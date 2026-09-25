@@ -1209,7 +1209,7 @@ class SpeculativeConfig:
                     )
             elif self.method == "df2t":
                 # The df2t draft_model_config is supplied directly.
-                pass
+                self._validate_df2t()
             else:
                 raise ValueError(
                     "num_speculative_tokens was provided but without speculative model."

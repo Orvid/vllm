@@ -61,14 +61,24 @@ def test_df2t_tree_resolution():
 
 
 def test_df2t_rejects_wrong_arch():
-    cfg = _build(arch="DFlashDraftModel")
     with pytest.raises(ValueError, match="df2t"):
-        cfg._validate_df2t()
+        _build(arch="DFlashDraftModel")
 
 
 def test_df2t_rejects_tree_budget_over_ceiling():
-    cfg = _build(tree_budget=128)
     with pytest.raises(ValueError, match="tree_budget"):
+        _build(tree_budget=128)
+
+
+def test_df2t_rejects_max_tree_depth_over_tokens():
+    with pytest.raises(ValueError, match="max_tree_depth"):
+        _build(max_tree_depth=20)
+
+
+def test_df2t_rejects_missing_num_speculative_tokens():
+    cfg = _build()
+    cfg.num_speculative_tokens = None  # type: ignore[assignment]
+    with pytest.raises(ValueError, match="num_speculative_tokens"):
         cfg._validate_df2t()
 
 
