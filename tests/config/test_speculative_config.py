@@ -1,0 +1,88 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Tests for the DF2T tree speculative decoding config surface."""
+
+from types import SimpleNamespace
+from typing import Any, get_args
+
+import pytest
+
+from vllm.config.speculative import SpeculativeConfig
+
+ARCH = "DFlash2DraftModel"
+
+
+def _draft_cfg(arch: str = ARCH) -> SimpleNamespace:
+    """A lightweight stand-in for a draft ``ModelConfig`` whose ``hf_config``
+    exposes ``dflash_config.block_size`` (16), the DFlash2 draft-block size."""
+    return SimpleNamespace(
+        architectures=[arch],
+        hf_config=SimpleNamespace(
+            block_size=16,
+            dflash_config=SimpleNamespace(block_size=16),
+        ),
+        model="draft",
+        max_model_len=128,
+        verify_with_parallel_config=lambda *_: None,
+        compute_hash=lambda: "draft-hash",
+    )
+
+
+def _build(arch: str = ARCH, **over: Any) -> SpeculativeConfig:
+    kwargs: dict[str, Any] = dict(
+        method="df2t",
+        num_speculative_tokens=15,
+        draft_model_config=_draft_cfg(arch),
+        tree_budget=None,
+    )
+    kwargs.update(over)
+    return SpeculativeConfig(**kwargs)
+
+
+def test_df2t_method_registered():
+    import vllm.config.speculative as m
+
+    assert "df2t" in get_args(m.SpeculativeMethod)
+
+
+def test_use_df2t():
+    cfg = _build()
+    assert cfg.use_df2t()
+    cfg.method = "dflash"
+    assert not cfg.use_df2t()
+
+
+def test_df2t_tree_resolution():
+    cfg = _build()
+    cfg._validate_df2t()
+    assert cfg.tree_budget == cfg.max_tree_budget == 64
+    assert cfg.max_tree_depth == 15
+    assert cfg.parallel_drafting
+
+
+def test_df2t_rejects_wrong_arch():
+    cfg = _build(arch="DFlashDraftModel")
+    with pytest.raises(ValueError, match="df2t"):
+        cfg._validate_df2t()
+
+
+def test_df2t_rejects_tree_budget_over_ceiling():
+    cfg = _build(tree_budget=128)
+    with pytest.raises(ValueError, match="tree_budget"):
+        cfg._validate_df2t()
+
+
+def test_df2t_get_num_draft_tokens():
+    cfg = _build()
+    cfg.tree_budget = 32
+    assert cfg.get_num_draft_tokens() == 32
+    cfg.tree_s = 0.5
+    assert cfg.get_num_draft_tokens() == 16
+    cfg.tree_budget = None
+    assert cfg.get_num_draft_tokens() == 15
+
+
+def test_df2t_tree_knobs_change_hash():
+    base = _build()
+    modified = _build(tree_budget=32)
+    assert base.compute_hash() != modified.compute_hash()

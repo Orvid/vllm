@@ -68,6 +68,7 @@ MTPModelTypes = Literal[
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
 DSparkModelTypes = Literal["dspark"]
+DF2TModelTypes = Literal["df2t"]
 EagleModelTypes = Literal[
     "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
 ]
@@ -81,6 +82,7 @@ SpeculativeMethod = Literal[
     EagleModelTypes,
     NgramGPUTypes,
     DSparkModelTypes,
+    DF2TModelTypes,
 ]
 RejectionSampleMethod = Literal["standard", "synthetic", "block"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
@@ -553,6 +555,22 @@ class SpeculativeConfig:
     """Whether to adaptively size the draft-verification budget from per-request
     confidence. Currently only supported for method="dspark"."""
 
+    # Tree speculative decoding (DF2T).
+    enable_tree: bool = False
+    """Verify the DFlash2 draft as a top-B tree instead of the greedy walk."""
+    tree_budget: int | None = Field(default=None, ge=1)
+    """Policy node count B at s=1.0; also the static decode shape 1+B."""
+    max_tree_budget: int = Field(default=64, ge=1)
+    """Allocation ceiling: buffers, KV arena, ancestor-mask words."""
+    max_tree_depth: int | None = Field(default=None, ge=1)
+    """Tree depth cap; default min(num_speculative_tokens, block_size-1)."""
+    tree_s: float = Field(default=1.0, ge=0.25, le=4.0)
+    """Operator compute scale: nodes_max = clamp(round(s*policy), ...)."""
+    nodes_ceiling: int = Field(default=64, ge=1)
+    """Cap on nodes_max (deployment throughput/runtime knob)."""
+    tree_attention_backend: Literal["flex", "fa4"] = "fa4"
+    """Tree-verification attention vehicle."""
+
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
         """Mean acceptance length to unconditional per-position rates, using
@@ -650,6 +668,19 @@ class SpeculativeConfig:
                     self.draft_model_config.hf_config,
                     "index_share_for_mtp_iteration",
                     False,
+                )
+            )
+
+        if self.use_df2t():
+            factors.append(
+                (
+                    self.enable_tree,
+                    self.tree_budget,
+                    self.max_tree_budget,
+                    self.max_tree_depth,
+                    self.tree_s,
+                    self.tree_attention_backend,
+                    self.nodes_ceiling,
                 )
             )
 
@@ -1176,6 +1207,9 @@ class SpeculativeConfig:
                         "method='custom_class' requires 'model' to contain the "
                         "custom proposer module path (e.g., 'my_module.MyProposer')."
                     )
+            elif self.method == "df2t":
+                # The df2t draft_model_config is supplied directly.
+                pass
             else:
                 raise ValueError(
                     "num_speculative_tokens was provided but without speculative model."
@@ -1316,7 +1350,7 @@ class SpeculativeConfig:
                         draft_hf.truncated_vocab_size = target_vocab
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash", "dspark"):
+                if self.method in ("eagle", "eagle3", "dflash", "dspark", "df2t"):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -1459,6 +1493,8 @@ class SpeculativeConfig:
 
                 if self.method in ("dflash", "dspark"):
                     self.parallel_drafting = True
+                elif self.use_df2t():
+                    self._validate_df2t()
 
                 if self.num_speculative_tokens is not None and hasattr(
                     self.draft_model_config.hf_config, "num_lookahead_tokens"
@@ -1948,6 +1984,39 @@ class SpeculativeConfig:
 
     def use_dspark(self) -> bool:
         return self.method == "dspark"
+
+    def use_df2t(self) -> bool:
+        return self.method == "df2t"
+
+    def get_num_draft_tokens(self) -> int:
+        if self.use_df2t() and self.tree_budget is not None:
+            return int(round(self.tree_s * self.tree_budget))
+        return self.num_speculative_tokens
+
+    def _validate_df2t(self) -> None:
+        self.parallel_drafting = True
+        archs = set(getattr(self.draft_model_config, "architectures", []))
+        if not (archs & {"DF2TDraftModel", "DFlash2DraftModel"}):
+            raise ValueError(
+                "df2t requires a DFlash2DraftModel/DF2TDraftModel drafter; "
+                f"got architectures={sorted(archs)}."
+            )
+        if self.num_speculative_tokens is None:
+            raise ValueError("df2t requires num_speculative_tokens")
+        if self.tree_budget is None:
+            self.tree_budget = self.max_tree_budget
+        if self.tree_budget > self.max_tree_budget:
+            raise ValueError("tree_budget exceeds max_tree_budget")
+        block_size = getattr(
+            getattr(self.draft_model_config.hf_config, "dflash_config", {}),
+            "block_size",
+            None,
+        )
+        trained = (int(block_size) - 1) if block_size else self.num_speculative_tokens
+        if self.max_tree_depth is None:
+            self.max_tree_depth = min(self.num_speculative_tokens, trained)
+        if self.max_tree_depth > self.num_speculative_tokens:
+            raise ValueError("max_tree_depth must be <= num_speculative_tokens")
 
     def uses_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None
