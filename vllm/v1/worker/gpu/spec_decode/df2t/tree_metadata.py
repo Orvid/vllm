@@ -16,6 +16,8 @@ class TreeDraft:
     parents: torch.Tensor  # parent arena index; root's parent = -1
     arena: torch.Tensor  # == arange(B); kept for clarity
     words: torch.Tensor  # uint64 ancestor-or-self bitmask over arena
+    # Only populated by the batched triton builder: shape (R,) int32 cuda.
+    num_nodes: torch.Tensor | None = None
 
 
 def pack_ancestor_words(
