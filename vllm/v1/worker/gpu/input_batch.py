@@ -121,6 +121,10 @@ class InputBatch:
     # slot-position equivalent of ``positions`` (see ``prepare_tree_inputs``).
     slot_positions: torch.Tensor | None = None
 
+    # [num_reqs] per-request df2t TreeDraft from the scheduler carry, or None
+    # for non-tree batches. Populated in prepare_inputs for the sample step.
+    trees: "list[TreeDraft | None] | None" = None
+
     @classmethod
     def make_dummy(
         cls,

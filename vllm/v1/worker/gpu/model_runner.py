@@ -113,6 +113,7 @@ from vllm.v1.worker.gpu.input_batch import (
     InputBuffers,
     combine_sampled_and_draft_tokens,
     expand_idx_mapping,
+    get_num_sampled_and_rejected,
     post_update,
     post_update_num_computed_tokens,
     prepare_pos_seq_lens,
@@ -131,6 +132,7 @@ from vllm.v1.worker.gpu.lora_utils import (
     get_lora_capture_cases,
     get_num_active_loras_for_dispatch,
 )
+from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
@@ -153,6 +155,7 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     resolve_adaptive_cudagraph_mode,
 )
 from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import TreeDraft
+from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import TreeVerifier
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
     verify_supports_aux_hidden_states_over_pp,
@@ -330,6 +333,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # model_state exists (num_new_sampled_tokens_per_step from ModelState).
         self.sampler: Sampler | None = None
         self.rejection_sampler: RejectionSampler | None = None
+        # DF2T tree-traversal verifier (used only when method=="df2t"); a
+        # sibling of RejectionSampler with the same output contract.
+        self.tree_verifier: TreeVerifier | None = None
         self.batch_sharder: BatchSharder | None = None
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
@@ -500,6 +506,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.vllm_config.watermark_config
                     ),
                 )
+                if self.speculative_config.use_df2t():
+                    # DF2T verifies with tree traversal, not rejection.
+                    self.tree_verifier = TreeVerifier(
+                        self.max_num_reqs,
+                        self.speculative_config.get_num_draft_tokens(),
+                        self.vocab_size,
+                        self.device,
+                    )
             self.prompt_logprobs_worker = PromptLogprobsWorker(
                 self.max_num_reqs, logprobs_mode=self.model_config.logprobs_mode
             )
@@ -1502,6 +1516,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
             slot_positions=slot_positions,
+            trees=trees,
             is_padding=is_padding,
             logits_indices=logits_indices,
             cu_num_logits=cu_num_logits,
@@ -1708,6 +1723,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         elif input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
             assert self.sampler is not None
             sampler_output = self.sampler(logits, input_batch)
+        elif input_batch.trees is not None:
+            # DF2T tree-traversal verification (v5 spec §3.6). The tree comes
+            # from the scheduler carry; the verifier reads only the target
+            # logits rows, never any drafter probability buffer.
+            assert self.speculative_config is not None
+            assert self.speculative_config.use_df2t()
+            assert self.tree_verifier is not None
+            sampler_output = self._df2t_tree_verify(logits, input_batch)
         else:
             # Rejection sampling for spec decoding.
             assert self.rejection_sampler is not None
@@ -1742,6 +1765,85 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         assert sampler_output is not None
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
+
+    def _df2t_tree_verify(
+        self,
+        logits: torch.Tensor,
+        input_batch: InputBatch,
+    ) -> SamplerOutput:
+        """DF2T tree-traversal verification (v5 spec §3.6).
+
+        Reads the scheduler's tree for each request, gathers the request's
+        target logits rows (row 0 = anchor, row ``1 + arena`` = node ``arena``)
+        into ``[num_reqs, 1 + B, vocab]``, runs the TreeVerifier, and emits the
+        rejection-sampler output contract unchanged (``sampled [R, 1 + B]`` /
+        ``num_sampled [R]``), so ``get_num_sampled_and_rejected`` and
+        ``postprocess_sampled`` consume it as-is.
+        """
+        trees = input_batch.trees
+        assert trees is not None
+        assert self.tree_verifier is not None
+        assert self.sampler is not None
+        num_reqs = input_batch.num_reqs
+        typed_trees = [t for t in trees if t is not None]
+        assert len(typed_trees) == len(trees), (
+            "df2t batches must carry a tree for every request"
+        )
+        b_max = max(t.token_ids.shape[0] for t in typed_trees)
+        cu = input_batch.cu_num_logits.tolist()
+        token_ids = torch.zeros(num_reqs, b_max, dtype=torch.long, device=self.device)
+        parents = torch.full(
+            (num_reqs, b_max), -2, dtype=torch.long, device=self.device
+        )
+        num_nodes = torch.zeros(num_reqs, dtype=torch.long, device=self.device)
+        target = torch.zeros(
+            num_reqs,
+            1 + b_max,
+            logits.shape[-1],
+            dtype=logits.dtype,
+            device=self.device,
+        )
+        for r, tree in enumerate(typed_trees):
+            b = tree.token_ids.shape[0]
+            token_ids[r, :b] = tree.token_ids
+            parents[r, :b] = tree.parents
+            num_nodes[r] = b
+            target[r, : 1 + b] = logits[cu[r] : cu[r + 1]]
+
+        ss = self.sampler.sampling_states
+        idx = input_batch.idx_mapping
+        temperature = ss.temperature.gpu[idx]
+        top_k = ss.top_k.gpu[idx]
+        top_p = ss.top_p.gpu[idx]
+        seeds = None
+        if ss.any_explicit_seed(input_batch.idx_mapping_np):
+            seeds = ss.seeds.gpu[idx]
+        sampled, num_sampled = self.tree_verifier(
+            target,
+            token_ids,
+            parents,
+            num_nodes,
+            greedy=temperature == 0.0,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            seeds=seeds,
+        )
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            num_sampled,
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.sampler.req_states.prefill_len.gpu,
+        )
+        num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
+        return SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None,
+            num_nans=num_nans,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+        )
 
     def postprocess_sampled(
         self,
