@@ -117,6 +117,7 @@ from vllm.v1.worker.gpu.input_batch import (
     post_update_num_computed_tokens,
     prepare_pos_seq_lens,
     prepare_prefill_inputs,
+    prepare_tree_inputs,
     set_dummy_context,
 )
 from vllm.v1.worker.gpu.kv_connector import (
@@ -151,6 +152,7 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
 )
+from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import TreeDraft
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
     verify_supports_aux_hidden_states_over_pp,
@@ -1282,6 +1284,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Get the number of draft tokens for each request.
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
         num_draft_tokens_per_req = None
+        slot_positions = None
+        trees = None
+        use_df2t_trees = (
+            bool(scheduler_output.spec_tree_draft)
+            and self.speculative_config is not None
+            and self.speculative_config.use_df2t()
+        )
         if not draft_tokens and self.model_state.num_new_sampled_tokens_per_step == 1:
             # No draft token scheduled (common case).
             total_num_draft_tokens = 0
@@ -1312,6 +1321,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_num_logits_np[0] = 0
             np.cumsum(num_logits, out=cu_num_logits_np[1:])
             cu_num_logits = async_tensor_h2d(cu_num_logits_np, device=self.device)
+            if use_df2t_trees:
+                trees = [
+                    TreeDraft.from_lists(
+                        scheduler_output.spec_tree_draft[req], self.device
+                    )
+                    if req in scheduler_output.spec_tree_draft
+                    else None
+                    for req in req_ids
+                ]
+                for req_idx, tree in enumerate(trees):
+                    if tree is not None:
+                        assert (
+                            num_draft_tokens_per_req[req_idx]
+                            == (tree.token_ids.shape[0])
+                        ), (
+                            f"scheduled {num_draft_tokens_per_req[req_idx]} draft "
+                            f"tokens for a {tree.token_ids.shape[0]}-node tree"
+                        )
 
         # The general branch also serves a no-draft batch with k != 1, and
         # compact_batch's budget is only primed when drafts are scheduled.
@@ -1389,6 +1416,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.model_state.num_new_sampled_tokens_per_step,
         )
 
+        if trees is not None:
+            # df2t tree verify block: snapshot consecutive positions for slot
+            # mapping, then rewrite the block rows (see prepare_tree_inputs).
+            slot_positions = self.input_buffers.slot_positions[
+                :num_tokens_after_padding
+            ]
+            slot_positions.copy_(
+                self.input_buffers.positions[:num_tokens_after_padding]
+            )
+            prepare_tree_inputs(
+                self.input_buffers.input_ids[:num_tokens_after_padding],
+                self.input_buffers.positions[:num_tokens_after_padding],
+                slot_positions,
+                idx_mapping,
+                self.req_states.last_sampled_tokens,
+                query_start_loc,
+                seq_lens,
+                self.req_states.prefill_len.gpu,
+                cu_num_logits,
+                logits_indices,
+                trees,
+            )
+
         fast_prefill = None
         if self.fast_prefill is not None:
             fast_prefill = self.fast_prefill.prepare(
@@ -1440,6 +1490,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             has_prefill=batch_req_state.has_prefill,
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
+            slot_positions=slot_positions,
             is_padding=is_padding,
             logits_indices=logits_indices,
             cu_num_logits=cu_num_logits,
@@ -1469,10 +1520,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         # Slot mappings: [num_kv_cache_groups, num_tokens_padded].
         # Kernel pads beyond num_tokens with PAD_SLOT_ID.
+        # df2t tree batches map slots through slot_positions (arena-decoupled
+        # from RoPE positions); otherwise slots follow the positions directly.
+        positions = (
+            input_batch.slot_positions
+            if input_batch.slot_positions is not None
+            else input_batch.positions
+        )
         slot_mappings = self.block_tables.compute_slot_mappings(
             input_batch.idx_mapping,
             input_batch.query_start_loc,
-            input_batch.positions,
+            positions,
             num_tokens_padded=input_batch.num_tokens_after_padding,
         )
         return block_tables, slot_mappings

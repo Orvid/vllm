@@ -14,6 +14,7 @@ from vllm.utils.math_utils import cdiv
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.attn_utils import FastPrefillBatchMetadata
     from vllm.v1.worker.gpu.block_table import BlockTables
+    from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import TreeDraft
 
 
 class InputBuffers:
@@ -24,6 +25,9 @@ class InputBuffers:
 
         self.input_ids = torch.zeros(max_num_tokens, dtype=torch.int32, device=device)
         self.positions = torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
+        self.slot_positions = torch.zeros(
+            max_num_tokens, dtype=torch.int64, device=device
+        )
         self.is_padding = torch.zeros(max_num_tokens, dtype=torch.bool, device=device)
         self.query_start_loc = torch.zeros(
             max_num_reqs + 1, dtype=torch.int32, device=device
@@ -112,6 +116,10 @@ class InputBatch:
 
     # [num_reqs] set only under PCP+DCP (see CommonAttentionMetadata).
     dcp_local_seq_lens_cpu_upper_bound: torch.Tensor | None = None
+
+    # [num_tokens_after_padding] only set for df2t tree batches: the
+    # slot-position equivalent of ``positions`` (see ``prepare_tree_inputs``).
+    slot_positions: torch.Tensor | None = None
 
     @classmethod
     def make_dummy(
@@ -489,6 +497,83 @@ def combine_sampled_and_draft_tokens(
         ),
     )
     return logits_indices
+
+
+def prepare_tree_inputs(
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    slot_positions: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    last_sampled_tokens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    prefill_len: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    logits_indices: torch.Tensor,
+    trees: "Sequence[TreeDraft | None]",
+    num_new_sampled_tokens: int = 1,
+) -> None:
+    """Rewrite the verify-block rows of requests that carry a df2t tree.
+
+    For every request whose tree is not None, the trailing ``1 + B`` token rows
+    (the verify block, spanning ``[query_end - num_logits, query_end)``) become
+    ``[anchor @ C] + [node i @ C + depth_i]``:
+      * ``input_ids``: the anchor (last sampled token) then node token ids in
+        arena order.
+      * ``positions``: ``C`` then ``C + depth_i`` (RoPE/depth semantics, so
+        siblings may share a position).
+      * ``slot_positions``: ``C`` then ``C + 1 + arena_i`` (consecutive; this
+        is what the block-table slot kernel translates, so sibling KV slots
+        stay distinct even when positions collide).
+      * ``logits_indices``: every row of the ``1 + B`` block.
+
+    ``positions[block_start]`` must already equal ``C`` (the request's
+    ``num_computed_tokens`` for a decode step), which ``prepare_pos_seq_lens``
+    guarantees. Requests with a None tree are left untouched.
+
+    Args:
+        input_ids: [num_tokens_after_padding] int32.
+        positions: [num_tokens_after_padding] int64 logical (RoPE) positions.
+        slot_positions: [num_tokens_after_padding] int64, fed to the block-table
+            slot kernel instead of ``positions`` for tree batches.
+        idx_mapping: [num_reqs] batch_idx -> req_state_idx.
+        last_sampled_tokens: [max_num_reqs] int32.
+        query_start_loc: [num_reqs + 1] int32.
+        seq_lens: [num_reqs] int32.
+        prefill_len: [max_num_reqs] int32.
+        cu_num_logits: [num_reqs + 1] int32.
+        logits_indices: [total_num_logits] int64, written for the block rows.
+        trees: [num_reqs] per-request TreeDraft or None (unchanged).
+        num_new_sampled_tokens: anchor rows per request (1 for LLM).
+
+    """
+    num_reqs = idx_mapping.shape[0]
+    assert num_new_sampled_tokens == 1, "df2t verify supports one anchor"
+    for req_idx in range(num_reqs):
+        tree = trees[req_idx]
+        if tree is None:
+            continue
+        num_nodes = tree.token_ids.shape[0]
+        num_logits = int(cu_num_logits[req_idx + 1].item()) - int(
+            cu_num_logits[req_idx].item()
+        )
+        block_start = int(query_start_loc[req_idx + 1].item()) - num_logits
+        assert num_logits == num_nodes + num_new_sampled_tokens, (
+            f"scheduled {num_logits} logit rows for a {num_nodes}-node tree"
+        )
+        anchor_pos = int(positions[block_start].item())
+        node_rows = slice(block_start + 1, block_start + 1 + num_nodes)
+        positions[node_rows] = anchor_pos + tree.depths
+        slot_positions[block_start] = anchor_pos
+        slot_positions[node_rows] = anchor_pos + 1 + tree.arena
+        logits_start = int(cu_num_logits[req_idx].item())
+        logits_indices[logits_start : logits_start + num_logits] = torch.arange(
+            block_start, block_start + num_logits, device=logits_indices.device
+        )
+        req_state_idx = int(idx_mapping[req_idx].item())
+        if int(seq_lens[req_idx].item()) > int(prefill_len[req_state_idx].item()):
+            input_ids[block_start] = last_sampled_tokens[req_state_idx]
+            input_ids[node_rows] = tree.token_ids
 
 
 @triton.jit
