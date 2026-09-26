@@ -844,7 +844,12 @@ class Scheduler(SchedulerInterface):
                         spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
                     scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
                     if request.tree_draft is not None:
-                        spec_tree_draft[request.request_id] = request.tree_draft
+                        tree = request.tree_draft
+                        if len(tree.token_ids) > len(spec_token_ids):
+                            # Budget trimming dropped some drafts; trim the tree
+                            # so its node count matches the scheduled tokens.
+                            tree = tree.truncated(len(spec_token_ids))
+                        spec_tree_draft[request.request_id] = tree
 
                 # New spec tokens will be set in `update_draft_token_ids` before the
                 # next step when applicable.

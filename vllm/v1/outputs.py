@@ -367,6 +367,19 @@ class StashedTree:
     # len(token_ids), kept to match the builder's num_nodes; None if absent.
     num_nodes: int | None = None
 
+    def truncated(self, n: int) -> "StashedTree":
+        """First ``n`` nodes; parents are prefix-closed (``parents[i] < i``), so
+        the slice is still a valid tree and agrees with a draft-token list
+        trimmed to ``n``."""
+        return StashedTree(
+            token_ids=self.token_ids[:n],
+            depths=self.depths[:n],
+            parents=self.parents[:n],
+            arena=self.arena[:n],
+            words=self.words[:n],
+            num_nodes=n if self.num_nodes is not None else None,
+        )
+
 
 @dataclass
 class DraftTokenIds:

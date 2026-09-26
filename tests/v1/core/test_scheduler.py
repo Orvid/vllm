@@ -1927,6 +1927,49 @@ def test_scheduler_carries_tree_draft_to_scheduled_output():
     assert torch.equal(back.num_nodes, tree.num_nodes)
 
 
+def test_scheduler_trims_tree_to_scheduled_spec_token_count():
+    """Budget-boundary scheduling trims draft tokens to
+    ``num_scheduled_spec_tokens``; the stashed tree must be trimmed to the same
+    count so the tree and scheduled tokens agree at the Task-6 consume point."""
+    scheduler = create_scheduler(
+        num_speculative_tokens=3,
+        max_num_seqs=2,
+        max_num_batched_tokens=2,
+        max_model_len=100,
+    )
+    [req] = create_requests(num_requests=1, num_tokens=1)
+    scheduler.add_request(req)
+    rid = req.request_id
+    scheduler.update_from_output(
+        scheduler.schedule(),
+        ModelRunnerOutput(
+            req_ids=[rid],
+            req_id_to_index={rid: 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    tree = _make_draft_tree()
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([rid], [[7, 8, 9]], spec_tree_draft=[tree.to_lists()])
+    )
+    output = scheduler.schedule()
+    scheduled = output.scheduled_spec_decode_tokens[rid]
+    assert len(scheduled) < len(tree.token_ids), "budget should have trimmed"
+    stashed = output.spec_tree_draft[rid]
+    assert len(stashed.token_ids) == len(scheduled)
+    assert stashed.num_nodes == len(scheduled)
+    back = TreeDraft.from_lists(stashed, device="cpu")
+    assert torch.equal(back.token_ids, tree.token_ids[: len(scheduled)])
+    assert torch.equal(back.arena, tree.arena[: len(scheduled)])
+    assert torch.equal(
+        back.num_nodes, torch.tensor([len(scheduled)], dtype=torch.int32)
+    )
+
+
 def test_per_request_spec_decode_detailed_records_per_step():
     scheduler = create_scheduler(
         num_speculative_tokens=3,
