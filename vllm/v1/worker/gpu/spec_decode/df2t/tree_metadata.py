@@ -32,9 +32,25 @@ def pack_ancestor_words(
     return words
 
 
-def _paths_to_draft(
-    paths: list[tuple[int, ...]], logp: torch.Tensor, cand: torch.Tensor
-) -> TreeDraft:
+def _best_first_perm(logp: torch.Tensor) -> torch.Tensor:
+    """Per-row best-first successor order: ``perm[d, p, r]`` is the original
+    candidate index whose transition log-probability is the r-th largest in row
+    (d, p).
+
+    Builds the order by removing the row argmax K times (left-most ties),
+    mirroring the masked-argmax pass in ``_tree_builder_kernel`` so the two
+    implementations cannot re-order the same row differently.
+    """
+    remaining = logp.float().clone()
+    perm = torch.empty_like(logp, dtype=torch.long)
+    for r in range(logp.shape[-1]):
+        best = torch.argmax(remaining, dim=-1, keepdim=True)
+        perm[..., r : r + 1] = best
+        remaining.scatter_(-1, best, float("-inf"))
+    return perm
+
+
+def _paths_to_draft(paths: list[tuple[int, ...]], tokens: torch.Tensor) -> TreeDraft:
     n = len(paths)
     token_ids = torch.zeros(n, dtype=torch.long)
     depths = torch.zeros(n, dtype=torch.long)
@@ -43,7 +59,8 @@ def _paths_to_draft(
     index: dict[tuple[int, ...], int] = {(): -1}
     for i, path in enumerate(paths):
         depth = len(path)
-        token_ids[i] = cand[depth - 1, path[-1]]
+        prank = path[-2] if depth >= 2 else 0
+        token_ids[i] = tokens[depth - 1, prank, path[-1]]
         depths[i] = depth
         parents[i] = index[path[:-1]]
         index[path] = i
@@ -58,20 +75,29 @@ def build_tree_naive(
 
     Args:
         scores: [L, K, K] successor logits for (depth, predecessor rank,
-            candidate rank). Candidates must be ordered best-first along the
-            last axis so the lazy next-sibling advance stays monotone in mass.
-        cand: [L, K] successor token ids per depth; rank columns of
-            ``scores`` index into these rows.
+            candidate rank) in any order. Each row is re-ordered best-first
+            internally so the lazy next-sibling advance stays monotone in mass.
+        cand: [L, K] successor token ids per depth; the k-th candidate of a
+            (depth, predecessor) row is ``cand[depth, k]``.
         B: number of emitted nodes (the implicit depth-0 anchor is excluded).
         L: depth cap; downgoing nodes past ``L`` are never expanded.
 
     Returns:
         A TreeDraft in emit order with all depths >= 1, parents[i] < i, and
-        ancestor words packed over the arena.
+        ancestor words packed over the arena. Tokens are read back through the
+        per-row best-first permutation, so ``cand`` need not be pre-sorted.
+        On already-best-first rows the permutation is the identity and the
+        result matches the historical behaviour.
 
     """
     K = scores.shape[1]
     logp = torch.log_softmax(scores.float(), dim=-1)
+    perm = _best_first_perm(logp)
+    # Heap works over sorted positions; tokens are the original-indexed cands.
+    sorted_logp = torch.gather(logp, -1, perm)
+    tokens = torch.gather(
+        cand[:, None, :].expand(logp.shape[0], K, K).contiguous(), -1, perm
+    )
     # Heap of (-mass, -parent_mass, path); parent_mass is the mass of the node
     # above ``path`` (the anchor has mass 0.0), used to price the next sibling.
     heap: list[tuple[float, float, tuple[int, ...]]] = [(0.0, 0.0, ())]
@@ -87,12 +113,12 @@ def build_tree_naive(
             prank = parent_path[-1] if parent_path else 0
             rank = path[-1] + 1
             if rank < K:
-                sib_mass = parent_mass + float(logp[depth - 1, prank, rank])
+                sib_mass = parent_mass + float(sorted_logp[depth - 1, prank, rank])
                 heapq.heappush(heap, (-sib_mass, -parent_mass, parent_path + (rank,)))
         if depth >= L:
             continue
         # best child of this node
         c_rank = 0
-        child_mass = mass + float(logp[depth, path[-1] if path else 0, c_rank])
+        child_mass = mass + float(sorted_logp[depth, path[-1] if path else 0, c_rank])
         heapq.heappush(heap, (-child_mass, -mass, path + (c_rank,)))
-    return _paths_to_draft(emitted, logp, cand)
+    return _paths_to_draft(emitted, tokens)

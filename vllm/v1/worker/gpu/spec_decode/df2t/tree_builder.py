@@ -12,7 +12,9 @@ packed path, mirroring the reference's ``(-mass, -parent_mass, path)`` heap.
 DFlash2 ``_score_edges`` returns UNSORTED per-row successor scores, but the
 lazy-next-sibling advance needs each (depth, predecessor) row best-first. The
 kernel therefore computes a per-row log-softmax and reorders successors
-descending before the heap runs.
+descending before the heap runs, reading tokens back through the row
+permutation; ``build_tree_naive._best_first_perm`` mirrors the same
+permutation, so both agree on raw unsorted rows.
 """
 
 import torch
