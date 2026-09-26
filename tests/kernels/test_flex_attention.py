@@ -507,8 +507,9 @@ def test_block_sparsity_hint_prunes_blocks():
     metadata_no_hint.block_mask = metadata_no_hint._build_block_mask_direct()
     assert metadata_no_hint.block_mask.kv_num_blocks.max().item() > 1
 
-    def diagonal_hint(q_block_idx, kv_block_idx, block_size):
-        return q_block_idx == kv_block_idx
+    def diagonal_hint(q_idx, logical_q_idx, kv_block_idx, block_size):
+        del q_idx
+        return logical_q_idx[:, None] // block_size == kv_block_idx
 
     metadata_with_hint = builder.build(
         common_prefix_len=0, common_attn_metadata=common_attn_metadata

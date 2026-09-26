@@ -1,0 +1,303 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Tests for the df2t FlexAttention tree mask.
+
+Task 8 builds the tree-verify attention mask on the FlexAttention vehicle: a
+``logical_mask_mod`` closure over per-request ancestor words, so the verify
+forward attends only to context + anchor + ancestor-or-self nodes. Within a
+request's verify block the logical KV index equals the block-slot: keys with
+logical index < C are context (always allowed for the fully-causal target), the
+key at logical index C is the anchor, and keys at ``C + 1 + j`` are nodes that
+are allowed iff ``(words[r, q] >> j) & 1`` (ancestor-or-self of query node q).
+
+These tests pin (1) the boolean mask matrix against a manual expectation from a
+concrete small tree and (2) that the mask actually gates a packed FlexAttention
+forward against a reference attention computed with the same mask.
+"""
+
+import pytest
+import torch
+
+from tests.v1.attention.test_attention_backends import (
+    MockAttentionLayer,
+    create_and_prepopulate_kv_cache,
+)
+from tests.v1.attention.utils import (
+    BatchSpec,
+    create_common_attn_metadata,
+    create_standard_kv_cache_spec,
+    create_vllm_config,
+)
+from vllm.config import set_current_vllm_config
+from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backends.flex_attention import (
+    FlexAttentionImpl,
+    FlexAttentionMetadataBuilder,
+)
+from vllm.v1.kv_cache_interface import KVCacheLayout
+from vllm.v1.worker.gpu.spec_decode.df2t.attention import (
+    attach_tree_flex_mask,
+    build_flex_tree_mask,
+)
+
+
+def _manual_matrix(C: int, words: list[int], B: int) -> torch.Tensor:
+    """Manual [C + 1 + B, C + 1 + B] boolean matrix over logical (q, k).
+
+    The real verify block only holds query rows ``[C, C + B]`` (anchor at C,
+    node with arena ``a`` at ``C + 1 + a``); rows below C are context positions
+    that never query in the verify layout and are left False. Key ``k`` is
+    allowed iff ``k < C`` (context), ``k == C`` (anchor), or ``k == C + 1 + j``
+    with bit ``j`` set in the query node's ancestor-or-self word.
+    """
+    n = C + 1 + B
+    matrix = torch.zeros(n, n, dtype=torch.bool)
+    words_t = torch.tensor(words, dtype=torch.long)
+    for arena in range(B):
+        q = C + 1 + arena
+        matrix[q, : C + 1] = True
+        for j in range(B):
+            k = C + 1 + j
+            matrix[q, k] = bool((words_t[arena] >> j) & 1)
+    matrix[C, : C + 1] = True
+    return matrix
+
+
+def test_flex_tree_mask_matches_manual():
+    """The closure reproduces the hand-computed matrix on the verify-block
+    rows: context always allowed, the anchor allowed, and node keys allowed
+    exactly when their bit is set in the query node's ancestor-or-self word."""
+    C, B = 4, 3
+    words = [0b1, 0b11, 0b101]  # node1: self; node2: self + node0 ancestors
+    request_lookup = torch.zeros(1, dtype=torch.int32)
+    mask_mod, hint = build_flex_tree_mask(
+        1,
+        torch.tensor([C], dtype=torch.long),
+        torch.tensor([words], dtype=torch.long),
+        B,
+        request_lookup,
+    )
+    assert hint is not None
+
+    n = C + 1 + B
+    b = torch.zeros(n, 1, dtype=torch.long)
+    h = torch.zeros(n, 1, dtype=torch.long)
+    q = torch.arange(n, dtype=torch.long)[:, None].expand(n, n)
+    k = torch.arange(n, dtype=torch.long)[None, :].expand(n, n)
+    got = mask_mod(b.expand(n, n), h, q, k)
+
+    expected = _manual_matrix(C, words, B)
+    # Rows below C are context positions, never queries in the verify layout.
+    assert torch.equal(got[C:], expected[C:])
+    assert torch.equal(got[C], expected[C])  # anchor row: context + anchor
+    assert got[4].sum().item() == C + 1
+
+
+def test_flex_tree_mask_matches_manual_multi_request():
+    """Per-request data is found through the packed query index -> request
+    lookup, so one closure serves different trees in a single packed batch."""
+    specs = [(4, [0b1, 0b11, 0b101], 3), (2, [0b1, 0b11], 2), (3, [0b1], 1)]
+    num_reqs = len(specs)
+    max_b = 3
+    query_lens = [b + 1 for _, _, b in specs]
+    query_start_loc = [0]
+    for qlen in query_lens:
+        query_start_loc.append(query_start_loc[-1] + qlen)
+    num_tokens = query_start_loc[-1]
+    request_lookup = torch.zeros(num_tokens, dtype=torch.int32)
+    for r, (_, _, b) in enumerate(specs):
+        request_lookup[query_start_loc[r] : query_start_loc[r + 1]] = r
+
+    c_per_req = torch.tensor([c for c, _, _ in specs], dtype=torch.long)
+    words = torch.zeros(num_reqs, max_b, dtype=torch.long)
+    for r, (_, w, _) in enumerate(specs):
+        words[r, : len(w)] = torch.tensor(w, dtype=torch.long)
+
+    mask_mod, _ = build_flex_tree_mask(
+        num_reqs, c_per_req, words, max_b, request_lookup
+    )
+
+    h = torch.zeros(1, dtype=torch.long)
+    for r, (c, w, b_nodes) in enumerate(specs):
+        n_r = c + 1 + b_nodes
+        # logical query position -> packed token index of that verify row.
+        b_for_q = torch.full((n_r,), query_start_loc[r], dtype=torch.long)
+        b_for_q[c + 1 : c + 1 + b_nodes] = (
+            query_start_loc[r] + 1 + torch.arange(b_nodes, dtype=torch.long)
+        )
+        q = torch.arange(n_r, dtype=torch.long)[:, None].expand(n_r, n_r)
+        k = torch.arange(n_r, dtype=torch.long)[None, :].expand(n_r, n_r)
+        b = b_for_q[:, None].expand(n_r, n_r)
+        got = mask_mod(b, h, q, k)
+        expected = _manual_matrix(c, w, b_nodes)
+        assert torch.equal(got[c:], expected[c:]), f"request {r}"
+
+
+def test_flex_tree_mask_hint_never_prunes_visible_blocks():
+    """The BlockSparsityHint is a superset of the real mask at block
+    granularity (a block holding any allowed key stays visible) and prunes
+    node-region blocks an anchor query cannot reach."""
+    C, B = 4, 3
+    words = [0b1, 0b11, 0b101]
+    request_lookup = torch.zeros(B + 1, dtype=torch.int32)  # one req's block
+    _, hint = build_flex_tree_mask(
+        1,
+        torch.tensor([C], dtype=torch.long),
+        torch.tensor([words], dtype=torch.long),
+        B,
+        request_lookup,
+    )
+
+    block_size = 2
+    num_blocks = 4  # logical keys [0, 8) at block granularity
+    # One packed query per verify row: anchor + the B nodes.
+    q_idx = torch.arange(B + 1, dtype=torch.long)
+    logical_q = torch.tensor([C, C + 1, C + 2, C + 3], dtype=torch.long)
+    kv_block = torch.arange(num_blocks, dtype=torch.long)[None, :]
+    pruned = ~hint.hint_fn(q_idx, logical_q, kv_block, block_size)
+
+    # Anchor query (row 0) reaches only context + anchor blocks 0..2.
+    assert pruned[0, 3].item()
+    assert (~pruned[0, :3]).all().item()
+    # Node 2 (row 3) attends node 0 and 2 (keys 5, 7): block 3 stays visible.
+    assert (~pruned[3, :4]).all().item()
+
+    # Consistency: no block that holds an allowed key is ever pruned.
+    matrix = _manual_matrix(C, words, B)
+    for row in range(B + 1):
+        q_logical = logical_q[row].item()
+        for bloc in range(num_blocks):
+            keys = range(bloc * block_size, (bloc + 1) * block_size)
+            any_visible = any(matrix[q_logical, k].item() for k in keys)
+            if any_visible:
+                assert not pruned[row, bloc].item(), (
+                    f"pruned a block with a visible key (q={q_logical}, block={bloc})"
+                )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_flex_tree_mask_gates_attention():
+    """The tree mask actually gates a packed FlexAttention forward: attaching it
+    to the Flex metadata and running the impl matches a reference attention
+    computed with the same mask, so sibling nodes do not leak and ancestors
+    stay visible."""
+    device = torch.device("cuda")
+    vllm_config = create_vllm_config(
+        model_name="Qwen/Qwen3-0.6B",
+        max_model_len=64,
+        block_size=16,
+        num_gpu_blocks=1024,
+        max_num_seqs=8,
+        max_num_batched_tokens=256,
+    )
+    head_size = vllm_config.model_config.get_head_size()
+    num_heads = vllm_config.model_config.get_num_attention_heads(
+        vllm_config.parallel_config
+    )
+    num_kv_heads = vllm_config.model_config.get_num_kv_heads(
+        vllm_config.parallel_config
+    )
+    scale = 1.0 / (head_size**0.5)
+
+    specs = [(4, [0b1, 0b11, 0b101], 3), (2, [0b1, 0b11], 2)]
+    num_reqs = len(specs)
+    query_lens = [b + 1 for _, _, b in specs]
+    seq_lens = [c + 1 + b for c, _, b in specs]
+    max_b = max(b for _, _, b in specs)
+
+    batch_spec = BatchSpec(seq_lens=seq_lens, query_lens=query_lens, name="df2t_tree")
+    common = create_common_attn_metadata(
+        batch_spec, vllm_config.cache_config.block_size, device
+    )
+
+    torch.manual_seed(0)
+    k_full, v_full, k_contexts, v_contexts = [], [], [], []
+    for c, _, b_nodes in specs:
+        seq_len = c + 1 + b_nodes
+        k_full.append(torch.randn(seq_len, num_kv_heads, head_size, device=device))
+        v_full.append(torch.randn(seq_len, num_kv_heads, head_size, device=device))
+        k_contexts.append(k_full[-1][:c])
+        v_contexts.append(v_full[-1][:c])
+
+    kv_cache = create_and_prepopulate_kv_cache(
+        k_contexts=k_contexts,
+        v_contexts=v_contexts,
+        block_size=vllm_config.cache_config.block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=torch.float32,
+        device=device,
+        num_blocks=vllm_config.cache_config.num_gpu_blocks or 1024,
+        common_attn_metadata=common,
+        layout=KVCacheLayout.LBNHC,
+    )
+
+    # Reference output: per request, SDPA over the tree mask matrix for the
+    # verify-block query rows (logical slots C..C+B).
+    q_rows, k_rows, v_rows, sdpa_rows = [], [], [], []
+    for r, (c, w, b_nodes) in enumerate(specs):
+        q_r = torch.randn(b_nodes + 1, num_heads, head_size, device=device)
+        kfull = k_full[r].transpose(0, 1)[None]
+        vfull = v_full[r].transpose(0, 1)[None]
+        if num_heads != num_kv_heads:
+            kfull = kfull.repeat_interleave(num_heads // num_kv_heads, dim=1)
+            vfull = vfull.repeat_interleave(num_heads // num_kv_heads, dim=1)
+        mask = _manual_matrix(c, w, b_nodes)[c:].unsqueeze(0).unsqueeze(0).to(device)
+        out = (
+            torch.nn.functional.scaled_dot_product_attention(
+                q_r.unsqueeze(0).transpose(1, 2),
+                kfull,
+                vfull,
+                attn_mask=mask,
+                scale=scale,
+            )
+            .transpose(1, 2)
+            .squeeze(0)
+        )
+
+        q_rows.append(q_r)
+        k_rows.append(k_full[r][c:])
+        v_rows.append(v_full[r][c:])
+        sdpa_rows.append(out)
+
+    query = torch.cat(q_rows, dim=0)
+    key = torch.cat(k_rows, dim=0)
+    value = torch.cat(v_rows, dim=0)
+    sdpa_output = torch.cat(sdpa_rows, dim=0)
+
+    # df2t per-request SoA inputs for the tree mask.
+    c_per_req = torch.tensor([c for c, _, _ in specs], dtype=torch.long, device=device)
+    words = torch.zeros(num_reqs, max_b, dtype=torch.long, device=device)
+    for r, (_, w, _) in enumerate(specs):
+        words[r, : len(w)] = torch.tensor(w, dtype=torch.long, device=device)
+
+    kv_spec = create_standard_kv_cache_spec(vllm_config)
+    with set_current_vllm_config(vllm_config):
+        builder = FlexAttentionMetadataBuilder(
+            kv_spec, ["placeholder"], vllm_config, device
+        )
+        attn_metadata = builder.build(common_prefix_len=0, common_attn_metadata=common)
+        attach_tree_flex_mask(attn_metadata, num_reqs, c_per_req, words, max_b)
+
+        impl = FlexAttentionImpl(
+            num_heads=num_heads,
+            head_size=head_size,
+            scale=scale,
+            num_kv_heads=num_kv_heads,
+            alibi_slopes=None,
+            sliding_window=None,
+            attn_type=AttentionType.DECODER,
+            kv_cache_dtype="auto",
+        )
+
+    layer = MockAttentionLayer(device)
+    output = torch.empty_like(query)
+    impl.do_kv_cache_update(layer, key, value, kv_cache, attn_metadata.slot_mapping)
+    backend_output = impl.forward(
+        layer, query, key, value, kv_cache, attn_metadata, output=output
+    )
+
+    assert backend_output.shape == sdpa_output.shape
+    torch.testing.assert_close(
+        backend_output.float(), sdpa_output.float(), rtol=2e-2, atol=2e-2
+    )

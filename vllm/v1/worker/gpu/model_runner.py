@@ -307,6 +307,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_prefill_lookahead=num_prefill_lookahead,
         )
         self.adaptive_verification: AdaptiveVerificationManager | None = None
+        # df2t flex tree verify: per-request mask inputs staged by
+        # ``prepare_inputs`` and attached to the Flex metadata in
+        # ``execute_model``. Stays None except on flex-tree batches.
+        self._pending_tree_flex_mask: (
+            tuple[int, torch.Tensor, torch.Tensor, int] | None
+        ) = None
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -1340,6 +1346,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             f"tokens for a {tree.token_ids.shape[0]}-node tree"
                         )
 
+        # df2t flex verify: stage the per-request tree mask inputs (context
+        # length C per request, ancestor-or-self words) so execute_model can
+        # attach them to the Flex metadata after prepare_attn.
+        self._stage_tree_flex_mask(use_df2t_trees, trees, num_reqs, idx_mapping)
+
         # The general branch also serves a no-draft batch with k != 1, and
         # compact_batch's budget is only primed when drafts are scheduled.
         adaptive_verification = self.adaptive_verification if draft_tokens else None
@@ -1507,6 +1518,70 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.pcp_manager is not None:
             input_batch = self.pcp_manager.partition_batch(input_batch, batch_desc)
         return input_batch
+
+    def _stage_tree_flex_mask(
+        self,
+        use_df2t_trees: bool,
+        trees: "list[TreeDraft | None] | None",
+        num_reqs: int,
+        idx_mapping: torch.Tensor,
+    ) -> None:
+        """Stage the df2t flex-tree per-request mask inputs, or clear them.
+
+        Only active on df2t tree batches with ``tree_attention_backend ==
+        "flex"``; and attaches the tree mask in ``execute_model``. For every
+        other batch the pending field is cleared so no stale mask leaks into a
+        later step.
+        """
+        spec = self.speculative_config
+        self._pending_tree_flex_mask = None
+        if not (
+            use_df2t_trees
+            and spec is not None
+            and spec.tree_attention_backend == "flex"
+        ):
+            return
+        from vllm.v1.worker.gpu.spec_decode.df2t.attention import (
+            pack_tree_mask_inputs,
+        )
+
+        c_per_req = self.req_states.num_computed_tokens.gpu[idx_mapping].to(torch.int64)
+        words = pack_tree_mask_inputs(
+            trees, num_reqs, spec.max_tree_budget, self.device
+        )
+        self._pending_tree_flex_mask = (
+            num_reqs,
+            c_per_req,
+            words,
+            spec.max_tree_budget,
+        )
+
+    def _attach_tree_flex_mask(self, attn_metadata: dict[str, Any] | None) -> None:
+        """Attach the staged df2t tree mask to the Flex verify metadata."""
+        pending = self._pending_tree_flex_mask
+        self._pending_tree_flex_mask = None
+        if pending is None or attn_metadata is None:
+            return
+        from vllm.v1.attention.backends.flex_attention import (
+            FlexAttentionMetadata,
+        )
+        from vllm.v1.worker.gpu.spec_decode.df2t.attention import (
+            attach_tree_flex_mask,
+        )
+
+        num_reqs, c_per_req, words, b = pending
+        attached = False
+        for metadata in attn_metadata.values():
+            if isinstance(metadata, FlexAttentionMetadata):
+                attach_tree_flex_mask(metadata, num_reqs, c_per_req, words, b)
+                attached = True
+        if not attached:
+            raise ValueError(
+                "tree_attention_backend='flex' requires running the df2t "
+                "verify forward on the FlexAttention backend, but no "
+                "FlexAttentionMetadata was produced. Select FlexAttention "
+                "for the target (or set tree_attention_backend='fa4')."
+            )
 
     def prepare_attn(
         self, input_batch: InputBatch
@@ -1869,6 +1944,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # indices from the previous real batch.
                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
             )
+
+        self._attach_tree_flex_mask(attn_metadata)
 
         input_ids = input_batch.input_ids
         inputs_embeds = None

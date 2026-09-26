@@ -335,7 +335,7 @@ def bidirectional_mask_mod(
 
 # Type alias for the block sparsity hint callable signature.
 _block_sparsity_hint_signature = Callable[
-    [torch.Tensor, torch.Tensor, int], torch.Tensor
+    [torch.Tensor, torch.Tensor, torch.Tensor, int], torch.Tensor
 ]
 
 
@@ -346,9 +346,12 @@ class BlockSparsityHint(NamedTuple):
     the kernel iterating over all KV blocks unnecessarily.
 
     Attributes:
-        hint_fn: (q_block_idx [num_tokens, 1], kv_block_idx [1, num_kv_blocks],
-            block_size int) -> bool Tensor [num_tokens, num_kv_blocks].
-            Returns True for block pairs that may contain non-masked elements.
+        hint_fn: (q_idx [num_tokens], logical_q_idx [num_tokens],
+            kv_block_idx [1, num_kv_blocks], block_size int) -> bool Tensor
+            [num_tokens, num_kv_blocks]. ``q_idx`` is the raw packed query
+            index, ``logical_q_idx`` its per-request logical position, used to
+            derive per-query state. Returns True for block pairs that may
+            contain non-masked elements.
 
     """
 
@@ -482,7 +485,12 @@ class FlexAttentionMetadata:
             (is_valid, logical_q_idx, logical_kv_idx) = (
                 self._convert_physical_to_logical(self.doc_ids, q_idx, physical_kv_idx)
             )
-            return is_valid & self.logical_mask_mod(b, h, logical_q_idx, logical_kv_idx)
+            # Pass the packed query index (not the batch index ``b``, always 0
+            # for the flattened paged batch) so a logical_mask_mod can look up
+            # per-request data via ``doc_ids``, as the R-SWA wrapper does.
+            return is_valid & self.logical_mask_mod(
+                q_idx, h, logical_q_idx, logical_kv_idx
+            )
 
         return final_mask_mod
 
@@ -777,9 +785,9 @@ class FlexAttentionMetadata:
                 used_pages.masked_fill_(in_gap, 0)
             if custom_hint:
                 assert self.block_sparsity_hint is not None
-                q_block_idx = logical_q_idx // self.block_size
                 hint_mask = self.block_sparsity_hint.hint_fn(
-                    q_block_idx[:, None],
+                    token_indices,
+                    logical_q_idx,
                     self.logical_block_ids[None, :],
                     self.block_size,
                 )

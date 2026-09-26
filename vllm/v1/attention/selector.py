@@ -11,6 +11,7 @@ from vllm.config.cache import CacheDType
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.backends.registry import (
+    AttentionBackendEnum,
     MambaAttentionBackendEnum,
 )
 
@@ -187,6 +188,20 @@ def get_attn_backend(
             attn_type=attn_type,
         )
         backend = attention_config.backend_per_kind.get(kind.value, backend)
+
+    # df2t tree verify runs the target verify forward on FlexAttention (the
+    # correctness vehicle the FA4 swap is tested against). Force the plain
+    # decoder full-attention layers to flex; drafters pass their own backend
+    # explicitly, and windowed/MLA kinds never carry a tree.
+    if (
+        speculative_config is not None
+        and speculative_config.use_df2t()
+        and speculative_config.tree_attention_backend == "flex"
+        and not use_mla
+        and not has_sliding_window
+        and attn_type == AttentionType.DECODER
+    ):
+        backend = AttentionBackendEnum.FLEX_ATTENTION
 
     # The KV cache layout is resolved across all of the model's backends at once
     # in get_kv_cache_spec(); a single selection cannot see its peers.
