@@ -1,14 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import TYPE_CHECKING
+
 import numpy as np
 import torch
 
 from vllm.config import LoadConfig, replace
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
-from vllm.v1.outputs import DraftTokenIds
+from vllm.v1.outputs import DraftTokenIds, StashedTree
 from vllm.v1.worker.gpu.async_utils import async_copy_to_np
 from vllm.v1.worker.gpu.input_batch import InputBatch
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import TreeDraft
 
 logger = init_logger(__name__)
 
@@ -36,12 +41,24 @@ class DraftTokensHandler:
         self.req_ids: list[str] = []
         self.draft_tokens_np: np.ndarray | None = None
         self.num_draft_tokens: int = 0
+        # Per-request stashed tree (parallel to req_ids), or None for the plain
+        # draft-token path. Trees ride along with the token ids into the
+        # scheduler for the next-step verify.
+        self.trees: list[StashedTree | None] | None = None
 
     def set_draft_tokens(
-        self, input_batch: InputBatch, draft_tokens: torch.Tensor
+        self,
+        input_batch: InputBatch,
+        draft_tokens: torch.Tensor,
+        trees: "list[TreeDraft | None] | None" = None,
     ) -> None:
         self.req_ids = input_batch.req_ids
         self.num_draft_tokens = draft_tokens.shape[1]
+        self.trees = (
+            [t.to_lists() if t is not None else None for t in trees]
+            if trees is not None
+            else None
+        )
         if not input_batch.has_structured_output_reqs:
             # No draft token validation needs to be performed by
             # the scheduler for this batch.
@@ -67,7 +84,7 @@ class DraftTokensHandler:
         else:
             # This case only happens when async scheduling is disabled.
             draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
-        return DraftTokenIds(self.req_ids, draft_token_ids)
+        return DraftTokenIds(self.req_ids, draft_token_ids, spec_tree_draft=self.trees)
 
 
 def get_parallel_drafting_token_id(hf_config) -> int:

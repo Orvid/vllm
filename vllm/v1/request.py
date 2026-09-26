@@ -28,6 +28,7 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
+    from vllm.v1.outputs import StashedTree
 
 
 @dataclass
@@ -181,6 +182,9 @@ class Request:
         self.last_sched_seq = 0
 
         self.spec_token_ids: list[int] = []
+        # Stashed df2t tree for those spec tokens; carried worker -> scheduler
+        # as python lists and scheduled next step into SchedulerOutput.
+        self.tree_draft: StashedTree | None = None
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
 

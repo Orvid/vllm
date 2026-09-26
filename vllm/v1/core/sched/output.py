@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+    from vllm.v1.outputs import StashedTree
     from vllm.v1.request import Request
 else:
     AuxOutputConnectorMetadata = object
@@ -34,6 +35,7 @@ else:
     MultiModalFeatureSpec = object
     PoolingParams = object
     SamplingParams = object
+    StashedTree = object
     Request = object
 
 
@@ -314,6 +316,10 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # req_id -> stashed df2t tree, parallel to scheduled_spec_decode_tokens.
+    # Only present for tree (df2t) requests; empty for all other methods.
+    spec_tree_draft: "dict[str, StashedTree]" = field(default_factory=dict)
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
@@ -326,6 +332,7 @@ class SchedulerOutput:
             num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
+            spec_tree_draft={},
         )
 
 

@@ -355,11 +355,28 @@ class AsyncModelRunnerOutput(ABC):
 
 
 @dataclass
+class StashedTree:
+    # Python-list form of a per-request TreeDraft; the only form that crosses
+    # the worker -> scheduler hop (plain ints, not GPU tensors). Rebuild with
+    # TreeDraft.from_lists on the side that needs tensors.
+    token_ids: list[int]
+    depths: list[int]
+    parents: list[int]
+    arena: list[int]
+    words: list[int]
+    # len(token_ids), kept to match the builder's num_nodes; None if absent.
+    num_nodes: int | None = None
+
+
+@dataclass
 class DraftTokenIds:
     # [num_reqs]
     req_ids: list[str]
     # num_reqs x num_draft_tokens
     draft_token_ids: list[list[int]]
+    # Per-request stashed df2t tree, parallel to req_ids; None per request
+    # without one, and the whole field is None for non-tree methods.
+    spec_tree_draft: list[StashedTree | None] | None = None
 
 
 def make_empty_encoder_model_runner_output(

@@ -68,6 +68,7 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
+from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import TreeDraft
 
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
@@ -1877,6 +1878,53 @@ def _run_spec_verify_steps(scheduler, rounds, num_invalid_per_round=None):
             output.num_invalid_spec_tokens = {rid: num_invalid_per_round[i]}
         scheduler.update_from_output(output, _mk_output([out]))
     return req
+
+
+def _make_draft_tree() -> TreeDraft:
+    return TreeDraft(
+        token_ids=torch.tensor([7, 8, 9]),
+        depths=torch.tensor([1, 2, 2]),
+        parents=torch.tensor([-1, 0, 1]),
+        arena=torch.tensor([0, 1, 2]),
+        words=torch.tensor([1, 3, 7]),
+        num_nodes=torch.tensor([3], dtype=torch.int32),
+    )
+
+
+def test_scheduler_carries_tree_draft_to_scheduled_output():
+    """A tree stashed via ``update_draft_token_ids`` lands in
+    ``SchedulerOutput.spec_tree_draft`` for the scheduled step and
+    re-materializes to the original ``TreeDraft``."""
+    scheduler = create_scheduler(num_speculative_tokens=3)
+    [req] = create_requests(num_requests=1, num_tokens=1)
+    scheduler.add_request(req)
+    rid = req.request_id
+    scheduler.update_from_output(
+        scheduler.schedule(),
+        ModelRunnerOutput(
+            req_ids=[rid],
+            req_id_to_index={rid: 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    tree = _make_draft_tree()
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([rid], [[7, 8, 9]], spec_tree_draft=[tree.to_lists()])
+    )
+    output = scheduler.schedule()
+    assert output.scheduled_spec_decode_tokens[rid] == [7, 8, 9]
+    assert rid in output.spec_tree_draft
+    back = TreeDraft.from_lists(output.spec_tree_draft[rid], device="cpu")
+    assert torch.equal(back.token_ids, tree.token_ids)
+    assert torch.equal(back.depths, tree.depths)
+    assert torch.equal(back.parents, tree.parents)
+    assert torch.equal(back.arena, tree.arena)
+    assert torch.equal(back.words, tree.words)
+    assert torch.equal(back.num_nodes, tree.num_nodes)
 
 
 def test_per_request_spec_decode_detailed_records_per_step():

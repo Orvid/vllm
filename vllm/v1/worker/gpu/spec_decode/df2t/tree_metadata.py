@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm.v1.outputs import StashedTree
+
 
 @dataclass
 class TreeDraft:
@@ -18,6 +20,37 @@ class TreeDraft:
     words: torch.Tensor  # uint64 ancestor-or-self bitmask over arena
     # Only populated by the batched triton builder: shape (R,) int32 cuda.
     num_nodes: torch.Tensor | None = None
+
+    def to_lists(self) -> StashedTree:
+        """Portable python-list form for the scheduler hop (not GPU tensors)."""
+        num_nodes = int(self.num_nodes.item()) if self.num_nodes is not None else None
+        return StashedTree(
+            token_ids=self.token_ids.tolist(),
+            depths=self.depths.tolist(),
+            parents=self.parents.tolist(),
+            arena=self.arena.tolist(),
+            words=self.words.tolist(),
+            num_nodes=num_nodes,
+        )
+
+    @classmethod
+    def from_lists(
+        cls, stashed: StashedTree, device: str | torch.device
+    ) -> "TreeDraft":
+        """Re-materialize the tensors back on ``device`` (int64, num_nodes i32)."""
+        num_nodes = (
+            torch.tensor([stashed.num_nodes], dtype=torch.int32, device=device)
+            if stashed.num_nodes is not None
+            else None
+        )
+        return cls(
+            token_ids=torch.tensor(stashed.token_ids, dtype=torch.long, device=device),
+            depths=torch.tensor(stashed.depths, dtype=torch.long, device=device),
+            parents=torch.tensor(stashed.parents, dtype=torch.long, device=device),
+            arena=torch.tensor(stashed.arena, dtype=torch.long, device=device),
+            words=torch.tensor(stashed.words, dtype=torch.long, device=device),
+            num_nodes=num_nodes,
+        )
 
 
 def pack_ancestor_words(
