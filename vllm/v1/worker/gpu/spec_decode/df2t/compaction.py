@@ -74,10 +74,12 @@ def compact_accepted_chain(
         accept_depths: [a] int64 cuda depths of the accepted nodes.
         slot_mapping: int64 block-slot -> physical KV slot for the request's
             verify block, covering ``C + 1 + max(arena)`` and ``C + max(depth)``.
-        kv_caches: per-layer KV caches, each shaped ``[num_blocks,
-            tokens_per_block, num_heads, content]`` (the LBNHC per-layer view;
-            ``content`` channels per head). A physical slot holds one
-            contiguous ``num_heads * content`` run per layer.
+        kv_caches: per-layer KV caches, each the logical ``[num_blocks,
+            num_heads, tokens_per_block, content]`` view (as
+            ``create_kv_cache_views`` returns, ``content`` channels per head)
+            in the LBNHC physical layout, i.e. strided ``(tokens_per_block *
+            num_heads * content, content, num_heads * content, 1)``. A physical
+            slot holds one contiguous ``num_heads * content`` run per layer.
         C: anchor block-slot of the request's tree verify block.
         num_accepted: number of accepted nodes; defaults to
             ``accept_arenas.shape[0]`` so padded buffers can be sliced.
@@ -104,16 +106,24 @@ def compact_accepted_chain(
     copy_mask = src_phys != dst_phys
 
     for layer in kv_caches:
-        num_heads = layer.shape[-2]
-        content = layer.shape[-1]
-        elems = num_heads * content
-        if not layer.is_contiguous():
+        if layer.ndim != 4:
             raise ValueError(
-                "df2t compaction needs per-slot-contiguous (LBNHC) layer caches "
-                "so slot offsets are back-to-back elements; got strides "
-                f"{layer.stride()}"
+                "df2t compaction needs 4D [B, H, N, C] per-layer caches; "
+                f"got shape {tuple(layer.shape)}"
             )
-        kv_flat = layer.view(-1)
+        _, num_heads, tokens_per_block, content = layer.shape
+        elems = num_heads * content
+        # Flat ``physical_slot * elems`` addressing over the raw storage is
+        # valid only when a slot's KV is one contiguous elems-sized run and
+        # slots sit back-to-back: the LBNHC logical-view stride pattern. Any
+        # other physical layout (e.g. LBHNC, where heads are strided by N*C)
+        # would read/write head-strided positions instead, so reject it.
+        if layer.stride() != (tokens_per_block * elems, content, elems, 1):
+            raise ValueError(
+                "df2t compaction requires per-slot-contiguous (LBNHC) layer "
+                f"caches; got strides {layer.stride()} for shape "
+                f"{tuple(layer.shape)}"
+            )
         src_off = src_phys * elems
         dst_off = dst_phys * elems
         grid = (a,)
@@ -121,7 +131,7 @@ def compact_accepted_chain(
             src_off,
             dst_off,
             copy_mask,
-            kv_flat,
+            layer,
             a,
             NUM_EL=elems,
             BLOCK=_CopyBlock,
@@ -129,7 +139,7 @@ def compact_accepted_chain(
         _zero_kernel[grid](
             src_off,
             copy_mask,
-            kv_flat,
+            layer,
             a,
             NUM_EL=elems,
             BLOCK=_CopyBlock,

@@ -5,10 +5,12 @@
 Task 7 ships the KV-compaction primitive: after the tree verify accepts a
 chain, accepted nodes' K/V still live at their scattered tree-block slots
 ``C + 1 + arena`` while inference reads context by ``position -> slot`` (slot
-``C + depth``). These tests pin, on GPU with fake per-layer caches shaped
-``[1, num_slots, num_heads, head_dim]``, that compaction moves each accepted
-node's K/V to the canonical slot, zeroes the stale scattered slots, handles
-multi-layer/multi-node batches, and treats ``num_accepted == 0`` as a no-op.
+``C + depth``). These tests pin, on GPU with fake per-layer caches mirroring
+the engine's logical ``[B, H, N, C]`` LBNHC view (physical storage
+``[B, N, H, C]``), that compaction moves each accepted node's K/V to the
+canonical slot, zeroes the stale scattered slots, handles multi-layer /
+multi-node batches, treats ``num_accepted == 0`` as a no-op, and rejects
+layouts where the flat slot-addressing would corrupt (e.g. LBHNC).
 """
 
 import pytest
@@ -17,10 +19,21 @@ import torch
 from vllm.v1.worker.gpu.spec_decode.df2t.compaction import compact_accepted_chain
 
 
-def _cache(num_slots, num_heads, head_dim):
-    return torch.zeros(
+def _make_layer(num_slots, num_heads, head_dim):
+    """Engine-style LBNHC layer: (logical view, physical storage).
+
+    The physical cache is laid out ``[1, num_slots, num_heads, head_dim]``
+    (contiguous, ``[B, N, H, C]``); the per-layer view is the non-contiguous
+    transpose ``[1, num_heads, num_slots, head_dim]`` (logical ``[B, H, N, C]``
+    with strides ``(num_slots * num_heads * head_dim, head_dim,
+    num_heads * head_dim, 1)``), exactly what ``create_kv_cache_views`` yields
+    under LBNHC. Tests seed/read through ``storage`` and pass ``view`` to the
+    primitive.
+    """
+    storage = torch.zeros(
         1, num_slots, num_heads, head_dim, dtype=torch.float32, device="cuda"
     )
+    return storage.transpose(1, 2), storage
 
 
 def _phys(slot_mapping, block_slots):
@@ -52,24 +65,24 @@ def test_compaction_moves_accepted_chain_to_canonical_slots():
     canon_phys = _phys(slot_mapping, canon_slot)
     assert len(set(scatter_phys + canon_phys)) == 2 * len(arenas)
 
-    cache = _cache(num_slots, H, D)
+    view, storage = _make_layer(num_slots, H, D)
     expected = [torch.full((H, D), float(i + 1), device="cuda") for i in arenas]
     for phys, val in zip(scatter_phys, expected):
-        cache[0, phys] = val
+        storage[0, phys] = val
 
     compact_accepted_chain(
         torch.tensor(arenas, dtype=torch.long, device="cuda"),
         torch.tensor(depths, dtype=torch.long, device="cuda"),
         slot_mapping,
-        [cache],
+        [view],
         C,
         num_accepted=len(arenas),
     )
 
     for phys, val in zip(canon_phys, expected):
-        assert torch.equal(cache[0, phys], val)
+        assert torch.equal(storage[0, phys], val)
     for phys in scatter_phys:
-        assert torch.equal(cache[0, phys], torch.zeros((H, D), device="cuda"))
+        assert torch.equal(storage[0, phys], torch.zeros((H, D), device="cuda"))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -88,20 +101,20 @@ def test_compaction_zeroes_stale_scattered_slots():
     scatter_slot, _ = _scatter_and_canon_slots(C, arenas, depths)
     scatter_phys = _phys(slot_mapping, scatter_slot)
 
-    cache = _cache(num_slots, H, D)
+    view, storage = _make_layer(num_slots, H, D)
     for phys in scatter_phys:
-        cache[0, phys] = torch.full((H, D), 7.0, device="cuda")
+        storage[0, phys] = torch.full((H, D), 7.0, device="cuda")
 
     compact_accepted_chain(
         torch.tensor(arenas, dtype=torch.long, device="cuda"),
         torch.tensor(depths, dtype=torch.long, device="cuda"),
         slot_mapping,
-        [cache],
+        [view],
         C,
     )
 
     for phys in scatter_phys:
-        assert torch.equal(cache[0, phys], torch.zeros((H, D), device="cuda"))
+        assert torch.equal(storage[0, phys], torch.zeros((H, D), device="cuda"))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -119,27 +132,26 @@ def test_compaction_multi_layer_multi_node():
     scatter_phys = _phys(slot_mapping, scatter_slot)
     canon_phys = _phys(slot_mapping, canon_slot)
 
-    caches = [_cache(num_slots, H, D) for D in (8, 16)]
-    for layer, cache in enumerate(caches):
+    layers = [_make_layer(num_slots, H, D) for D in (8, 16)]
+    for layer_idx, (_, storage) in enumerate(layers):
+        fill = torch.full((H, storage.shape[-1]), float(layer_idx + 1), device="cuda")
         for phys in scatter_phys:
-            cache[0, phys] = torch.full(
-                (H, cache.shape[-1]), float(layer + 1), device="cuda"
-            )
+            storage[0, phys] = fill.clone()
 
     compact_accepted_chain(
         torch.tensor(arenas, dtype=torch.long, device="cuda"),
         torch.tensor(depths, dtype=torch.long, device="cuda"),
         slot_mapping,
-        caches,
+        [view for view, _ in layers],
         C,
     )
 
-    for layer, cache in enumerate(caches):
-        fill = torch.full((H, cache.shape[-1]), float(layer + 1), device="cuda")
+    for layer_idx, (_, storage) in enumerate(layers):
+        fill = torch.full((H, storage.shape[-1]), float(layer_idx + 1), device="cuda")
         for phys in canon_phys:
-            assert torch.equal(cache[0, phys], fill)
+            assert torch.equal(storage[0, phys], fill)
         for phys in scatter_phys:
-            assert torch.equal(cache[0, phys], torch.zeros_like(fill))
+            assert torch.equal(storage[0, phys], torch.zeros_like(fill))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -148,20 +160,20 @@ def test_compaction_num_accepted_zero_is_noop():
     cache byte-for-byte unchanged."""
     num_slots, H, D = 8, 4, 8
     slot_mapping = torch.arange(num_slots, dtype=torch.long, device="cuda")
-    cache = _cache(num_slots, H, D)
-    cache.fill_(3.5)
-    snapshot = cache.clone()
+    view, storage = _make_layer(num_slots, H, D)
+    storage.fill_(3.5)
+    snapshot = storage.clone()
 
     compact_accepted_chain(
         torch.tensor([], dtype=torch.long, device="cuda"),
         torch.tensor([], dtype=torch.long, device="cuda"),
         slot_mapping,
-        [cache],
+        [view],
         C=1,
         num_accepted=0,
     )
 
-    assert torch.equal(cache, snapshot)
+    assert torch.equal(storage, snapshot)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -173,19 +185,20 @@ def test_compaction_preserves_node_already_at_canonical_slot():
     arenas = [2]
     depths = [3]  # C + 1 + 2 == C + 3: scattered and canonical coincide.
     slot_mapping = torch.arange(num_slots, dtype=torch.long, device="cuda")
-    cache = _cache(num_slots, H, D)
-    cache[0, C + 1 + arenas[0]] = torch.full((H, D), 9.0, device="cuda")
+    view, storage = _make_layer(num_slots, H, D)
+    storage[0, C + 1 + arenas[0]] = torch.full((H, D), 9.0, device="cuda")
 
     compact_accepted_chain(
         torch.tensor(arenas, dtype=torch.long, device="cuda"),
         torch.tensor(depths, dtype=torch.long, device="cuda"),
         slot_mapping,
-        [cache],
+        [view],
         C,
     )
 
     assert torch.equal(
-        cache[0, C + 1 + arenas[0]], torch.full((H, D), 9.0, device="cuda")
+        storage[0, C + 1 + arenas[0]],
+        torch.full((H, D), 9.0, device="cuda"),
     )
 
 
@@ -204,8 +217,8 @@ def test_compaction_slot_mapping_translation_is_used():
     assert _phys(slot_mapping, scatter_slot) != scatter_slot
     assert _phys(slot_mapping, canon_slot) != canon_slot
 
-    cache = _cache(num_slots, H, D)
-    cache[0, _phys(slot_mapping, scatter_slot)[0]] = torch.full(
+    view, storage = _make_layer(num_slots, H, D)
+    storage[0, _phys(slot_mapping, scatter_slot)[0]] = torch.full(
         (H, D), 5.0, device="cuda"
     )
 
@@ -213,11 +226,55 @@ def test_compaction_slot_mapping_translation_is_used():
         torch.tensor(arenas, dtype=torch.long, device="cuda"),
         torch.tensor(depths, dtype=torch.long, device="cuda"),
         slot_mapping,
-        [cache],
+        [view],
         C,
     )
 
     assert torch.equal(
-        cache[0, _phys(slot_mapping, canon_slot)[0]],
+        storage[0, _phys(slot_mapping, canon_slot)[0]],
         torch.full((H, D), 5.0, device="cuda"),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compaction_stride_guard_accepts_lbnc_rejects_lbhnc():
+    """The stride guard accepts the engine's true LBNHC per-layer view and
+    rejects a contiguous (LBHNC-order) view whose flat addressing would
+    corrupt, instead of silently copying the wrong head-strided positions."""
+    num_slots, H, D = 16, 4, 8
+    C = 3
+    arenas = [1]
+    depths = [1]
+    slot_mapping = torch.arange(num_slots, dtype=torch.long, device="cuda")
+    scatter_slot, canon_slot = _scatter_and_canon_slots(C, arenas, depths)
+    scatter_phys = _phys(slot_mapping, scatter_slot)
+    canon_phys = _phys(slot_mapping, canon_slot)
+
+    # A contiguous [1, H, N, C] tensor is the LBHNC memory order: head stride
+    # is N*C, so slots are head-strided and flat slot addressing is invalid.
+    lbhnc_view = torch.zeros(1, H, num_slots, D, dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match="per-slot-contiguous"):
+        compact_accepted_chain(
+            torch.tensor(arenas, dtype=torch.long, device="cuda"),
+            torch.tensor(depths, dtype=torch.long, device="cuda"),
+            slot_mapping,
+            [lbhnc_view],
+            C,
+        )
+
+    # The true LBNHC logical view (non-contiguous transpose) is accepted and
+    # compacts correctly through its raw storage.
+    view, storage = _make_layer(num_slots, H, D)
+    storage[0, scatter_phys[0]] = torch.full((H, D), 6.0, device="cuda")
+
+    compact_accepted_chain(
+        torch.tensor(arenas, dtype=torch.long, device="cuda"),
+        torch.tensor(depths, dtype=torch.long, device="cuda"),
+        slot_mapping,
+        [view],
+        C,
+    )
+
+    assert torch.equal(
+        storage[0, canon_phys[0]], torch.full((H, D), 6.0, device="cuda")
     )
