@@ -1546,6 +1546,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         c_per_req = self.req_states.num_computed_tokens.gpu[idx_mapping].to(torch.int64)
+        # Defensive: the tree verify block only exists on decode steps with a
+        # non-empty context; a fresh-prompt prefill (C == 0) would attend
+        # nothing and a mixed step is unsupported, so fail closed.
+        assert bool((c_per_req > 0).all().item()), (
+            "df2t flex tree verify requires a decode batch with context (C > 0)"
+        )
         words = pack_tree_mask_inputs(
             trees, num_reqs, spec.max_tree_budget, self.device
         )
@@ -1555,6 +1561,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             words,
             spec.max_tree_budget,
         )
+
+    def _tree_verify_layer_names(self) -> set[str]:
+        """Layer names whose group runs the df2t tree verify block.
+
+        These are the target model's FlexAttention full-attention layers
+        (the layers the selector forced to Flex under
+        ``tree_attention_backend == "flex"``). A Flex metadata from any other
+        group (a Flex drafter or a prefill/encoder group) shares no logical
+        slot space with the tree block and must never receive the tree mask.
+        """
+        from vllm.v1.attention.backends.flex_attention import (
+            FlexAttentionBackend,
+        )
+
+        flex_name = FlexAttentionBackend.get_name()
+        names: set[str] = set()
+        for groups in self.attn_groups:
+            for group in groups:
+                if group.backend.get_name() == flex_name:
+                    names.update(group.layer_names)
+        return names
 
     def _attach_tree_flex_mask(self, attn_metadata: dict[str, Any] | None) -> None:
         """Attach the staged df2t tree mask to the Flex verify metadata."""
@@ -1570,11 +1597,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         num_reqs, c_per_req, words, b = pending
+        # Only the target verify group(s) (see _tree_verify_layer_names) carry
+        # the tree block; a second Flex group's metadata must stay untouched.
+        target_layers = self._tree_verify_layer_names()
         attached = False
-        for metadata in attn_metadata.values():
-            if isinstance(metadata, FlexAttentionMetadata):
-                attach_tree_flex_mask(metadata, num_reqs, c_per_req, words, b)
-                attached = True
+        seen_metadata: set[int] = set()
+        for layer_name, metadata in attn_metadata.items():
+            if layer_name not in target_layers or not isinstance(
+                metadata, FlexAttentionMetadata
+            ):
+                continue
+            if id(metadata) in seen_metadata:
+                continue
+            seen_metadata.add(id(metadata))
+            attach_tree_flex_mask(metadata, num_reqs, c_per_req, words, b)
+            attached = True
         if not attached:
             raise ValueError(
                 "tree_attention_backend='flex' requires running the df2t "

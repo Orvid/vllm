@@ -32,6 +32,7 @@ from vllm.config import set_current_vllm_config
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.flex_attention import (
     FlexAttentionImpl,
+    FlexAttentionMetadata,
     FlexAttentionMetadataBuilder,
 )
 from vllm.v1.kv_cache_interface import KVCacheLayout
@@ -301,3 +302,218 @@ def test_flex_tree_mask_gates_attention():
     torch.testing.assert_close(
         backend_output.float(), sdpa_output.float(), rtol=2e-2, atol=2e-2
     )
+
+
+def _fake_flex_metadata(doc_ids: torch.Tensor) -> FlexAttentionMetadata:
+    """Uninitialised FlexAttentionMetadata (real class, so the runner's
+    isinstance gate passes) with only the fields the df2t attach helper and the
+    assertions touch."""
+    meta = object.__new__(FlexAttentionMetadata)
+    meta.doc_ids = doc_ids
+    meta.logical_mask_mod = None
+    meta.block_sparsity_hint = None
+    meta.mask_mod = None
+    meta.direct_build = False
+    meta.block_mask = None
+    meta.build_calls = 0
+
+    def get_mask_mod():
+        return meta.logical_mask_mod
+
+    def build_block_mask():
+        meta.build_calls += 1
+        meta.block_mask = object()
+        return meta.block_mask
+
+    meta.get_mask_mod = get_mask_mod
+    meta.build_block_mask = build_block_mask
+    return meta
+
+
+class _FakeBackend:
+    def __init__(self, name: str):
+        self._name = name
+
+    def get_name(self):
+        return self._name
+
+
+def _fake_tree(words, device) -> "object":
+    return type(
+        "Tree", (), {"words": torch.tensor(words, dtype=torch.long, device=device)}
+    )()
+
+
+def _fake_runner(spec, req_states, device, attn_groups):
+    import types
+
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    runner = types.SimpleNamespace(
+        speculative_config=spec,
+        req_states=req_states,
+        device=device,
+        _pending_tree_flex_mask=None,
+        attn_groups=attn_groups,
+    )
+    for name in (
+        "_stage_tree_flex_mask",
+        "_tree_verify_layer_names",
+        "_attach_tree_flex_mask",
+    ):
+        setattr(runner, name, types.MethodType(getattr(GPUModelRunner, name), runner))
+    return runner
+
+
+def test_runner_stage_attach_targets_only_the_flex_verify_group():
+    """The runner's stage -> attach path wires the tree mask onto the target
+    Flex verify group only, keyed by the right per-request C and words, and
+    leaves a second Flex metadata (another group) untouched."""
+    device = torch.device("cpu")
+    spec = type(
+        "Spec",
+        (),
+        {"tree_attention_backend": "flex", "max_tree_budget": 64},
+    )()
+    # Two requests: req0 C=4 with a 3-node tree, req1 C=2 with a 2-node tree.
+    num_computed = torch.tensor([4, 2, 0, 0], dtype=torch.int32)
+    req_states = type(
+        "ReqStates", (), {"num_computed_tokens": type("T", (), {"gpu": num_computed})()}
+    )()
+    trees = [_fake_tree([0b1, 0b11, 0b101], device), _fake_tree([0b1, 0b11], device)]
+    idx_mapping = torch.tensor([0, 1], dtype=torch.int32)
+    attn_groups = [
+        [
+            type(
+                "G",
+                (),
+                {
+                    "backend": _FakeBackend("FLEX_ATTENTION"),
+                    "layer_names": ["target.attn"],
+                },
+            )(),
+            type(
+                "G",
+                (),
+                {"backend": _FakeBackend("FLASH_ATTN"), "layer_names": ["other.attn"]},
+            )(),
+        ]
+    ]
+    runner = _fake_runner(spec, req_states, device, attn_groups)
+
+    runner._stage_tree_flex_mask(True, trees, 2, idx_mapping)
+    assert runner._pending_tree_flex_mask is not None
+
+    target_meta = _fake_flex_metadata(
+        torch.tensor([0, 0, 0, 0, 1, 1, 1], dtype=torch.int32)
+    )
+    other_meta = _fake_flex_metadata(
+        torch.tensor([2, 2, 2], dtype=torch.int32)  # a different group's tokens
+    )
+    runner._attach_tree_flex_mask(
+        {"target.attn": target_meta, "other.attn": other_meta}
+    )
+
+    assert runner._pending_tree_flex_mask is None
+    # Only the target Flex group received the tree mask.
+    assert target_meta.logical_mask_mod is not None
+    assert target_meta.block_sparsity_hint is not None
+    assert target_meta.build_calls == 1
+    assert other_meta.logical_mask_mod is None
+    assert other_meta.build_calls == 0
+
+    # The mask lands on the right requests: per-request rows match the manual
+    # matrix through the target metadata's doc_ids lookup.
+    h = torch.zeros(1, dtype=torch.long)
+    query_lens = [4, 3]  # 1 + B per request (anchor + nodes)
+    start = 0
+    for r, (c, w, b_nodes) in enumerate(
+        [(4, [0b1, 0b11, 0b101], 3), (2, [0b1, 0b11], 2)]
+    ):
+        n_r = c + 1 + b_nodes
+        b_for_q = torch.full((n_r,), start, dtype=torch.long)
+        b_for_q[c] = start
+        b_for_q[c + 1 : c + 1 + b_nodes] = (
+            start + 1 + torch.arange(b_nodes, dtype=torch.long)
+        )
+        q = torch.arange(n_r, dtype=torch.long)[:, None].expand(n_r, n_r)
+        k = torch.arange(n_r, dtype=torch.long)[None, :].expand(n_r, n_r)
+        b_grid = b_for_q[:, None].expand(n_r, n_r)
+        got = target_meta.logical_mask_mod(b_grid, h, q, k)
+        assert torch.equal(got[c:], _manual_matrix(c, w, b_nodes)[c:])
+        start += query_lens[r]
+
+
+def test_runner_stage_rejects_zero_context():
+    """A zero-context (fresh-prompt prefill) staged flex-tree batch fails
+    closed instead of silently running a mask that attends nothing."""
+    device = torch.device("cpu")
+    spec = type("Spec", (), {"tree_attention_backend": "flex", "max_tree_budget": 64})()
+    num_computed = torch.tensor([4, 0], dtype=torch.int32)
+    req_states = type(
+        "ReqStates", (), {"num_computed_tokens": type("T", (), {"gpu": num_computed})()}
+    )()
+    trees = [_fake_tree([0b1, 0b11], device)]
+    idx_mapping = torch.tensor([0, 1], dtype=torch.int32)
+    runner = _fake_runner(
+        spec,
+        req_states,
+        device,
+        [
+            [
+                type(
+                    "G",
+                    (),
+                    {
+                        "backend": _FakeBackend("FLEX_ATTENTION"),
+                        "layer_names": ["target.attn"],
+                    },
+                )()
+            ]
+        ],
+    )
+
+    with pytest.raises(AssertionError, match="decode batch"):
+        runner._stage_tree_flex_mask(True, trees, 2, idx_mapping)
+    assert runner._pending_tree_flex_mask is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_df2t_flex_selector_forces_flex_backend():
+    """tree_attention_backend == 'flex' routes the plain decoder full-attention
+    layers to the FlexAttention vehicle on df2t, while windowed / MLA / encoder
+    kinds and the default 'fa4' stay on their usual backends."""
+    from types import SimpleNamespace
+
+    from vllm.v1.attention.backend import AttentionType
+    from vllm.v1.attention.selector import get_attn_backend
+
+    def spec_obj(tree_attention_backend):
+        return SimpleNamespace(
+            use_df2t=lambda: True,
+            tree_attention_backend=tree_attention_backend,
+            enable_adaptive_verification=False,
+            num_speculative_tokens=0,
+        )
+
+    def resolve(tree_attention_backend, **kwargs):
+        cfg = create_vllm_config(
+            model_name="Qwen/Qwen3-0.6B", max_model_len=64, block_size=16
+        )
+        cfg.speculative_config = spec_obj(tree_attention_backend)
+        head_size = cfg.model_config.get_head_size()
+        with set_current_vllm_config(cfg):
+            return get_attn_backend(
+                head_size=head_size,
+                dtype=torch.float16,
+                kv_cache_dtype="auto",
+                num_heads=cfg.model_config.get_num_attention_heads(cfg.parallel_config),
+                **kwargs,
+            ).get_name()
+
+    assert resolve("flex") == "FLEX_ATTENTION"
+    # Windowed / MLA / encoder kinds and the default 'fa4' are not forced.
+    assert resolve("flex", has_sliding_window=True) != "FLEX_ATTENTION"
+    assert resolve("flex", use_mla=True) != "FLEX_ATTENTION"
+    assert resolve("flex", attn_type=AttentionType.ENCODER_ONLY) != "FLEX_ATTENTION"
+    assert resolve("fa4") != "FLEX_ATTENTION"
