@@ -476,3 +476,90 @@ def test_model_runner_df2t_tree_verify_mixed_batch():
     assert n - 1 == nacc_ref
     assert sampled[0, :n].tolist() == out_ref
     assert int(out.num_rejected[0].item()) == int(cu_np[1] - cu_np[0]) - n
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_df2t_production_pipeline_matches_reference():
+    """Pins the PRODUCTION df2t verify pipeline against the oracle.
+
+    Real serving routes the verify block through ``SamplingStates`` kernels
+    (apply_temperature, apply_min_p, apply_top_k_top_p) before the TreeVerifier
+    softmaxes every row. This test drives exactly those kernels with NON-default
+    per-request temperature/top-k/top-p/min_p (incl. an exact top-k boundary
+    tie) and compares the resulting per-token distribution to the oracle's
+    processed convention: a dropped or wrongly ordered temperature/top-k/top-p
+    stage in the kernel path (which the runner parity tests' keep-all default
+    would mask) fails the support or argmax equality here.
+    """
+    from vllm.v1.worker.gpu.sample.states import SamplingStates
+
+    device = torch.device("cuda")
+    num_reqs, vocab = 8, 128
+    params: list[dict[str, float | int | None]] = [
+        dict(temperature=0.8, top_k=4, top_p=0.9, min_p=0.0),
+        dict(temperature=1.0, top_k=6, top_p=0.8, min_p=0.0),
+        dict(temperature=0.7, top_k=3, top_p=None, min_p=0.0),
+        dict(temperature=1.1, top_k=None, top_p=0.95, min_p=0.0),
+        dict(temperature=0.9, top_k=2, top_p=0.9, min_p=0.05),
+        dict(temperature=1.0, top_k=None, top_p=None, min_p=0.0),
+        dict(temperature=0.5, top_k=8, top_p=0.6, min_p=0.1),
+        dict(temperature=1.0, top_k=5, top_p=0.9, min_p=0.0),
+    ]
+    raw = torch.randn(num_reqs, vocab, device=device)
+    # Row 0: exact tie at the top-k=4 boundary (two tokens at rank 4/5), so the
+    # kernel must keep BOTH boundary tokens or the support check fails.
+    row0 = torch.full((vocab,), -5.0, device=device)
+    row0[0], row0[1], row0[2] = 8.0, 7.0, 6.0
+    row0[3], row0[4] = 5.0, 5.0
+    raw[0] = row0
+
+    ss = SamplingStates(num_reqs, vocab)
+    for r, p in enumerate(params):
+        ss.temperature.np[r] = p["temperature"]
+        ss.top_k.np[r] = p["top_k"] if p["top_k"] else vocab
+        ss.top_p.np[r] = p["top_p"] if p["top_p"] is not None else 1.0
+        ss.min_p.np[r] = p["min_p"]
+        ss.seeds_set[r] = False
+    ss.temperature.copy_to_uva()
+    ss.top_k.copy_to_uva()
+    ss.top_p.copy_to_uva()
+    ss.min_p.copy_to_uva()
+
+    logits = raw.clone()
+    exp_map = torch.arange(num_reqs, dtype=torch.int32, device=device)
+    idx_np = torch.arange(num_reqs).numpy()
+    ss.apply_temperature(logits, exp_map, idx_np)
+    ss.apply_min_p(logits, exp_map, idx_np)
+    processed = ss.apply_top_k_top_p(logits, exp_map, idx_np)
+
+    def _expected_minp(row, temperature, top_k, top_p, min_p):
+        # Production order (temperature -> min_p -> top-k -> top-p), using the
+        # oracle convention for each stage. With min_p == 0 this reduces to the
+        # oracle's processed distribution.
+        temperature = float(temperature) if temperature is not None else None
+        top_k = int(top_k) if top_k is not None else None
+        top_p = float(top_p) if top_p is not None else None
+        p = _ref_processed(row, temperature, top_k, top_p)
+        if min_p and 0.0 < float(min_p) <= 1.0:
+            keep = p >= float(min_p) * float(p.max())
+            p = torch.where(keep, p, torch.zeros_like(p))
+            if bool(keep.any()):
+                p = p / p.sum()
+        return p
+
+    for r, p in enumerate(params):
+        expected = _expected_minp(
+            raw[r],
+            p["temperature"],
+            p["top_k"],
+            p["top_p"],
+            p["min_p"],
+        ).to(torch.float64)
+        actual = torch.softmax(processed[r].to(torch.float64), dim=-1)
+        support_ok = bool(((actual > 1e-9) == (expected > 1e-9)).all().item())
+        assert support_ok, f"row {r}: kept set diverges from the reference"
+        assert int(torch.argmax(actual)) == int(torch.argmax(expected)), (
+            f"row {r}: argmax diverges from the reference"
+        )
+        max_diff = float((actual - expected).abs().max())
+        assert max_diff < 1e-5, f"row {r}: probability diff {max_diff}"

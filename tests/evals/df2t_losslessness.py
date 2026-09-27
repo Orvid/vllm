@@ -32,13 +32,18 @@ verifier.
 """
 
 import argparse
+from typing import TYPE_CHECKING
 
+import numpy as np
 import pytest
 import torch
 
 from vllm.v1.worker.gpu.spec_decode.df2t.reference_verifier import _processed
 from vllm.v1.worker.gpu.spec_decode.df2t.tree_builder import TreeBuilder
 from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import TreeVerifier
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.sample.states import SamplingStates
 
 # Synthetic model knobs (small enough for a tight, fast gate).
 VOCAB = 12  # contexts/last-token rows
@@ -135,9 +140,17 @@ def _decode(
     steps: int,
     replicas: int,
     seed: int,
+    prod_ss: "SamplingStates | None" = None,
 ) -> tuple[torch.Tensor, int]:
     """Batched df2t decode loop; returns the (anchor, emitted) count matrix and
-    the count of any emitted token that deviates from the target argmax."""
+    the count of any emitted token that deviates from the target argmax.
+
+    With ``prod_ss`` set, every target row is preprocessed through the real
+    production sampling kernels (apply_temperature / apply_min_p /
+    apply_top_k_top_p on a per-request SamplingStates) before the verifier
+    softmaxes it — the exact architecture ``_df2t_tree_verify`` uses in
+    serving — instead of the verifier's reference-convention ``_processed``.
+    """
     dev = p_logits.device
     g = torch.Generator().manual_seed(seed)
     counts = torch.zeros(vocab, vocab, dtype=torch.long, device=dev)
@@ -155,16 +168,38 @@ def _decode(
     for _ in range(steps):
         token_ids, parents, num_nodes = _build_step(anchors, q_logits, builder)
         target = _target_rows(anchors, token_ids, num_nodes, p_logits)
-        sampled, num_sampled = verifier(
-            target,
-            token_ids,
-            parents,
-            num_nodes,
-            greedy=greedy,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-        )
+        if prod_ss is not None:
+            rows = target.shape[1]
+            flat = target.reshape(replicas * rows, vocab).clone()
+            exp_map = (
+                torch.arange(replicas * rows, device=dev)
+                .div(rows, rounding_mode="floor")
+                .to(torch.int32)
+            )
+            idx_np = np.arange(replicas)
+            prod_ss.apply_temperature(flat, exp_map, idx_np)
+            prod_ss.apply_min_p(flat, exp_map, idx_np)
+            target = prod_ss.apply_top_k_top_p(flat, exp_map, idx_np).reshape(
+                replicas, rows, vocab
+            )
+            sampled, num_sampled = verifier(
+                target,
+                token_ids,
+                parents,
+                num_nodes,
+                greedy=greedy,
+            )
+        else:
+            sampled, num_sampled = verifier(
+                target,
+                token_ids,
+                parents,
+                num_nodes,
+                greedy=greedy,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
         active = pos < num_sampled.to(torch.long)[:, None]
         em = sampled[active]
         ra = rr[active]
@@ -234,9 +269,27 @@ def _run_gates(**knobs: int | float) -> dict[str, float]:
     p_logits, q_logits = _tables(7, device)
     builder = TreeBuilder(r, int(knobs["L"]), int(knobs["K"]), int(knobs["B"]), device)
     verifier = TreeVerifier(r, int(knobs["B"]), vocab, device)
+    # The real production sampling pipeline the serving path routes the verify
+    # block through (apply_temperature / apply_min_p / apply_top_k_top_p).
+    from vllm.v1.worker.gpu.sample.states import SamplingStates
+
+    prod_ss = SamplingStates(r, vocab)
+    prod_ss.temperature.np[:] = float(knobs.get("PROD_TEMPERATURE", 0.9))
+    prod_ss.top_k.np[:] = int(knobs.get("PROD_TOP_K", 8))
+    prod_ss.top_p.np[:] = float(knobs.get("PROD_TOP_P", 0.95))
+    prod_ss.min_p.np[:] = 0.0
+    prod_ss.seeds_set[:] = False
+    prod_ss.temperature.copy_to_uva()
+    prod_ss.top_k.copy_to_uva()
+    prod_ss.top_p.copy_to_uva()
+    prod_ss.min_p.copy_to_uva()
 
     def gate(
-        greedy: bool, temperature: float, top_k: int | None, top_p: float | None
+        greedy: bool,
+        temperature: float,
+        top_k: int | None,
+        top_p: float | None,
+        production: bool,
     ) -> tuple[float, float, int, int]:
         counts, bad = _decode(
             p_logits,
@@ -251,6 +304,7 @@ def _run_gates(**knobs: int | float) -> dict[str, float]:
             steps=steps,
             replicas=r,
             seed=vocab + (0 if greedy else 1),
+            prod_ss=prod_ss if production else None,
         )
         # T=0 is deterministic (one-hot target), so even the ~R/12 samples a
         # greedy-unreachable context gets are conclusive; the sampling gate
@@ -261,8 +315,9 @@ def _run_gates(**knobs: int | float) -> dict[str, float]:
         total = int(counts.sum().item())
         return mean_kl, float(bad), total, covered
 
-    kl_t0, bad_t0, total_t0, covered_t0 = gate(True, 1.0, None, None)
-    kl_tgt, bad_tgt, total_tgt, covered_tgt = gate(False, 0.9, 8, 0.95)
+    kl_t0, bad_t0, total_t0, covered_t0 = gate(True, 1.0, None, None, False)
+    kl_raw, bad_raw, total_raw, covered_raw = gate(False, 0.9, 8, 0.95, False)
+    kl_tgt, bad_tgt, total_tgt, covered_tgt = gate(False, 0.9, 8, 0.95, True)
     return {
         "VOCAB": vocab,
         "R": r,
@@ -272,6 +327,9 @@ def _run_gates(**knobs: int | float) -> dict[str, float]:
         "covered_t0": covered_t0,
         "kl_t0": kl_t0,
         "bad_t0": int(bad_t0),
+        "total_raw": total_raw,
+        "covered_raw": covered_raw,
+        "kl_raw": kl_raw,
         "total_tgt": total_tgt,
         "covered_tgt": covered_tgt,
         "kl_tgt": kl_tgt,
@@ -281,7 +339,13 @@ def _run_gates(**knobs: int | float) -> dict[str, float]:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required (triton)")
 def test_df2t_losslessness() -> None:
     """Hard gate: bit-identical accepted tokens at T=0 and KL < 1e-3 in both
-    the greedy and the production (T>0, top-p/top-k) regimes."""
+    the greedy and the production (T>0, top-p/top-k) regimes.
+
+    The T>0 gate runs through the REAL production sampling kernels (via
+    ``SamplingStates.apply_temperature/apply_min_p/apply_top_k_top_p``), not
+    just the standalone verifier's reference-convention processing, so a
+    dropped or wrongly ordered stage in the serving path fails the gate.
+    """
     results = _run_gates(**_DEFAULTS)
     print(f"\n  df2t losslessness: {results}")
     assert results["covered_t0"] == results["VOCAB"], "T=0: contexts starved"
@@ -289,8 +353,12 @@ def test_df2t_losslessness() -> None:
         f"T=0: {results['bad_t0']} emitted tokens != target argmax"
     )
     assert results["kl_t0"] < results["KL_GATE"], f"T=0 KL {results['kl_t0']}"
+    assert results["covered_raw"] == results["VOCAB"], "raw: contexts starved"
+    assert results["kl_raw"] < results["KL_GATE"], f"raw KL {results['kl_raw']}"
     assert results["covered_tgt"] == results["VOCAB"], "prod: contexts starved"
-    assert results["kl_tgt"] < results["KL_GATE"], f"prod KL {results['kl_tgt']}"
+    assert results["kl_tgt"] < results["KL_GATE"], (
+        f"production-kernel KL {results['kl_tgt']}"
+    )
 
 
 def _main() -> None:
@@ -306,6 +374,7 @@ def _main() -> None:
     ok = (
         results["bad_t0"] == 0
         and results["kl_t0"] < knobs["KL_GATE"]
+        and results["kl_raw"] < knobs["KL_GATE"]
         and results["kl_tgt"] < knobs["KL_GATE"]
     )
     raise SystemExit(0 if ok else 1)
