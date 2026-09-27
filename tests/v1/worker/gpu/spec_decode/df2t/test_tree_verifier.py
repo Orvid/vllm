@@ -270,8 +270,9 @@ def test_tree_verifier_chain_equals_greedy_walk_t0(device):
 
 @pytest.mark.parametrize("device", _DEVICES)
 def test_tree_verifier_stops_and_masks_early_done_requests(device):
-    """Requests that finish at depth 0 (anchor mismatch) must not be drawn from
-    again at later depths, and their later sampled rows stay untouched."""
+    """A request whose anchor draw matches no tree child emits exactly one
+    token (the anchor row draw) and is masked out of every later depth, so
+    num_sampled == 1 and only the anchor column of its sampled row is written."""
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA required")
     # One request has an anchor whose argmax never matches any drafted token:
@@ -296,6 +297,10 @@ def test_tree_verifier_stops_and_masks_early_done_requests(device):
     sampled, num_sampled = tv(target_logits, token_ids, parents, num_nodes, greedy=True)
     assert int(num_sampled[0].item()) == 1
     assert sampled[0, 0].item() == 7
+    # Request 0 stops at depth 0: no later column of its row is written.
+    assert sampled[0, 1:].tolist() == [0] * B
+    assert int(num_sampled[1].item()) == B + 1
+    assert sampled[1, : B + 1].tolist() == [1, 2, 3, 4, 5]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -351,23 +356,33 @@ def test_model_runner_df2t_tree_verify_output_contract():
     # verifier's greedy flag, so compare against the greedy reference.
     ss.temperature.np[:] = 0.0
     ss.temperature.copy_to_uva()
-    # top_k/top_p default to "keep all", so the processed distribution is the
-    # raw softmax; no request is seeded.
+    # top_k/top_p default to "keep all"; no request is seeded.
     prefill_len = SimpleNamespace(
         gpu=torch.zeros(num_reqs, dtype=torch.int32, device=device)
     )
+    pipeline_calls: list[int] = []
+
+    def apply_sampling_params(logits, *args, **kwargs):
+        # All-default params: the real pipeline would return the logits
+        # unchanged; record that the wiring routed through it.
+        pipeline_calls.append(1)
+        return logits
+
     fake_self = SimpleNamespace(
         tree_verifier=tree_verifier,
         sampler=SimpleNamespace(
             sampling_states=ss,
             req_states=SimpleNamespace(prefill_len=prefill_len),
             compute_nans=False,
+            apply_sampling_params=apply_sampling_params,
         ),
         device=device,
     )
 
     out = GPUModelRunner._df2t_tree_verify(fake_self, logits, ib)
     sampled, num_sampled = out.sampled_token_ids, out.num_sampled
+
+    assert pipeline_calls, "df2t must route logits through the sampling pipeline"
 
     assert sampled.dtype == torch.int64 and sampled.shape == (num_reqs, B + 1)
     assert num_sampled.dtype == torch.int32
@@ -381,3 +396,83 @@ def test_model_runner_df2t_tree_verify_output_contract():
         assert n - 1 == nacc_ref
         assert sampled[r, :n].tolist() == out_ref
         assert int(out.num_rejected[r].item()) == int(cu_np[r + 1] - cu_np[r]) - n
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_model_runner_df2t_tree_verify_mixed_batch():
+    """A request without a scheduled tree in a df2t step must not crash the
+    worker: it is verified as an empty tree (a plain single-token draw from its
+    anchor row, num_sampled == 1), while the tree-carrying requests in the same
+    step keep their full tree verification untouched."""
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from vllm.v1.worker.gpu.input_batch import (
+        InputBatch,
+        InputBuffers,
+    )
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+    from vllm.v1.worker.gpu.sample.states import SamplingStates
+
+    device = torch.device("cuda")
+    vocab = 48
+    B = 5
+    # Request 0 carries a tree (chain of 2 nodes), request 1 has no tree.
+    num_reqs = 2
+    torch.manual_seed(10)
+    token_ids = torch.tensor([[7, 3], [0, 0]], device=device)
+    parents = torch.tensor([[-1, 0], [-2, -2]], device=device)
+    logits_all = torch.randn(num_reqs, 1 + B, vocab, device=device)
+
+    # Flatten to the runner layout: request 0 -> 1 + 2 rows, request 1 -> 1 row.
+    cu_np = np.array([0, 1 + 2, 1 + 2 + 1], dtype=np.int64)
+    logits = torch.cat([logits_all[0, :3], logits_all[1, :1]], dim=0).to(device)
+    cu = torch.tensor(cu_np, dtype=torch.int32, device=device)
+
+    batches = InputBuffers(num_reqs, logits.shape[0], device)
+    ib = InputBatch.make_dummy(num_reqs, logits.shape[0], batches, is_padding=True)
+    ib.cu_num_logits = cu
+    ib.seq_lens = torch.ones(num_reqs, dtype=torch.int32, device=device) * 50
+    ib.trees = [
+        SimpleNamespace(token_ids=token_ids[0, :2], parents=parents[0, :2]),
+        None,
+    ]
+
+    ss = SamplingStates(num_reqs, vocab)
+    ss.temperature.np[:] = 0.0
+    ss.temperature.copy_to_uva()
+    prefill_len = SimpleNamespace(
+        gpu=torch.zeros(num_reqs, dtype=torch.int32, device=device)
+    )
+
+    def apply_sampling_params(logits, *args, **kwargs):
+        return logits
+
+    fake_self = SimpleNamespace(
+        tree_verifier=TreeVerifier(num_reqs, B, vocab, device),
+        sampler=SimpleNamespace(
+            sampling_states=ss,
+            req_states=SimpleNamespace(prefill_len=prefill_len),
+            compute_nans=False,
+            apply_sampling_params=apply_sampling_params,
+        ),
+        device=device,
+    )
+
+    out = GPUModelRunner._df2t_tree_verify(fake_self, logits, ib)
+    sampled, num_sampled = out.sampled_token_ids, out.num_sampled
+
+    assert sampled.shape == (num_reqs, 1 + 2)  # 1 + batch b_max (request 0)
+    # Plain request: exactly one token from its anchor row (the argmax at T=0).
+    assert int(num_sampled[1].item()) == 1
+    assert sampled[1, 0].item() == int(torch.argmax(logits_all[1, 0]).item())
+    assert int(out.num_rejected[1].item()) == 0
+    # Tree request: unchanged full traversal, matching the greedy reference.
+    out_ref, nacc_ref = tree_verify_reference(
+        logits_all[0], token_ids[0, :2], parents[0, :2], greedy=True
+    )
+    n = int(num_sampled[0].item())
+    assert n - 1 == nacc_ref
+    assert sampled[0, :n].tolist() == out_ref
+    assert int(out.num_rejected[0].item()) == int(cu_np[1] - cu_np[0]) - n

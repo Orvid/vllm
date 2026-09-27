@@ -86,6 +86,7 @@ class TreeVerifier:
     ) -> torch.Tensor:
         """Full-vocab processed distribution over ``[.., V]`` rows, matching
         ``reference_verifier._processed`` per row (see module docstring)."""
+        n_e = torch.tensor(_NEG_INF, dtype=logits.dtype, device=logits.device)
         if temperature is not None:
             mask = (temperature > 0) & (temperature != 1.0)
             if bool(mask.any()):
@@ -98,9 +99,8 @@ class TreeVerifier:
                 v = logits.shape[-1]
                 k = top_k.clamp(min=1, max=v)
                 thr_val = torch.topk(logits, int(k.max()), dim=-1).values
-                n_e = torch.tensor(_NEG_INF, dtype=logits.dtype, device=logits.device)
                 thr = torch.gather(thr_val, -1, (k - 1).unsqueeze(-1)).squeeze(-1)
-                thr = torch.where(do_k, thr, torch.full_like(thr, _NEG_INF))
+                thr = torch.where(do_k, thr, torch.full_like(thr, n_e))
                 logits = torch.where(logits < thr[:, None], n_e, logits)
         if top_p is not None:
             do_p = (top_p > 0) & (top_p < 1.0)
@@ -111,7 +111,6 @@ class TreeVerifier:
                 arange = torch.arange(
                     logits.shape[-1], device=logits.device, dtype=torch.long
                 )
-                n_e = torch.tensor(_NEG_INF, dtype=logits.dtype, device=logits.device)
                 kept = torch.where(arange[None, :] < n_keep[:, None], srt, n_e)
                 restored = torch.empty_like(logits)
                 restored.scatter_(-1, idx, kept)

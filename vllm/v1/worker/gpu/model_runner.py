@@ -1773,24 +1773,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> SamplerOutput:
         """DF2T tree-traversal verification (v5 spec §3.6).
 
-        Reads the scheduler's tree for each request, gathers the request's
-        target logits rows (row 0 = anchor, row ``1 + arena`` = node ``arena``)
-        into ``[num_reqs, 1 + B, vocab]``, runs the TreeVerifier, and emits the
-        rejection-sampler output contract unchanged (``sampled [R, 1 + B]`` /
-        ``num_sampled [R]``), so ``get_num_sampled_and_rejected`` and
-        ``postprocess_sampled`` consume it as-is.
+        Runs the same per-request logits pipeline ordinary decoding uses
+        (logits processors, min_p, temperature, top-k/top-p) on the verify
+        block, then gathers each request's processed rows (row 0 = anchor, row
+        ``1 + arena`` = node ``arena``) into ``[num_reqs, 1 + B, vocab]`` and
+        runs the TreeVerifier, which softmaxes and draws one token per depth.
+        Emits the rejection-sampler output contract unchanged (``sampled [R,
+        1 + B]`` / ``num_sampled [R]``) so ``get_num_sampled_and_rejected``
+        and ``postprocess_sampled`` consume it as-is. Requests without a
+        scheduled tree this step (first decode, joined mid-step) verify as an
+        empty tree: a plain single-token draw from their anchor row — never
+        dropped, and never crashes the worker.
         """
         trees = input_batch.trees
         assert trees is not None
         assert self.tree_verifier is not None
         assert self.sampler is not None
         num_reqs = input_batch.num_reqs
-        typed_trees = [t for t in trees if t is not None]
-        assert len(typed_trees) == len(trees), (
-            "df2t batches must carry a tree for every request"
-        )
-        b_max = max(t.token_ids.shape[0] for t in typed_trees)
         cu = input_batch.cu_num_logits.tolist()
+        b_vals = [t.token_ids.shape[0] if t is not None else 0 for t in trees]
+        b_max = max(b_vals)
+
+        # The full ordinary-decode logits pipeline (penalties, custom
+        # processors, min_p, temperature, top-k/top-p). A df2t request must
+        # never silently drop its active sampling/processing configuration.
+        processed = self.sampler.apply_sampling_params(
+            logits,
+            input_batch.expanded_idx_mapping,
+            input_batch.idx_mapping,
+            input_batch.idx_mapping_np,
+            input_batch.positions[input_batch.logits_indices],
+            input_batch.input_ids[input_batch.logits_indices],
+            input_batch.expanded_local_pos,
+            input_batch.seq_lens_cpu_upper_bound.numpy(),
+        )
         token_ids = torch.zeros(num_reqs, b_max, dtype=torch.long, device=self.device)
         parents = torch.full(
             (num_reqs, b_max), -2, dtype=torch.long, device=self.device
@@ -1800,33 +1816,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_reqs,
             1 + b_max,
             logits.shape[-1],
-            dtype=logits.dtype,
+            dtype=processed.dtype,
             device=self.device,
         )
-        for r, tree in enumerate(typed_trees):
-            b = tree.token_ids.shape[0]
+        for r, (tree, b) in enumerate(zip(trees, b_vals)):
+            if tree is None:
+                # Empty tree: a single-token draw from the anchor row.
+                target[r, 0] = processed[cu[r]]
+                continue
             token_ids[r, :b] = tree.token_ids
             parents[r, :b] = tree.parents
             num_nodes[r] = b
-            target[r, : 1 + b] = logits[cu[r] : cu[r + 1]]
+            target[r, : 1 + b] = processed[cu[r] : cu[r + 1]]
 
         ss = self.sampler.sampling_states
         idx = input_batch.idx_mapping
-        temperature = ss.temperature.gpu[idx]
-        top_k = ss.top_k.gpu[idx]
-        top_p = ss.top_p.gpu[idx]
         seeds = None
         if ss.any_explicit_seed(input_batch.idx_mapping_np):
             seeds = ss.seeds.gpu[idx]
+        # temperature/top-k/top-p are already applied by the pipeline above, so
+        # the verifier only softmaxes the processed rows for the draw.
         sampled, num_sampled = self.tree_verifier(
             target,
             token_ids,
             parents,
             num_nodes,
-            greedy=temperature == 0.0,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
+            greedy=ss.temperature.gpu[idx] == 0.0,
             seeds=seeds,
         )
         num_sampled, num_rejected = get_num_sampled_and_rejected(
