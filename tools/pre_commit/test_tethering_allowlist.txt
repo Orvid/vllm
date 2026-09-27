@@ -50,6 +50,7 @@ tests/lora/test_qwen3moe_tp.py  # --ignore'd from sharded LoRA run; no dedicated
 
 # tests/models/ - the models_*.yaml jobs run specific paths, not all of models/.
 tests/models/deepseek_v32/test_sequence_parallel.py  # no models_*.yaml job collects this path
+tests/models/test_qwen3_df2t_confidence.py  # df2t feature (synthetic confidence-head unit test); no models_*.yaml job collects this path yet
 tests/models/test_deepseek_v4_dspark_rocm.py  # added by #52362 (2026-09-21), no models_*.yaml job collects this path
 tests/models/test_deepseek_v4_fi_moe_ep.py  # no models_*.yaml job collects this path
 tests/models/test_deepseek_v4_rocm_compressor_gemm_fusion.py  # no models_*.yaml job collects this path
