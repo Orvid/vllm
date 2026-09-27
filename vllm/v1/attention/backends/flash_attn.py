@@ -184,6 +184,14 @@ class FA4DenseAttentionKernel(VllmJitKernel["FA4DenseAttentionKernel.CompileKey"
             q_stages = WarmupChoices(1)
             single_batches = WarmupChoices(False)
             split_counts = WarmupChoices(1, 32, 64, 128, 256)
+        elif major == 12:
+            # SM120 (consumer Blackwell) FA4 runs decode (q_stage=1) and
+            # extend (q_stage=2) through the CpAsync SM80-base forward kernel;
+            # warm the paged causal/window variants at num_splits=1 (SplitKV
+            # is not used on SM120 in vLLM).
+            q_stages = WarmupChoices(1, 2)
+            single_batches = WarmupChoices(True, False)
+            split_counts = WarmupChoices(1)
         else:
             return []
 

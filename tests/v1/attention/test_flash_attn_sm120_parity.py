@@ -1,0 +1,351 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""FA4 parity and selection on SM120 (RTX 5090, compute capability 12.0).
+
+FA4 is available on consumer Blackwell, but `get_flash_attn_version` only
+selects it under df2t speculative decoding; without a df2t speculative config
+SM120 keeps resolving to FA2 exactly as before. These tests pin both sides of
+that gate and run the adopted FA4 CuTe-DSL forward against FA2 and a dense
+float32 SDPA reference.
+
+All configs are built offline from a locally-written minimal Qwen3-0.6B
+config.json (no HuggingFace access), mirroring the df2t spec-decode fixtures.
+"""
+
+import json
+
+import pytest
+import torch
+
+from vllm.platforms import current_platform
+
+# --------------------------------------------------------------------------- #
+# Promote definite analysis over uncertain assertions: this suite runs against
+# the real kernel, so the SKIP guard must be airtight.
+# --------------------------------------------------------------------------- #
+
+
+def _sm120() -> bool:
+    capability = current_platform.get_device_capability()
+    return (
+        current_platform.is_cuda() and capability is not None and capability.major == 12
+    )
+
+
+def _fa4_available() -> bool:
+    if not current_platform.is_cuda():
+        return False
+    from vllm.v1.attention.backends.fa_utils import is_fa_version_supported
+
+    return is_fa_version_supported(4)
+
+
+requires_sm120_fa4 = pytest.mark.skipif(
+    not (_sm120() and _fa4_available()),
+    reason="FA4 on SM120 parity requires an SM120 device with FA4 available",
+)
+
+# Imported conditionally because these pull in CuTe / FA4 build artifacts that
+# are absent wherever requires_sm120_fa4 skips.
+if _sm120() and _fa4_available():  # pragma: no branch
+    from tests.v1.attention.utils import (
+        create_standard_kv_cache_spec,
+        create_vllm_config,
+    )
+    from vllm.config import set_current_vllm_config
+    from vllm.v1.attention.backends.fa_utils import (
+        get_flash_attn_version,
+        is_fa_version_supported,
+    )
+    from vllm.v1.attention.backends.flash_attn import FA4DenseAttentionKernel
+    from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
+
+    DEVICE = torch.device("cuda:0")
+    DTYPE = torch.bfloat16
+    HEAD_DIM = 128
+    NUM_HEADS = 16
+    NUM_KV_HEADS = 8
+    BLOCK_SIZE = 128
+    TOL = 3e-2
+
+    _MINIMAL_QWEN3_CONFIG = {
+        "architectures": ["Qwen3ForCausalLM"],
+        "model_type": "qwen3",
+        "hidden_size": 1024,
+        "intermediate_size": 3072,
+        "num_hidden_layers": 28,
+        "num_attention_heads": NUM_HEADS,
+        "num_key_value_heads": NUM_KV_HEADS,
+        "head_dim": HEAD_DIM,
+        "vocab_size": 151936,
+        "max_position_embeddings": 32768,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 1000000.0,
+        "tie_word_embeddings": True,
+        "sliding_window": None,
+        "use_sliding_window": False,
+        "bos_token_id": 151643,
+        "eos_token_id": 151645,
+    }
+
+
+@pytest.fixture(scope="module")
+def qwen3_config_path(tmp_path_factory):
+    """A local directory holding a minimal Qwen3-0.6B config.json (offline)."""
+    root = tmp_path_factory.mktemp("qwen3-0.6b") / "config.json"
+    root.write_text(json.dumps(_MINIMAL_QWEN3_CONFIG))
+    return str(root.parent)
+
+
+# --------------------------------------------------------------------------- #
+# Selection gate
+# --------------------------------------------------------------------------- #
+
+
+def _fake_spec_config(df2t: bool):
+    import types
+
+    return types.SimpleNamespace(
+        method="df2t" if df2t else "dflash",
+        use_df2t=lambda: df2t,
+        num_speculative_tokens=5,
+    )
+
+
+@requires_sm120_fa4
+def test_get_flash_attn_version_gates_fa4_on_df2t(qwen3_config_path):
+    """SM120 resolves FA2 by default and only upgrades to FA4 under df2t.
+
+    The gate is the active speculative config (via `set_current_vllm_config`),
+    so a non-df2t speculative decoder must NOT pull in FA4.
+    """
+    assert (
+        get_flash_attn_version(head_size=HEAD_DIM, kv_cache_block_size=BLOCK_SIZE) == 2
+    )
+
+    cfg = create_vllm_config(
+        model_name=qwen3_config_path,
+        max_model_len=1024,
+        block_size=BLOCK_SIZE,
+        num_gpu_blocks=64,
+    )
+    cfg.speculative_config = _fake_spec_config(df2t=False)
+    with set_current_vllm_config(cfg):
+        assert (
+            get_flash_attn_version(head_size=HEAD_DIM, kv_cache_block_size=BLOCK_SIZE)
+            == 2
+        )
+
+    cfg.speculative_config = _fake_spec_config(df2t=True)
+    with set_current_vllm_config(cfg):
+        assert (
+            get_flash_attn_version(head_size=HEAD_DIM, kv_cache_block_size=BLOCK_SIZE)
+            == 4
+        )
+
+    assert is_fa_version_supported(4)
+
+
+# --------------------------------------------------------------------------- #
+# Parity
+# --------------------------------------------------------------------------- #
+
+
+def _cu_seqlens(lens):
+    out = torch.zeros(len(lens) + 1, dtype=torch.int32)
+    out[1:] = torch.tensor(lens, dtype=torch.int32).cumsum(0)
+    return out.to(DEVICE)
+
+
+def _build_paged(seq_lens):
+    """Random Q/K/V plus a paged cache with one contiguous page run per seq."""
+    torch.manual_seed(0)
+    total = sum(seq_lens)
+    q = torch.randn(total, NUM_HEADS, HEAD_DIM, dtype=DTYPE, device=DEVICE)
+    max_seqlen = max(seq_lens)
+    num_blocks = (max_seqlen + BLOCK_SIZE - 1) // BLOCK_SIZE
+    physical = torch.arange(
+        len(seq_lens) * num_blocks, dtype=torch.int32, device=DEVICE
+    ).view(len(seq_lens), num_blocks)
+    k_cache = torch.randn(
+        len(seq_lens) * num_blocks,
+        BLOCK_SIZE,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        dtype=DTYPE,
+        device=DEVICE,
+    )
+    v_cache = torch.randn_like(k_cache)
+    seqused_k = torch.tensor(seq_lens, dtype=torch.int32, device=DEVICE)
+    cu = _cu_seqlens(seq_lens)
+    return q, k_cache, v_cache, physical, seqused_k, cu, max_seqlen
+
+
+def _gather_paged_reference(
+    q, k_cache, v_cache, physical, seqused_k, cu, scale, causal, window_size=(-1, -1)
+):
+    """Dense float32 (varlen) reference over the packed rows of the cache."""
+    ref = torch.zeros_like(q, dtype=torch.float32)
+    st = 0
+    for i, slen in enumerate(seqused_k.tolist()):
+        rows = []
+        for page in physical[i].tolist():
+            rows.append(k_cache[page])
+        kk = (
+            torch.cat(rows, 0)[:slen]
+            .float()
+            .repeat_interleave(NUM_HEADS // NUM_KV_HEADS, dim=1)
+        )
+        rows_v = []
+        for page in physical[i].tolist():
+            rows_v.append(v_cache[page])
+        vv = (
+            torch.cat(rows_v, 0)[:slen]
+            .float()
+            .repeat_interleave(NUM_HEADS // NUM_KV_HEADS, dim=1)
+        )
+        qi = q[st : st + slen].float()
+        # (head, seq_q, head_dim) x (head, head_dim, seq_k) -> (head, seq_q, seq_k)
+        attn = torch.matmul(qi.permute(1, 0, 2), kk.permute(1, 2, 0)) * scale
+        r = torch.arange(slen, device=DEVICE)
+        keep = torch.ones(slen, slen, dtype=torch.bool, device=DEVICE)
+        if causal:
+            keep &= r[:, None] >= r[None, :]
+        if window_size != (-1, -1):
+            left, right = window_size
+            wl = left if left >= 0 else slen
+            wr = right if right >= 0 else slen
+            keep &= (r[None, :] >= r[:, None] - wr) & (r[None, :] <= r[:, None] + wl)
+        attn = attn.masked_fill(~keep[None, :, :], float("-inf"))
+        prob = torch.softmax(attn, dim=-1)
+        # (head, seq_q, seq_k) x (head, seq_k, head_dim) -> (seq_q, head, head_dim)
+        ref[st : st + slen] = torch.matmul(prob, vv.permute(1, 0, 2)).permute(1, 0, 2)
+        st += slen
+    return ref
+
+
+def _run_paged_fa(
+    q,
+    k_cache,
+    v_cache,
+    physical,
+    seqused_k,
+    cu,
+    max_seqlen,
+    scale,
+    fa_version,
+    causal,
+    window_size=(-1, -1),
+):
+    return flash_attn_varlen_func(
+        q,
+        k_cache,
+        v_cache,
+        max_seqlen_q=max_seqlen,
+        cu_seqlens_q=cu,
+        max_seqlen_k=max_seqlen,
+        cu_seqlens_k=None,
+        seqused_k=seqused_k,
+        block_table=physical,
+        softmax_scale=scale,
+        fa_version=fa_version,
+        causal=causal,
+        window_size=window_size,
+        num_splits=1,
+    )
+
+
+SEQLENS = [96, 256, 40]
+
+
+@requires_sm120_fa4
+def test_varlen_paged_causal_matches_fa2_and_sdpa():
+    """FA4 varlen paged causal forward matches FA2 and a dense SDPA reference."""
+    q, k_cache, v_cache, physical, seqused_k, cu, max_seqlen = _build_paged(SEQLENS)
+    scale = HEAD_DIM**-0.5
+
+    out4 = _run_paged_fa(
+        q, k_cache, v_cache, physical, seqused_k, cu, max_seqlen, scale, 4, causal=True
+    )
+    out2 = _run_paged_fa(
+        q, k_cache, v_cache, physical, seqused_k, cu, max_seqlen, scale, 2, causal=True
+    )
+    reference = _gather_paged_reference(
+        q, k_cache, v_cache, physical, seqused_k, cu, scale, causal=True
+    )
+
+    assert torch.isclose(out4.float(), out2.float(), atol=TOL).all(), (
+        "FA4 paged causal diverged from FA2"
+    )
+    assert (out4.float() - reference).abs().max() < TOL, (
+        "FA4 paged causal diverged from the SDPA reference"
+    )
+
+
+@requires_sm120_fa4
+def test_varlen_paged_noncausal_window_matches_sdpa():
+    """A non-causal symmetric window on paged KV matches the SDPA reference."""
+    q, k_cache, v_cache, physical, seqused_k, cu, max_seqlen = _build_paged(SEQLENS)
+    scale = HEAD_DIM**-0.5
+    window = (64, 64)
+
+    out4 = _run_paged_fa(
+        q,
+        k_cache,
+        v_cache,
+        physical,
+        seqused_k,
+        cu,
+        max_seqlen,
+        scale,
+        4,
+        causal=False,
+        window_size=window,
+    )
+    reference = _gather_paged_reference(
+        q,
+        k_cache,
+        v_cache,
+        physical,
+        seqused_k,
+        cu,
+        scale,
+        causal=False,
+        window_size=window,
+    )
+
+    assert (out4.float() - reference).abs().max() < TOL, (
+        "FA4 paged non-causal window diverged from the SDPA reference"
+    )
+
+
+@requires_sm120_fa4
+def test_fa4_dense_warmup_keys_cover_decode_and_extend(qwen3_config_path):
+    """The SM120 warmup emits the decode/extend keys needed by the vLLM path.
+
+    WARMUP slots in as if a production startup ran `compile_flash_attn_varlen_*
+    from_specs` for a target-decode attention layer: both q_stages (decode and
+    extend) and both single/non-single-batch variants are emitted, and the
+    decode single-batch key actually compiles on the SM120 device.
+    """
+    cfg = create_vllm_config(
+        model_name=qwen3_config_path,
+        max_model_len=2048,
+        block_size=BLOCK_SIZE,
+        num_gpu_blocks=64,
+    )
+    kv_cache_spec = create_standard_kv_cache_spec(cfg)
+
+    keys = FA4DenseAttentionKernel().get_warmup_keys(
+        vllm_config=cfg,
+        kv_cache_spec=kv_cache_spec,
+        num_qo_heads=NUM_HEADS,
+    )
+    q_stages = {k.q_stage for k in keys}
+    assert q_stages == {1, 2}, f"expected decode+extend warmup keys, got {q_stages}"
+    assert all(k.num_splits == 1 for k in keys)
+    assert all(k.is_single_batch in (True, False) for k in keys)
+    assert len(keys) == 4
+
+    decode_key = next(k for k in keys if k.q_stage == 1 and k.is_single_batch)
+    FA4DenseAttentionKernel().compile(decode_key)

@@ -95,6 +95,21 @@ def get_flash_attn_version(
 
         assert device_capability is not None
 
+        # df2t speculative decoding on consumer Blackwell (SM120/121) is the
+        # only path that requires FA4 there; everywhere else SM120 keeps
+        # resolving to FA2 exactly as before. The active speculative config
+        # signals this (checked through the live config below, same source the
+        # override step uses).
+        from vllm.config import get_current_vllm_config_or_none
+
+        active_vllm_config = get_current_vllm_config_or_none()
+        df2t_sm120 = (
+            device_capability.major == 12
+            and active_vllm_config is not None
+            and active_vllm_config.speculative_config is not None
+            and active_vllm_config.speculative_config.use_df2t()
+        )
+
         # 1. default version depending on platform
         if device_capability.major == 9 and is_fa_version_supported(3):
             # Hopper (SM90): prefer FA3
@@ -102,19 +117,22 @@ def get_flash_attn_version(
         elif device_capability.major == 10 and is_fa_version_supported(4):
             # Blackwell (SM100+, restrict to SM100 for now): prefer FA4
             fa_version = 4
+        elif df2t_sm120 and is_fa_version_supported(4):
+            # Consumer Blackwell (SM120): FA4 only under df2t spec-decode.
+            fa_version = 4
         else:
             # Fallback to FA2
             fa_version = 2
 
         # 2. override if passed by environment or config
-        from vllm.config import get_current_vllm_config_or_none
-
-        vllm_config = get_current_vllm_config_or_none()
+        vllm_config = active_vllm_config
+        config_override = False
         if (
             vllm_config is not None
             and vllm_config.attention_config.flash_attn_version is not None
         ):
             fa_version = vllm_config.attention_config.flash_attn_version
+            config_override = True
 
         # 3. fallback for unsupported combinations
         if device_capability.major >= 10 and fa_version == 3:
@@ -207,6 +225,25 @@ def get_flash_attn_version(
                 head_size,
             )
             fa_version = 2
+
+        # Fail closed for the df2t-on-SM120 FA4 path: if selection wanted FA4
+        # there but an automatic guard resolved it to FA2 (e.g. batch
+        # invariance or an unsupported head_dim), raise instead of silently
+        # running the df2t tree-verify pass on FA2. An explicit
+        # `attention_config.flash_attn_version` override is honored as a
+        # deliberate user choice.
+        if (
+            df2t_sm120
+            and is_fa_version_supported(4)
+            and fa_version != 4
+            and not config_override
+        ):
+            raise RuntimeError(
+                "df2t speculative decoding requires FlashAttention-4 on "
+                f"SM120, but version selection resolved to FA{fa_version}; "
+                "refusing a silent FA2 fallback (an automatic guard such as "
+                "VLLM_BATCH_INVARIANT or a TMEM-limited head_dim downgraded it)."
+            )
 
         if not is_fa_version_supported(fa_version):
             logger.error(
