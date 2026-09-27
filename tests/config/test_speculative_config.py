@@ -92,6 +92,11 @@ def test_df2t_get_num_draft_tokens():
     assert cfg.get_num_draft_tokens() == 15
 
 
+def test_df2t_nodes_ceiling_must_not_exceed_max_tree_budget():
+    with pytest.raises(ValueError, match="nodes_ceiling"):
+        _build(nodes_ceiling=65, max_tree_budget=64)
+
+
 def test_df2t_tree_knobs_change_hash():
     base = _build()
     modified = _build(tree_budget=32)

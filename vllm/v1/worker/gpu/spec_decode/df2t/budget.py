@@ -123,6 +123,13 @@ class BudgetPolicy:
     floor: int = _DEFAULT_FLOOR
     scale_factor: float = _HEAD_SCALE_FACTOR
 
+    def __post_init__(self) -> None:
+        if self.floor > self.ceiling:
+            raise ValueError(
+                "nodes_floor must not exceed nodes_ceiling: "
+                f"floor={self.floor} > ceiling={self.ceiling}"
+            )
+
     @property
     def nodes_max(self) -> int:
         """Deployment tree budget at the configured ``s``."""

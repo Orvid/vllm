@@ -154,6 +154,7 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
 )
+from vllm.v1.worker.gpu.spec_decode.df2t.budget import BudgetPolicy
 from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import TreeDraft
 from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import TreeVerifier
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
@@ -507,10 +508,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     ),
                 )
                 if self.speculative_config.use_df2t():
-                    # DF2T verifies with tree traversal, not rejection.
+                    # DF2T verifies with tree traversal, not rejection. The
+                    # TreeVerifier is sized by the operative df2t node budget
+                    # (BudgetPolicy.resolve_nodes_max, clamped to
+                    # [nodes_floor, nodes_ceiling]) — the same single source
+                    # that sizes the speculator's TreeBuilder — so the
+                    # unclamped get_num_draft_tokens cannot silently diverge
+                    # from the tree buffers.
                     self.tree_verifier = TreeVerifier(
                         self.max_num_reqs,
-                        self.speculative_config.get_num_draft_tokens(),
+                        BudgetPolicy.from_config(
+                            self.speculative_config
+                        ).resolve_nodes_max(),
                         self.vocab_size,
                         self.device,
                     )

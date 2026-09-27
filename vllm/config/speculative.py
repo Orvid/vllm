@@ -2007,6 +2007,11 @@ class SpeculativeConfig:
             self.tree_budget = self.max_tree_budget
         if self.tree_budget > self.max_tree_budget:
             raise ValueError("tree_budget exceeds max_tree_budget")
+        if self.nodes_ceiling > self.max_tree_budget:
+            raise ValueError(
+                "nodes_ceiling must not exceed max_tree_budget: "
+                f"{self.nodes_ceiling} > {self.max_tree_budget}"
+            )
         block_size = getattr(
             getattr(self.draft_model_config.hf_config, "dflash_config", {}),
             "block_size",

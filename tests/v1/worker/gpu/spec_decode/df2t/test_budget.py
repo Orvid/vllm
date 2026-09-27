@@ -9,6 +9,8 @@ offline on CPU and pin exact outputs.
 
 from types import SimpleNamespace
 
+import pytest
+
 from vllm.v1.worker.gpu.spec_decode.df2t.budget import (
     BudgetPolicy,
     resolve_nodes_max,
@@ -109,4 +111,25 @@ def test_budget_policy_static_matches_get_num_draft_tokens():
         max_tree_depth=15,
     )
     policy = BudgetPolicy.from_config(d)
+    assert policy.resolve_nodes_max() == 16
+
+
+def test_budget_policy_floor_must_not_exceed_ceiling():
+    with pytest.raises(ValueError, match="nodes_floor must not exceed"):
+        BudgetPolicy(policy=16, ceiling=4, max_depth=15, floor=8)
+
+
+def test_resolve_nodes_max_agrees_with_config_under_defaults():
+    """The operative nodes budget (BudgetPolicy) equals the config-level
+    ``get_num_draft_tokens`` under the default knobs, so both consumers see
+    the same per-deployment node budget."""
+    cfg = SimpleNamespace(
+        method="df2t",
+        tree_s=1.0,
+        tree_budget=16,
+        nodes_ceiling=64,
+        max_tree_depth=15,
+    )
+    policy = BudgetPolicy.from_config(cfg)
+    assert policy.resolve_nodes_max() == int(round(cfg.tree_s * cfg.tree_budget))
     assert policy.resolve_nodes_max() == 16
