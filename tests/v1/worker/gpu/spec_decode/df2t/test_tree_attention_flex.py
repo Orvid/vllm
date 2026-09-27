@@ -13,6 +13,11 @@ are allowed iff ``(words[r, q] >> j) & 1`` (ancestor-or-self of query node q).
 These tests pin (1) the boolean mask matrix against a manual expectation from a
 concrete small tree and (2) that the mask actually gates a packed FlexAttention
 forward against a reference attention computed with the same mask.
+
+These tests must stay FULLY OFFLINE: they construct a real `VllmConfig` via
+`create_vllm_config`, which resolves the model config through vLLM's loader.
+The `qwen3_config_path` fixture (see conftest.py) provides a locally-written
+Qwen3 config directory so no HuggingFace access ever happens.
 """
 
 import pytest
@@ -177,14 +182,14 @@ def test_flex_tree_mask_hint_never_prunes_visible_blocks():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_flex_tree_mask_gates_attention():
+def test_flex_tree_mask_gates_attention(qwen3_config_path):
     """The tree mask actually gates a packed FlexAttention forward: attaching it
     to the Flex metadata and running the impl matches a reference attention
     computed with the same mask, so sibling nodes do not leak and ancestors
     stay visible."""
     device = torch.device("cuda")
     vllm_config = create_vllm_config(
-        model_name="Qwen/Qwen3-0.6B",
+        model_name=qwen3_config_path,
         max_model_len=64,
         block_size=16,
         num_gpu_blocks=1024,
@@ -479,7 +484,7 @@ def test_runner_stage_rejects_zero_context():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_df2t_flex_selector_forces_flex_backend():
+def test_df2t_flex_selector_forces_flex_backend(qwen3_config_path):
     """tree_attention_backend == 'flex' routes the plain decoder full-attention
     layers to the FlexAttention vehicle on df2t, while windowed / MLA / encoder
     kinds and the default 'fa4' stay on their usual backends."""
@@ -498,7 +503,7 @@ def test_df2t_flex_selector_forces_flex_backend():
 
     def resolve(tree_attention_backend, **kwargs):
         cfg = create_vllm_config(
-            model_name="Qwen/Qwen3-0.6B", max_model_len=64, block_size=16
+            model_name=qwen3_config_path, max_model_len=64, block_size=16
         )
         cfg.speculative_config = spec_obj(tree_attention_backend)
         head_size = cfg.model_config.get_head_size()
