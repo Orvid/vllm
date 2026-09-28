@@ -553,12 +553,27 @@ def test_fa4_tree_mask_multi_page_matches_manual_and_flex_reference():
     )
 
     manual_out = torch.zeros_like(q, dtype=torch.float32)
+    flex_out = torch.zeros_like(q, dtype=torch.float32)
+    query_start_loc = [0]
+    for r, (c, w, b_nodes) in enumerate(specs):
+        query_start_loc.append(query_start_loc[-1] + b_nodes + 1)
+    flex_mod, flex_lookup, flex_c, flex_words = _build_flex_reference_mask(
+        specs, query_start_loc, max_b
+    )
     st = 0
     for r, (c, w, b_nodes) in enumerate(specs):
         qr = q[st : st + b_nodes + 1].float()
         kk = kfulls[r].transpose(0, 1)[None].float().repeat_interleave(Hq // Hkv, dim=1)
         vv = vfulls[r].transpose(0, 1)[None].float().repeat_interleave(Hq // Hkv, dim=1)
         m = _manual_matrix(c, w, b_nodes)[c:].unsqueeze(0).unsqueeze(0).to(DEVICE)
+        m_flex = (
+            _flex_matrix(
+                flex_mod, flex_lookup, flex_c, flex_words, max_b, query_start_loc, r
+            )[c:]
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .to(DEVICE)
+        )
         manual_out[st : st + b_nodes + 1] = (
             torch.nn.functional.scaled_dot_product_attention(
                 qr.unsqueeze(0).transpose(1, 2), kk, vv, attn_mask=m, scale=scale
@@ -566,9 +581,26 @@ def test_fa4_tree_mask_multi_page_matches_manual_and_flex_reference():
             .transpose(1, 2)
             .squeeze(0)
         )
+        flex_out[st : st + b_nodes + 1] = (
+            torch.nn.functional.scaled_dot_product_attention(
+                qr.unsqueeze(0).transpose(1, 2), kk, vv, attn_mask=m_flex, scale=scale
+            )
+            .transpose(1, 2)
+            .squeeze(0)
+        )
         st += b_nodes + 1
-    err = (out.float() - manual_out).abs().max().item()
-    assert err < TOL, f"multi-page tree mask diverged from manual reference: {err}"
+    err_manual = (out.float() - manual_out).abs().max().item()
+    err_flex = (out.float() - flex_out).abs().max().item()
+    assert err_manual < TOL, f"multi-page tree mask diverged from manual: {err_manual}"
+    assert err_flex < TOL, (
+        f"multi-page tree mask diverged from flex reference: {err_flex}"
+    )
+    assert torch.equal(
+        _manual_matrix(200, [0b1, 0b11, 0b101, 0b1111], 4)[200:],
+        _flex_matrix(
+            flex_mod, flex_lookup, flex_c, flex_words, max_b, query_start_loc, 0
+        )[200:],
+    )
 
 
 @requires_sm120_fa4
