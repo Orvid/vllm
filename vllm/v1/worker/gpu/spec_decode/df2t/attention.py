@@ -161,15 +161,15 @@ def _make_fa4_tree_mask_mod(B: int):
     uncached closure would poke a fresh function address every forward and
     force a full JIT recompile.
 
-    ``kv_idx`` is the local KV position within the sequence, which equals the
-    logical block-slot (context ``< C``, anchor ``== C``, node ``C + 1 + j``)
-    while the request's KV fits within a single KV page (fastdiv divmod in the
-    paged ``apply_mask`` wraps ``kv_idx`` by the page size beyond one page --
-    see the task 14 report; the runner fails closed in that regime), and
-    ``q_idx`` is the local verify-block query index (0 = anchor, ``1 + a``
-    = node arena ``a``), so the block-slot of the query is ``C + q_idx``. A
-    key is allowed iff it is context, the anchor, or a node ``j`` whose bit is
-    set in the query node's ancestor-or-self word.
+    ``kv_idx`` is the ABSOLUTE logical block-slot (context ``< C``, anchor
+    ``== C``, node ``C + 1 + j``) for arbitrarily long contexts: the fork's
+    Sm80-base paged forward now threads the page table into ``fastdiv_mods``
+    (mirroring ``flash_fwd_sm90.py``/``flash_fwd_sm100.py``), so the paged
+    mask index no longer wraps at page boundaries. ``q_idx`` is the local
+    verify-block query index (0 = anchor, ``1 + a`` = node arena ``a``), so
+    the block-slot of the query is ``C + q_idx``. A key is allowed iff it is
+    context, the anchor, or a node ``j`` whose bit is set in the query node's
+    ancestor-or-self word.
     """
     import cutlass
     import cutlass.cute as cute
@@ -234,9 +234,7 @@ def build_fa4_tree_mask(
         ``build_flex_tree_mask`` under the FA4 coordinate conventions (see
         ``_make_fa4_tree_mask_mod``): ``batch_idx`` is the request index,
         ``q_idx`` is the local verify-block query index, ``kv_idx`` is the
-        logical block-slot (exact only while each request's KV fits within one
-        KV page; the runner fails closed beyond that, see
-        ``GPUModelRunner._attach_tree_fa4_mask``). ``aux_tensors[0]`` is
+        absolute logical block-slot across pages. ``aux_tensors[0]`` is
         ``words`` and ``aux_tensors[1]`` is ``C_per_req``.
 
     """

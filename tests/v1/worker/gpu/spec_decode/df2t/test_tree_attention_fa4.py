@@ -411,14 +411,15 @@ def test_fa4_tree_mask_kv_idx_is_logical_blockslot():
 
 
 @requires_sm120_fa4
-def test_fa4_tree_mask_multi_page_wraps_kv_idx():
-    """Documented limitation: once a request's KV spans more than one KV page,
-    the FA4 paged mask_mod's kv_idx wraps by a page/tile divisor (fastdiv
-    divmod in cute/mask.py apply_mask), so distinct block-slots collide and
-    exact per-key tree masking is impossible. Empirically a 300-token sequence
-    maps kv_idx==200 onto block-slot 200 % 128 (the one-hot V at slot 72), not
-    slot 200. The attach gate (test_runner_attach_fa4_fails_closed_when_
-    verify_spans_pages) therefore refuses long-context df2t on this vehicle."""
+def test_fa4_tree_mask_multi_page_kv_idx_is_absolute():
+    """kv_idx is the ABSOLUTE logical block-slot across KV pages (fork fix
+    threads the page table into compute_fastdiv_mods, mirroring sm100): a mask
+    told to keep exactly block-slot 200 of a 300-token sequence (2nd/3rd page)
+    attends the one-hot V stored at slot 200, not any wrapped in-page offset.
+
+    The one-hot discriminators identify slots uniquely across heads (slot s
+    lives in kv head s // 128, feature s % 128), and the read below uses the
+    GQA-corrected query head (query head 2*kh reads kv head kh)."""
     block_size = 128
     seq_len = 300
     seq_len_q = 1
@@ -432,45 +433,142 @@ def test_fa4_tree_mask_multi_page_wraps_kv_idx():
     k_cache = torch.randn(num_pages, block_size, Hkv, 128, dtype=DTYPE, device=DEVICE)
     v_cache = torch.zeros(num_pages, block_size, Hkv, 128, dtype=DTYPE, device=DEVICE)
     for s in range(seq_len):
-        v_cache[s // block_size, s % block_size, :, s % 128] = 1.0
+        # slot s -> kv head s // 128 (= its page/block), feature s % 128.
+        v_cache[s // block_size, s % block_size, s // 128, s % 128] = 1.0
 
     import cutlass.cute as cute
     from cutlass import Int32  # type: ignore[attr-defined]
 
     from vllm.vllm_flash_attn.cute.utils import scalar_to_ssa, ssa_to_scalar
 
-    @cute.jit
-    def keep_slot(batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors=None):
-        k_s = ssa_to_scalar(kv_idx)
-        return scalar_to_ssa(k_s == 200, Int32)
+    def make_keep(target):
+        @cute.jit
+        def keep_slot(
+            batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors=None
+        ):
+            k_s = ssa_to_scalar(kv_idx)
+            return scalar_to_ssa(k_s == target, Int32)
 
-    keep_slot.use_fast_sampling = True
-    keep_slot.__vec_size__ = 1
+        keep_slot.use_fast_sampling = True
+        keep_slot.__vec_size__ = 1
+        return keep_slot
+
+    def run(keep_slot):
+        return flash_attn_varlen_func(
+            q,
+            k_cache,
+            v_cache,
+            max_seqlen_q=1,
+            cu_seqlens_q=cu,
+            max_seqlen_k=seq_len,
+            cu_seqlens_k=None,
+            seqused_k=seqused_k,
+            block_table=physical,
+            softmax_scale=128**-0.5,
+            fa_version=4,
+            num_splits=1,
+            causal=False,
+            window_size=(-1, -1),
+            mask_mod=keep_slot,
+            aux_tensors=[
+                torch.zeros(1, 64, dtype=torch.int64, device=DEVICE),
+                torch.zeros(1, dtype=torch.int32, device=DEVICE),
+            ],
+        )
+
+    for target in (200, 128, 256, 72):
+        out = run(make_keep(target))
+        kh, feat = target // 128, target % 128
+        hit = int(out[0, 2 * kh % Hq, feat].item() > 0.25)
+        assert hit == 1, f"slot {target} not attended as itself (kv_idx wrapped?)"
+    # A slot that does not exist (2049) is never attended.
+    out = run(make_keep(2049))
+    assert out.abs().max().item() < TOL
+
+
+@requires_sm120_fa4
+def test_fa4_tree_mask_multi_page_matches_manual_and_flex_reference():
+    """Multi-page parity: with contexts spanning >= 2 KV pages (block 128), the
+    FA4 tree mask reproduces the manual block-slot reference AND the Flex
+    closure's matrix exactly, so the per-key tree mask is honored across page
+    boundaries (kv_idx absolute)."""
+    block_size = 128
+    specs = [(200, [0b1, 0b11, 0b101, 0b1111], 4), (130, [0b1, 0b11], 2)]
+    num_reqs = len(specs)
+    query_lens = [b + 1 for _, _, b in specs]
+    seq_lens = [c + 1 + b for c, _, b in specs]
+    max_b = max(b for _, _, b in specs)
+    max_seqlen = max(seq_lens)
+
+    torch.manual_seed(0)
+    cu = torch.zeros(num_reqs + 1, dtype=torch.int32, device=DEVICE)
+    cu[1:] = torch.tensor(query_lens, dtype=torch.int32, device=DEVICE).cumsum(0)
+    seqused_k = torch.tensor(seq_lens, dtype=torch.int32, device=DEVICE)
+    max_blocks = (max_seqlen + block_size - 1) // block_size
+    physical = torch.arange(
+        num_reqs * max_blocks, dtype=torch.int32, device=DEVICE
+    ).view(num_reqs, max_blocks)
+
+    Hq, Hkv = 16, 8
+    total_q = sum(query_lens)
+    q = torch.randn(total_q, Hq, 128, dtype=DTYPE, device=DEVICE)
+    num_pages = num_reqs * max_blocks
+    k_cache = torch.randn(num_pages, block_size, Hkv, 128, dtype=DTYPE, device=DEVICE)
+    v_cache = torch.randn_like(k_cache)
+    kfulls, vfulls = [], []
+    for r, (c, w, b_nodes) in enumerate(specs):
+        seq_len = seq_lens[r]
+        kf = torch.randn(seq_len, Hkv, 128, dtype=DTYPE, device=DEVICE)
+        vf = torch.randn_like(kf)
+        kfulls.append(kf)
+        vfulls.append(vf)
+        for i in range(seq_len):
+            k_cache[physical[r, i // block_size], i % block_size] = kf[i]
+            v_cache[physical[r, i // block_size], i % block_size] = vf[i]
+
+    words = torch.zeros(num_reqs, max_b, dtype=torch.int64, device=DEVICE)
+    for r, (_, w, _) in enumerate(specs):
+        words[r, : len(w)] = torch.tensor(w, dtype=torch.int64, device=DEVICE)
+    c_per_req = torch.tensor([c for c, _, _ in specs], dtype=torch.int32, device=DEVICE)
+    scale = 128**-0.5
+
+    mask_mod, aux = build_fa4_tree_mask(num_reqs, c_per_req, words, max_b)
     out = flash_attn_varlen_func(
         q,
         k_cache,
         v_cache,
-        max_seqlen_q=1,
+        max_seqlen_q=max(query_lens),
         cu_seqlens_q=cu,
-        max_seqlen_k=seq_len,
+        max_seqlen_k=max_seqlen,
         cu_seqlens_k=None,
         seqused_k=seqused_k,
         block_table=physical,
-        softmax_scale=128**-0.5,
+        softmax_scale=scale,
         fa_version=4,
         num_splits=1,
         causal=False,
         window_size=(-1, -1),
-        mask_mod=keep_slot,
-        aux_tensors=[
-            torch.zeros(1, 64, dtype=torch.int64, device=DEVICE),
-            torch.zeros(1, dtype=torch.int32, device=DEVICE),
-        ],
+        mask_mod=mask_mod,
+        aux_tensors=aux,
     )
-    # kv_idx==200 cannot select the true block-slot 200: the mask sees the
-    # wrapped index 200 % 128 and attends that slot's distinct one-hot V.
-    assert out[0, 0].argmax().item() == 200 % block_size
-    assert out[0, 0].argmax().item() != 200
+
+    manual_out = torch.zeros_like(q, dtype=torch.float32)
+    st = 0
+    for r, (c, w, b_nodes) in enumerate(specs):
+        qr = q[st : st + b_nodes + 1].float()
+        kk = kfulls[r].transpose(0, 1)[None].float().repeat_interleave(Hq // Hkv, dim=1)
+        vv = vfulls[r].transpose(0, 1)[None].float().repeat_interleave(Hq // Hkv, dim=1)
+        m = _manual_matrix(c, w, b_nodes)[c:].unsqueeze(0).unsqueeze(0).to(DEVICE)
+        manual_out[st : st + b_nodes + 1] = (
+            torch.nn.functional.scaled_dot_product_attention(
+                qr.unsqueeze(0).transpose(1, 2), kk, vv, attn_mask=m, scale=scale
+            )
+            .transpose(1, 2)
+            .squeeze(0)
+        )
+        st += b_nodes + 1
+    err = (out.float() - manual_out).abs().max().item()
+    assert err < TOL, f"multi-page tree mask diverged from manual reference: {err}"
 
 
 @requires_sm120_fa4
@@ -824,11 +922,10 @@ def test_runner_stage_fa4_rejects_zero_context():
     assert runner._pending_tree_fa4_mask is None
 
 
-def test_runner_attach_fa4_fails_closed_when_verify_spans_pages():
-    """Long-context df2t on the fa4 vehicle fails closed at attach: the FA4
-    paged mask_mod wraps kv_idx by the page size beyond one page, so the exact
-    per-key tree mask cannot be honored; the attach raises instead of silently
-    running unmasked (wrong) attention (preserving the losslessness gate)."""
+def test_runner_attach_fa4_fails_closed_when_page_size_undeterminable():
+    """Attach fails closed if the tree group's KV page size is undeterminable
+    (no kv_cache group lists the tree layers): never attach a mask whose
+    kv_idx semantics depend on an unknown page size."""
     device = torch.device("cpu")
     spec = type("Spec", (), {"tree_attention_backend": "fa4", "max_tree_budget": 64})()
     num_computed = torch.tensor([200, 4, 0, 0], dtype=torch.int32)
@@ -837,6 +934,10 @@ def test_runner_attach_fa4_fails_closed_when_verify_spans_pages():
     )()
     trees = [_fake_tree([0b1, 0b11], device), _fake_tree([0b1], device)]
     idx_mapping = torch.tensor([0, 1], dtype=torch.int32)
+    # A kv_cache_config whose groups do not list the tree layers.
+    kv_cache_config = _fake_fa4_kv_cache_config(
+        block_size=16, layer_names=("other.attn",)
+    )
     runner = _fake_runner(
         spec,
         req_states,
@@ -853,13 +954,49 @@ def test_runner_attach_fa4_fails_closed_when_verify_spans_pages():
                 )()
             ]
         ],
-        kv_cache_config=_fake_fa4_kv_cache_config(block_size=16),
+        kv_cache_config=kv_cache_config,
     )
     runner._stage_tree_fa4_mask(True, trees, 2, idx_mapping)
     assert runner._pending_tree_fa4_mask is not None
-    with pytest.raises(RuntimeError, match="page"):
+    with pytest.raises(RuntimeError, match="page size"):
         runner._attach_tree_fa4_mask({"target.attn": _fake_fa4_metadata()})
     # The pending field is cleared even on failure.
+    assert runner._pending_tree_fa4_mask is None
+
+
+def test_runner_attach_fa4_fails_closed_when_staged_mask_dropped():
+    """A staged fa4 tree mask must never silently vanish: if no attention
+    metadata is produced (attn_metadata is None) on a df2t fa4-tree batch, the
+    attach raises instead of dropping the mask and running the verify forward
+    without it."""
+    device = torch.device("cpu")
+    spec = type("Spec", (), {"tree_attention_backend": "fa4", "max_tree_budget": 64})()
+    num_computed = torch.tensor([4, 2, 0, 0], dtype=torch.int32)
+    req_states = type(
+        "ReqStates", (), {"num_computed_tokens": type("T", (), {"gpu": num_computed})()}
+    )()
+    trees = [_fake_tree([0b1, 0b11], device), _fake_tree([0b1], device)]
+    runner = _fake_runner(
+        spec,
+        req_states,
+        device,
+        [
+            [
+                type(
+                    "G",
+                    (),
+                    {
+                        "backend": _FakeBackend("FLASH_ATTN"),
+                        "layer_names": ["target.attn"],
+                    },
+                )()
+            ]
+        ],
+    )
+    runner._stage_tree_fa4_mask(True, trees, 2, torch.tensor([0, 1], dtype=torch.int32))
+    assert runner._pending_tree_fa4_mask is not None
+    with pytest.raises(RuntimeError, match="dropped"):
+        runner._attach_tree_fa4_mask(None)
     assert runner._pending_tree_fa4_mask is None
 
 

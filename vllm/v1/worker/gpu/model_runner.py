@@ -1716,9 +1716,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _fa4_tree_page_sizes(self, target_layers: set[str]) -> set[int]:
         """KV page sizes of the KV cache groups backing the tree layers.
 
-        The FA4 paged ``mask_mod``'s ``kv_idx`` wraps by the KV page size
-        beyond one page (fork-side limitation, see task 14 report), so the
-        attach gate needs the tree group's page size.
+        The FA4 paged ``mask_mod``'s ``kv_idx`` is the absolute logical
+        block-slot (fork fix threads the page table into ``compute_fastdiv_
+        mods``, mirroring sm100; see task 14 fix report), which requires the
+        tree group's page size to be determinable at attach.
         """
         sizes: set[int] = set()
         if getattr(self, "kv_cache_config", None) is None:
@@ -1734,8 +1735,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Attach the staged df2t fa4 tree mask to the FA4 verify metadata."""
         pending = self._pending_tree_fa4_mask
         self._pending_tree_fa4_mask = None
-        if pending is None or attn_metadata is None:
+        if pending is None:
             return
+        if attn_metadata is None:
+            # A staged tree mask must never silently vanish: no attention
+            # metadata produced on a df2t fa4-tree batch is a hard failure.
+            raise RuntimeError(
+                "a staged df2t fa4 tree mask was dropped because no attention "
+                "metadata was produced this step; refusing to run the verify "
+                "forward without the tree mask."
+            )
         from vllm.v1.attention.backends.flash_attn import (
             FlashAttentionMetadata,
         )
@@ -1744,35 +1753,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         num_reqs, c_per_req, words, b = pending
-        # Fail closed: the FA4 paged mask_mod's kv_idx is the logical block-slot
-        # only while a request's verify KV stays within one KV page; beyond a
-        # page boundary the current mask_mod path wraps kv_idx by the page size
-        # (see the task 14 report on cute/mask.py fastdiv divmod), collapsing
-        # distinct block-slots so the exact per-key tree mask cannot be honored.
-        # Never silently run unmasked attention -- route long-context df2t to
-        # "flex" instead.
-        target_layers = self._fa4_tree_verify_layer_names()
-        page_sizes = self._fa4_tree_page_sizes(target_layers)
-        if page_sizes:
-            # The most restrictive page size: the wrap divisor is the kernel's
-            # page size, and the gate must never under-approximate it.
-            page_size = min(page_sizes)
-            # Per-request node count = nonzero word rows (every real node's
-            # ancestor-or-self word has its self bit set); +1 for the anchor.
-            nodes_per_req = (words != 0).sum(dim=1)
-            max_kv_len = int((c_per_req + 1 + nodes_per_req).max().item())
-            if max_kv_len > page_size:
-                raise RuntimeError(
-                    "df2t tree-verify FA4 mask requires the request KV "
-                    "(context + anchor + nodes) to fit within one KV page, "
-                    f"but the max KV length is {max_kv_len} vs page size "
-                    f"{page_size}. The FA4 paged mask_mod wraps kv_idx by the "
-                    "page size beyond one page and cannot honor the per-key "
-                    "tree mask; use tree_attention_backend='flex' for "
-                    "long-context df2t."
-                )
         # Only the target verify group(s) (see _fa4_tree_verify_layer_names)
         # carry the tree block; a second FA group's metadata stays untouched.
+        target_layers = self._fa4_tree_verify_layer_names()
+        if target_layers and not self._fa4_tree_page_sizes(target_layers):
+            # The FA4 paged mask_mod's kv_idx is the absolute logical
+            # block-slot only when its page size is known (the fastdiv divisor
+            # is page_size * pages_per_seq, see the task 14 fix). Never attach
+            # with an undeterminable page size.
+            raise RuntimeError(
+                "cannot determine the KV page size for the df2t tree-verify "
+                "FA4 mask; refusing to attach without it. Ensure the df2t "
+                "target's FlashAttention KV cache group is present in "
+                "kv_cache_config (or set tree_attention_backend='flex')."
+            )
         mask_mod, aux_tensors = build_fa4_tree_mask(num_reqs, c_per_req, words, b)
         attached = False
         seen_metadata: set[int] = set()
