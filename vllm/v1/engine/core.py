@@ -696,8 +696,27 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
+        df2t_async_grafted = False
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            if (
+                self.async_scheduling
+                and self.check_for_draft_tokens
+                and self.vllm_config.speculative_config is not None
+                and self.vllm_config.speculative_config.use_df2t()
+            ):
+                # df2t trees ride the worker -> scheduler graft that
+                # ``update_draft_token_ids_in_output`` performs, but that only
+                # runs for deferred (structured-output) batches. Non-deferred
+                # async steps never reach it, so graft the previous step's
+                # drafts + tree into the freshly scheduled output here, before
+                # execute_model lays out the verify block.
+                draft_token_ids = self.model_executor.take_draft_token_ids()
+                if draft_token_ids is not None:
+                    self.scheduler.update_draft_token_ids_in_output(
+                        draft_token_ids, scheduler_output
+                    )
+                    df2t_async_grafted = True
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -766,7 +785,8 @@ class EngineCore:
         if deferred_scheduler_output:
             # When draft tokens are used with structured output, validate them
             # before computing the grammar bitmask for the deferred request.
-            if self.check_for_draft_tokens:
+            # (df2t under async was already grafted right after schedule().)
+            if self.check_for_draft_tokens and not df2t_async_grafted:
                 draft_token_ids = self.model_executor.take_draft_token_ids()
                 if draft_token_ids is not None:
                     # Update the draft token ids in the scheduler output to

@@ -1938,33 +1938,32 @@ def _df2t_speculative_config(tmp_path: Path, parallel_config) -> SpeculativeConf
     )
 
 
-def test_df2t_forced_async_scheduling_raises(tmp_path: Path):
-    """df2t must never run under forced async scheduling: the tree is not
-    carried through the async/deferred path, so fail closed instead of
-    silently degrading to a chain."""
+def test_df2t_allows_async_scheduling(tmp_path: Path):
+    """df2t is a supported async-scheduling method: forcing it on must not
+    raise, and the config must keep async enabled."""
     parallel_config = ParallelConfig(distributed_executor_backend="uni")
     speculative_config = _df2t_speculative_config(tmp_path, parallel_config)
     model_config = speculative_config.target_model_config
 
-    with pytest.raises(ValueError, match="df2t"):
-        VllmConfig(
-            model_config=model_config,
-            scheduler_config=SchedulerConfig(
-                max_model_len=2048,
-                is_encoder_decoder=False,
-                async_scheduling=True,
-            ),
-            parallel_config=parallel_config,
-            speculative_config=speculative_config,
-            compilation_config=CompilationConfig(
-                mode=CompilationMode.NONE, cudagraph_mode=CUDAGraphMode.NONE
-            ),
-        )
+    cfg = VllmConfig(
+        model_config=model_config,
+        scheduler_config=SchedulerConfig(
+            max_model_len=2048,
+            is_encoder_decoder=False,
+            async_scheduling=True,
+        ),
+        parallel_config=parallel_config,
+        speculative_config=speculative_config,
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.NONE, cudagraph_mode=CUDAGraphMode.NONE
+        ),
+    )
+    assert cfg.scheduler_config.async_scheduling is True
 
 
-def test_df2t_disables_async_scheduling_by_default(tmp_path: Path):
-    """df2t deliberately defaults to non-async scheduling (the tree is not
-    carried through the async/deferred path)."""
+def test_df2t_defaults_to_async_scheduling(tmp_path: Path):
+    """df2t defaults to async scheduling (the tree is carried through the
+    async/deferred path by update_draft_token_ids_in_output)."""
     parallel_config = ParallelConfig(distributed_executor_backend="uni")
     speculative_config = _df2t_speculative_config(tmp_path, parallel_config)
     model_config = speculative_config.target_model_config
@@ -1980,7 +1979,7 @@ def test_df2t_disables_async_scheduling_by_default(tmp_path: Path):
             mode=CompilationMode.NONE, cudagraph_mode=CUDAGraphMode.NONE
         ),
     )
-    assert cfg.scheduler_config.async_scheduling is False
+    assert cfg.scheduler_config.async_scheduling is True
 
 
 def test_df2t_rejects_cudagraph_capture(tmp_path: Path):

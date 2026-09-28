@@ -1546,28 +1546,17 @@ class VllmConfig:
                     "select a different all2all backend."
                 )
             if self.speculative_config is not None:
-                if self.speculative_config.use_df2t():
-                    # df2t deliberately stays off async scheduling: the df2t
-                    # tree is not carried through the async/deferred scheduling
-                    # path (update_draft_token_ids_in_output), so running df2t
-                    # under async would silently degrade the tree to a chain.
-                    # Fail closed rather than produce that.
-                    raise ValueError(
-                        "Async scheduling is not supported with df2t speculative "
-                        "decoding (the df2t tree is not carried through the "
-                        "async/deferred scheduling path). Use non-async "
-                        "scheduling for df2t."
-                    )
                 if (
                     self.speculative_config.method not in get_args(EagleModelTypes)
                     and self.speculative_config.method not in get_args(NgramGPUTypes)
                     and self.speculative_config.method != "draft_model"
                     and self.speculative_config.method != "dspark"
                     and self.speculative_config.method != "dflash"
+                    and not self.speculative_config.use_df2t()
                 ):
                     raise ValueError(
                         "Currently, async scheduling is only supported "
-                        "with EAGLE/MTP/Draft Model/NGram GPU/DSpark/DFlash "
+                        "with EAGLE/MTP/Draft Model/NGram GPU/DSpark/DFlash/DF2T "
                         "kind of speculative decoding"
                     )
                 if self.speculative_config.disable_padded_drafter_batch:
@@ -1593,21 +1582,12 @@ class VllmConfig:
                 self.scheduler_config.async_scheduling = False
             elif (
                 self.speculative_config is not None
-                and self.speculative_config.use_df2t()
-            ):
-                logger.warning_once(
-                    "Async scheduling is disabled for df2t speculative "
-                    "decoding: the df2t tree is not carried through the "
-                    "async/deferred scheduling path."
-                )
-                self.scheduler_config.async_scheduling = False
-            elif (
-                self.speculative_config is not None
                 and self.speculative_config.method not in get_args(EagleModelTypes)
                 and self.speculative_config.method not in get_args(NgramGPUTypes)
                 and self.speculative_config.method != "draft_model"
                 and self.speculative_config.method != "dspark"
                 and self.speculative_config.method != "dflash"
+                and not self.speculative_config.use_df2t()
             ):
                 logger.warning_once(
                     "Async scheduling not supported with %s-based "
