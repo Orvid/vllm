@@ -1237,6 +1237,55 @@ def test_models_default_to_v2_model_runner(model_config, expected, monkeypatch):
     assert VllmConfig.use_v2_model_runner.fget(config) is expected
 
 
+def test_df2t_forces_v2_model_runner(monkeypatch):
+    """df2t (like dflash/dspark) runs only on the V2 GPU model runner.
+
+    ``_validate_df2t`` force-enables parallel drafting, so without the V2
+    parallel-drafting exemption the config would be flagged V2-unsupported and
+    fall back to the V1 runner, which crashes with "Unknown speculative
+    decoding method: df2t". The V1 runner must instead reject df2t outright.
+    """
+    from vllm.platforms import current_platform
+
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    monkeypatch.setattr(vllm_config_module, "HAS_TRITON", True)
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: False)
+
+    draft = SimpleNamespace(
+        architectures=["DFlash2DraftModel"],
+        hf_config=SimpleNamespace(
+            block_size=16,
+            dflash_config=SimpleNamespace(block_size=16),
+        ),
+        model="draft",
+        max_model_len=128,
+        compute_hash=lambda: "draft-hash",
+        verify_with_parallel_config=lambda *_: None,
+    )
+    spec = SpeculativeConfig(
+        method="df2t", num_speculative_tokens=15, draft_model_config=draft
+    )
+    config = object.__new__(VllmConfig)
+    config.attention_config = AttentionConfig()
+    config.parallel_config = ParallelConfig()
+    config.scheduler_config = SchedulerConfig.default_factory(async_scheduling=False)
+    config.compilation_config = CompilationConfig()
+    config.cache_config = CacheConfig()
+    config.model_config = None
+    config.speculative_config = spec
+
+    assert config.use_v2_model_runner is True
+    assert "parallel drafting for EAGLE speculative decoding" not in (
+        config._get_v2_model_runner_unsupported_features()
+    )
+    assert (
+        "df2t speculative decoding"
+        in config._get_v1_model_runner_unsupported_features()
+    )
+    with pytest.raises(ValueError, match="df2t"):
+        VllmConfig._validate_v1_model_runner(config)
+
+
 def test_v1_model_runner_rejects_v2_only_features():
     config = SimpleNamespace(
         parallel_config=ParallelConfig(

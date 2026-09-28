@@ -3051,11 +3051,11 @@ class VllmConfig:
                 unsupported.append(f"speculative method '{speculative_config.method}'")
 
             # V2 EagleSpeculator does not support parallel_drafting (for P-Eagle).
-            # DFlash and DSpark use parallel drafting natively in V2 via their
-            # own speculators.
+            # DFlash, DSpark, and df2t use parallel drafting natively in V2 via
+            # their own speculators.
             if (
                 speculative_config.parallel_drafting
-                and speculative_config.method not in ("dflash", "dspark")
+                and speculative_config.method not in ("dflash", "dspark", "df2t")
             ):
                 unsupported.append("parallel drafting for EAGLE speculative decoding")
 
@@ -3091,10 +3091,12 @@ class VllmConfig:
         ):
             unsupported.append("pipeline parallelism with async scheduling")
 
-        # DSpark is implemented only by the V2 GPU model runner.
+        # DSpark and df2t are implemented only by the V2 GPU model runner.
         if self.speculative_config:
             if self.speculative_config.method == "dspark":
                 unsupported.append("dspark speculative decoding")
+            if self.speculative_config.use_df2t():
+                unsupported.append("df2t speculative decoding")
             if self.speculative_config.enable_adaptive_verification:
                 unsupported.append("adaptive draft verification")
 
