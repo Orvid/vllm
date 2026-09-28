@@ -7185,6 +7185,35 @@ def test_update_draft_token_ids_in_output_strips_padding():
     assert scheduler_output.num_invalid_spec_tokens == {request.request_id: 2}
 
 
+def test_update_draft_token_ids_in_output_carries_tree():
+    """The async/deferred output path must carry the df2t tree into
+    ``scheduler_output.spec_tree_draft``, trimmed to the scheduled spec-token
+    count, mirroring the sync ``update_draft_token_ids`` path."""
+    scheduler = create_scheduler(num_speculative_tokens=4)
+    request = _decode_ready_request(scheduler)
+
+    # Budget trimming leaves only 2 of the 3 drafted (tree) slots scheduled.
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tokens={request.request_id: [0, 0]},
+        spec_tree_draft={},
+        num_invalid_spec_tokens=None,
+    )
+    tree = _make_draft_tree()  # 3 nodes [7, 8, 9]
+    scheduler.update_draft_token_ids_in_output(
+        DraftTokenIds(
+            [request.request_id],
+            [[7, 8, 9]],
+            spec_tree_draft=[tree.to_lists()],
+        ),
+        scheduler_output,
+    )
+    stashed = scheduler_output.spec_tree_draft[request.request_id]
+    assert stashed is not None
+    assert stashed.token_ids == [7, 8]
+    assert len(stashed.parents) == len(stashed.arena) == 2
+    assert stashed.num_nodes == 2
+
+
 def test_diffusion_canvas_width_defaults_to_the_served_canvas():
     def req(extra):
         return SimpleNamespace(sampling_params=SimpleNamespace(extra_args=extra))

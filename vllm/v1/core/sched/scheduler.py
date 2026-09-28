@@ -2517,9 +2517,12 @@ class Scheduler(SchedulerInterface):
         num_invalid_spec_tokens: dict[str, int] = {}
 
         sched_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
-        for req_id, spec_token_ids in zip(
-            draft_token_ids.req_ids,
-            draft_token_ids.draft_token_ids,
+        trees = draft_token_ids.spec_tree_draft
+        for i, (req_id, spec_token_ids) in enumerate(
+            zip(
+                draft_token_ids.req_ids,
+                draft_token_ids.draft_token_ids,
+            )
         ):
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
@@ -2534,6 +2537,14 @@ class Scheduler(SchedulerInterface):
             # Trim drafts to scheduled number of spec tokens
             # (needed for chunked prefill case for example).
             del spec_token_ids[orig_num_spec_tokens:]
+            # Carry the stashed tree (df2t & friends) into the scheduled step,
+            # trimmed to the same scheduled spec-token count as the drafts.
+            if trees is not None:
+                tree = trees[i]
+                if tree is not None:
+                    scheduler_output.spec_tree_draft[req_id] = tree.truncated(
+                        orig_num_spec_tokens
+                    )
             # Filter out spec tokens which do not adhere to the grammar.
             spec_token_ids = self.structured_output_manager.validate_tokens(
                 request, spec_token_ids
