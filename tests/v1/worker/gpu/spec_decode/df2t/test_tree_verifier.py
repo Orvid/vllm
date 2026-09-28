@@ -522,6 +522,7 @@ def test_df2t_production_pipeline_matches_reference():
         dict(temperature=0.5, top_k=8, top_p=0.6, min_p=0.1),
         dict(temperature=1.0, top_k=5, top_p=0.9, min_p=0.0),
     ]
+    torch.manual_seed(20260928)
     raw = torch.randn(num_reqs, vocab, device=device)
     # Row 0: exact tie at the top-k=4 boundary (two tokens at rank 4/5), so the
     # kernel must keep BOTH boundary tokens or the support check fails.
