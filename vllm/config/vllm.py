@@ -2166,6 +2166,8 @@ class VllmConfig:
                 "Disabling cascade attention when VLLM_BATCH_INVARIANT is enabled.",
             )
 
+        self._validate_df2t_cudagraph()
+
         if self.parallel_config.use_ubatching:
             a2a_backend = self.parallel_config.all2all_backend
             assert a2a_backend in [
@@ -3188,6 +3190,23 @@ class VllmConfig:
                 "df2t speculative decoding requires FA4 or Flex attention on "
                 "the target, but attention_config.backend_per_kind overrides "
                 f"{bad_kinds} are outside {{fa4, flex}}."
+            )
+
+    def _validate_df2t_cudagraph(self) -> None:
+        """df2t tree verify runs eagerly and is not CUDA-graph-captured.
+
+        Capturing graphs would silently bypass the eager tree-verify path on
+        replayed decode steps, so reject the combination instead.
+        """
+        spec_config = self.speculative_config
+        if spec_config is None or not spec_config.use_df2t():
+            return
+        if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            raise ValueError(
+                "df2t speculative decoding runs its tree-verify path eagerly "
+                "and is not CUDA-graph-captured; disable CUDA graphs for the "
+                "target decode (e.g. -cc.cudagraph_mode=none or "
+                "--enforce-eager) with df2t."
             )
 
     def _validate_adaptive_verification(self) -> None:

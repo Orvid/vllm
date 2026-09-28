@@ -1956,6 +1956,9 @@ def test_df2t_forced_async_scheduling_raises(tmp_path: Path):
             ),
             parallel_config=parallel_config,
             speculative_config=speculative_config,
+            compilation_config=CompilationConfig(
+                mode=CompilationMode.NONE, cudagraph_mode=CUDAGraphMode.NONE
+            ),
         )
 
 
@@ -1973,8 +1976,32 @@ def test_df2t_disables_async_scheduling_by_default(tmp_path: Path):
         ),
         parallel_config=parallel_config,
         speculative_config=speculative_config,
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.NONE, cudagraph_mode=CUDAGraphMode.NONE
+        ),
     )
     assert cfg.scheduler_config.async_scheduling is False
+
+
+def test_df2t_rejects_cudagraph_capture(tmp_path: Path):
+    """df2t tree verify runs eagerly and is not graph-captured; combining it
+    with CUDA-graph capture must fail closed instead of silently mishandling."""
+    parallel_config = ParallelConfig(distributed_executor_backend="uni")
+    speculative_config = _df2t_speculative_config(tmp_path, parallel_config)
+    model_config = speculative_config.target_model_config
+    with pytest.raises(ValueError, match="df2t"):
+        VllmConfig(
+            model_config=model_config,
+            scheduler_config=SchedulerConfig(
+                max_model_len=2048,
+                is_encoder_decoder=False,
+            ),
+            parallel_config=parallel_config,
+            speculative_config=speculative_config,
+            compilation_config=CompilationConfig(
+                cudagraph_mode=CUDAGraphMode.PIECEWISE
+            ),
+        )
 
 
 @pytest.mark.skip_global_cleanup
