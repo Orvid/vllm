@@ -11,6 +11,7 @@ contract matches the rejection samplers: ``sampled [num_reqs, 1 + B]`` and
 ``num_sampled [num_reqs]`` (per-request accepted-emitted length).
 """
 
+import numpy as np
 import pytest
 import torch
 
@@ -25,6 +26,49 @@ from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import (
 )
 
 _DEVICES = ["cpu", "cuda"]
+
+
+def _make_slot_layer(num_slots, num_heads, head_dim, device="cuda"):
+    """Engine-style LBNHC per-layer view: (logical view, physical storage).
+
+    Physical storage is the contiguous ``[1, num_slots, num_heads, head_dim]``
+    array; the view is the non-contiguous transpose ``[1, num_heads, num_slots,
+    head_dim]`` (strides ``(num_slots * num_heads * head_dim, head_dim,
+    num_heads * head_dim, 1)``), exactly what ``create_kv_cache_views`` yields
+    under LBNHC. ``compact_accepted_chain`` addresses slot ``phys`` via the
+    flat ``phys * elems`` run, so tests seed/read through ``storage[0, phys]``
+    and hand ``view`` to the primitive.
+    """
+    storage = torch.zeros(
+        1, num_slots, num_heads, head_dim, dtype=torch.float32, device=device
+    )
+    return storage.transpose(1, 2), storage
+
+
+class _FakeBlockTables:
+    """Minimal stand-in for ``BlockTables.gather_block_tables``.
+
+    Holds one row-major int64 block table per KV group, indexed by the padded
+    request id (the mapping is the identity on patch rows, which is not what is
+    under test here).
+    """
+
+    def __init__(self, tables):
+        self._tables = [t for t in tables]
+
+    def gather_block_tables(self, idx_mapping, num_reqs_padded=0):
+        del idx_mapping  # identity gather on request rows
+        return tuple(t[:num_reqs_padded] for t in self._tables)
+
+
+def _compute_tree_depths(parents: torch.Tensor) -> torch.Tensor:
+    """A valid depth per arena (parents precede children; ``-1`` = anchor)."""
+    b = parents.shape[0]
+    depths = torch.empty(b, dtype=torch.long)
+    for i in range(b):
+        p = int(parents[i])
+        depths[i] = depths[p] + 1 if p >= 0 else 1
+    return depths
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -327,7 +371,7 @@ def test_model_runner_df2t_tree_verify_output_contract():
     contract: sampled [R, 1+B] int64 + num_sampled [R] int32, with
     num_rejected == num_logits - num_sampled so the existing postprocess
     plumbing consumes it unchanged."""
-    from types import SimpleNamespace
+    from types import MethodType, SimpleNamespace
 
     import numpy as np
 
@@ -363,6 +407,7 @@ def test_model_runner_df2t_tree_verify_output_contract():
         SimpleNamespace(
             token_ids=token_ids[r, : int(num_nodes[r])].to(device),
             parents=parents[r, : int(num_nodes[r])].to(device),
+            depths=_compute_tree_depths(parents[r, : int(num_nodes[r])]).to(device),
         )
         for r in range(num_reqs)
     ]
@@ -385,6 +430,13 @@ def test_model_runner_df2t_tree_verify_output_contract():
         pipeline_calls.append(1)
         return logits
 
+    # Real accepted-KV compaction wiring (not a stub): a single LBNHC KV group
+    # whose block-slot -> physical mapping is a constant offset per slot. C == 0
+    # keeps every accepted slot inside block 0, so compaction always stays
+    # within the view but still moves accepted KV to the canonical slot.
+    kv_view, kv_storage = _make_slot_layer(16, 2, 4, device)
+    block_table = torch.zeros(num_reqs, 1, dtype=torch.long, device=device)
+
     fake_self = SimpleNamespace(
         tree_verifier=tree_verifier,
         sampler=SimpleNamespace(
@@ -394,8 +446,24 @@ def test_model_runner_df2t_tree_verify_output_contract():
             apply_sampling_params=apply_sampling_params,
         ),
         device=device,
-        # KV compaction runs in the real runner; not exercised here.
-        _compact_df2t_accepted_kv=lambda _ib: None,
+        _kv_cache_views_by_name={"layer.0": kv_view},
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(
+                    layer_names=["layer.0"],
+                    kv_cache_spec=SimpleNamespace(block_size=16),
+                )
+            ]
+        ),
+        block_tables=_FakeBlockTables([block_table]),
+        req_states=SimpleNamespace(
+            num_computed_tokens=SimpleNamespace(
+                gpu=torch.zeros(num_reqs, dtype=torch.int32, device=device)
+            )
+        ),
+    )
+    fake_self._compact_df2t_accepted_kv = MethodType(
+        GPUModelRunner._compact_df2t_accepted_kv, fake_self
     )
 
     out = GPUModelRunner._df2t_tree_verify(fake_self, logits, ib)
@@ -423,7 +491,7 @@ def test_model_runner_df2t_tree_verify_mixed_batch():
     worker: it is verified as an empty tree (a plain single-token draw from its
     anchor row, num_sampled == 1), while the tree-carrying requests in the same
     step keep their full tree verification untouched."""
-    from types import SimpleNamespace
+    from types import MethodType, SimpleNamespace
 
     import numpy as np
 
@@ -454,7 +522,11 @@ def test_model_runner_df2t_tree_verify_mixed_batch():
     ib.cu_num_logits = cu
     ib.seq_lens = torch.ones(num_reqs, dtype=torch.int32, device=device) * 50
     ib.trees = [
-        SimpleNamespace(token_ids=token_ids[0, :2], parents=parents[0, :2]),
+        SimpleNamespace(
+            token_ids=token_ids[0, :2],
+            parents=parents[0, :2],
+            depths=_compute_tree_depths(parents[0, :2]).to(device),
+        ),
         None,
     ]
 
@@ -468,6 +540,11 @@ def test_model_runner_df2t_tree_verify_mixed_batch():
     def apply_sampling_params(logits, *args, **kwargs):
         return logits
 
+    # Real accepted-KV compaction wiring (not a stub), same minimal single-
+    # group setup as the output-contract test.
+    kv_view, _kv_storage = _make_slot_layer(16, 2, 4, device)
+    block_table = torch.zeros(num_reqs, 1, dtype=torch.long, device=device)
+
     fake_self = SimpleNamespace(
         tree_verifier=TreeVerifier(num_reqs, B, vocab, device),
         sampler=SimpleNamespace(
@@ -477,8 +554,24 @@ def test_model_runner_df2t_tree_verify_mixed_batch():
             apply_sampling_params=apply_sampling_params,
         ),
         device=device,
-        # KV compaction runs in the real runner; not exercised here.
-        _compact_df2t_accepted_kv=lambda _ib: None,
+        _kv_cache_views_by_name={"layer.0": kv_view},
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(
+                    layer_names=["layer.0"],
+                    kv_cache_spec=SimpleNamespace(block_size=16),
+                )
+            ]
+        ),
+        block_tables=_FakeBlockTables([block_table]),
+        req_states=SimpleNamespace(
+            num_computed_tokens=SimpleNamespace(
+                gpu=torch.zeros(num_reqs, dtype=torch.int32, device=device)
+            )
+        ),
+    )
+    fake_self._compact_df2t_accepted_kv = MethodType(
+        GPUModelRunner._compact_df2t_accepted_kv, fake_self
     )
 
     out = GPUModelRunner._df2t_tree_verify(fake_self, logits, ib)
@@ -585,3 +678,266 @@ def test_df2t_production_pipeline_matches_reference():
         )
         max_diff = float((actual - expected).abs().max())
         assert max_diff < 1e-5, f"row {r}: probability diff {max_diff}"
+
+
+def _df2t_compaction_ib(num_reqs, trees):
+    """An InputBatch-shaped stand-in exposing the fields the compaction wiring
+    reads (num_reqs, padding, trees, idx_mapping, idx_mapping_np)."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        num_reqs=num_reqs,
+        num_reqs_after_padding=num_reqs,
+        trees=trees,
+        idx_mapping=torch.arange(num_reqs, dtype=torch.int32, device="cuda"),
+        idx_mapping_np=np.arange(num_reqs),
+    )
+
+
+def _df2t_compaction_phys(req_bt, c, max_delta, block_size):
+    """The runner's block-slot -> physical mapping: ``phys[i]`` is the physical
+    slot for block-slot ``c + i``."""
+    slots = c + torch.arange(max_delta + 1, device="cuda")
+    return req_bt[slots // block_size] * block_size + slots % block_size
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_model_runner_df2t_compaction_wiring_moves_per_group():
+    """``_compact_df2t_accepted_kv`` (the real runner method) relocates each
+    accepted node's KV from its scattered ``C + 1 + arena`` block-slot to the
+    canonical ``C + depth`` block-slot, through the per-group block tables,
+    and zeroes the stale scattered slots.
+
+    Covers: block-slot math over ``num_computed_tokens``, per-group ``phys``
+    construction, the ``C + 1 + arena -> C + depth`` mapping, the already
+    canonical (no-op) skip, and the ``UniformTypeKVCacheSpecs`` group spec
+    (block_size access on a uniform KV group)."""
+    from types import SimpleNamespace
+
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        UniformTypeKVCacheSpecs,
+    )
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    device = torch.device("cuda")
+    num_reqs = 3
+    block_size = 4
+
+    # Request 0: C=6, accepts a chain of 2 nodes (arenas 1, 2 at depths 1, 4),
+    # so both relocate to non-aliased canonical slots (scatter/dst disjoint).
+    # Request 1: C=2, single accepted node, arena 2 depth 3 (canonical no-op).
+    # Request 2: num_sampled == 1 -> skipped by the wiring.
+    num_sampled = torch.tensor([3, 2, 1], dtype=torch.int32, device=device)
+    accepted_arenas = torch.full((num_reqs, 8), -1, dtype=torch.long, device=device)
+    accepted_arenas[0, 1] = 1
+    accepted_arenas[0, 2] = 2
+    accepted_arenas[1, 1] = 2
+    trees = [
+        SimpleNamespace(
+            depths=torch.tensor([0, 1, 4, 9, 9], dtype=torch.long, device=device)
+        ),
+        SimpleNamespace(
+            depths=torch.tensor([0, 5, 3, 9, 9], dtype=torch.long, device=device)
+        ),
+        None,
+    ]
+    num_computed = torch.tensor([6, 2, 0], dtype=torch.int32, device=device)
+
+    # Group 0 uses a real UniformTypeKVCacheSpecs (R3: block_size must read
+    # off a uniform-type group without unwrapping); group 1 a plain spec.
+    uniform0 = UniformTypeKVCacheSpecs.from_specs(
+        {
+            "l.0": FullAttentionSpec(
+                block_size=block_size, num_kv_heads=2, head_size=3, dtype="float32"
+            ),
+            "l.1": FullAttentionSpec(
+                block_size=block_size, num_kv_heads=2, head_size=3, dtype="float32"
+            ),
+        }
+    )
+    assert uniform0 is not None
+    groups = [
+        SimpleNamespace(
+            layer_names=["l.0", "l.1"],
+            kv_cache_spec=uniform0,
+        ),
+        SimpleNamespace(
+            layer_names=["l.20"],
+            kv_cache_spec=SimpleNamespace(block_size=block_size),
+        ),
+    ]
+    layer_specs = [
+        [("l.0", 2, 3), ("l.1", 2, 3)],
+        [("l.20", 1, 5)],
+    ]
+    views_by_name = {}
+    storages = {}
+    for _, specs in enumerate(layer_specs):
+        for name, h, d in specs:
+            views_by_name[name], storages[name] = _make_slot_layer(256, h, d, device)
+
+    block_tables = [
+        torch.tensor(
+            [[10, 30, 40], [20, 50, 0], [1, 1, 1]], dtype=torch.long, device=device
+        ),
+        torch.tensor(
+            [[1, 2, 3], [11, 12, 0], [1, 1, 1]], dtype=torch.long, device=device
+        ),
+    ]
+
+    def _fill(distinct, h, d):
+        return torch.full((h, d), distinct, dtype=torch.float32, device=device)
+
+    # Request 0 scattered sources (per group) hold the accepted nodes' KV; the
+    # request 1 canonical slot holds KV that must be left untouched.
+    r0_g0 = _df2t_compaction_phys(block_tables[0][0], 6, 4, block_size)
+    # slots 6..10 -> phys [122, 123, 160, 161, 162]
+    assert r0_g0.tolist() == [122, 123, 160, 161, 162]
+    r0_g1 = _df2t_compaction_phys(block_tables[1][0], 6, 4, block_size)
+    assert r0_g1.tolist() == [10, 11, 12, 13, 14]
+    r1_g0 = _df2t_compaction_phys(block_tables[0][1], 2, 3, block_size)
+    r1_g1 = _df2t_compaction_phys(block_tables[1][1], 2, 3, block_size)
+    # Request 1 canonical slot is the phys index for depth 3 (index 3).
+    canon0 = int(r1_g0[3].item())
+    canon1 = int(r1_g1[3].item())
+    assert canon0 == 201 and canon1 == 49
+
+    for name, h, d in [("l.0", 2, 3), ("l.1", 2, 3)]:
+        storages[name][0, int(r0_g0[2])] = _fill(1, h, d)  # node1 scatter
+        storages[name][0, int(r0_g0[3])] = _fill(2, h, d)  # node2 scatter
+        storages[name][0, canon0] = _fill(9, h, d)  # canonical no-op request
+    storages["l.20"][0, int(r0_g1[2])] = _fill(1, 1, 5)
+    storages["l.20"][0, int(r0_g1[3])] = _fill(2, 1, 5)
+    storages["l.20"][0, canon1] = _fill(9, 1, 5)
+
+    fake_self = SimpleNamespace(
+        tree_verifier=SimpleNamespace(
+            num_sampled=num_sampled, accepted_arenas=accepted_arenas
+        ),
+        _kv_cache_views_by_name=views_by_name,
+        kv_cache_config=SimpleNamespace(kv_cache_groups=groups),
+        block_tables=_FakeBlockTables(block_tables),
+        req_states=SimpleNamespace(
+            num_computed_tokens=SimpleNamespace(gpu=num_computed)
+        ),
+        device=device,
+    )
+    ib = _df2t_compaction_ib(num_reqs, trees)
+
+    GPUModelRunner._compact_df2t_accepted_kv(fake_self, ib)
+
+    # Request 0 / group 0: node1 scatter 160 -> canonical 123 and node2 scatter
+    # 161 -> canonical 162; both scattered slots come back zeroed.
+    for name in ("l.0", "l.1"):
+        assert torch.equal(
+            storages[name][0, int(r0_g0[1])], _fill(1, 2, 3)
+        )  # dst depth1
+        assert torch.equal(
+            storages[name][0, int(r0_g0[4])], _fill(2, 2, 3)
+        )  # dst depth4
+        assert torch.equal(
+            storages[name][0, int(r0_g0[2])], torch.zeros((2, 3), device=device)
+        )
+        assert torch.equal(
+            storages[name][0, int(r0_g0[3])], torch.zeros((2, 3), device=device)
+        )
+
+    # Request 0 / group 1 uses its OWN block table: node1 12 -> 11, node2
+    # 13 -> 14.
+    assert torch.equal(storages["l.20"][0, int(r0_g1[1])], _fill(1, 1, 5))
+    assert torch.equal(storages["l.20"][0, int(r0_g1[4])], _fill(2, 1, 5))
+    assert torch.equal(
+        storages["l.20"][0, int(r0_g1[2])], torch.zeros((1, 5), device=device)
+    )
+    assert torch.equal(
+        storages["l.20"][0, int(r0_g1[3])], torch.zeros((1, 5), device=device)
+    )
+
+    # Request 1: already canonical (canonical slot == scattered slot), so the
+    # KV there is left byte-for-byte untouched.
+    for name in ("l.0", "l.1"):
+        assert torch.equal(storages[name][0, canon0], _fill(9, 2, 3))
+    assert torch.equal(storages["l.20"][0, canon1], _fill(9, 1, 5))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_model_runner_df2t_compaction_wiring_noop_cases():
+    """The wiring is a no-op (no KV written) when no request accepted > 1
+    node, when the batch has no trees, or when the runner has no KV views."""
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    device = torch.device("cuda")
+    num_reqs = 2
+    view, storage = _make_slot_layer(16, 2, 4, device)
+    storage.fill_(3.5)
+    snapshot = storage.clone()
+    block_table = torch.zeros(num_reqs, 1, dtype=torch.long, device=device)
+
+    def _run(verifier, trees):
+        fake_self = SimpleNamespace(
+            tree_verifier=verifier,
+            _kv_cache_views_by_name={"layer.0": view},
+            kv_cache_config=SimpleNamespace(
+                kv_cache_groups=[
+                    SimpleNamespace(
+                        layer_names=["layer.0"],
+                        kv_cache_spec=SimpleNamespace(block_size=16),
+                    )
+                ]
+            ),
+            block_tables=_FakeBlockTables([block_table]),
+            req_states=SimpleNamespace(
+                num_computed_tokens=SimpleNamespace(
+                    gpu=torch.zeros(num_reqs, dtype=torch.int32, device=device)
+                )
+            ),
+            device=device,
+        )
+        ib = _df2t_compaction_ib(num_reqs, trees)
+        GPUModelRunner._compact_df2t_accepted_kv(fake_self, ib)
+
+    # Zero-accepted: num_sampled all <= 1 -> nothing written.
+    _run(
+        SimpleNamespace(
+            num_sampled=torch.tensor([1, 1], dtype=torch.int32, device=device),
+            accepted_arenas=torch.zeros(num_reqs, 8, dtype=torch.long, device=device),
+        ),
+        [SimpleNamespace(depths=torch.zeros(4, dtype=torch.long, device=device))]
+        * num_reqs,
+    )
+    assert torch.equal(storage, snapshot)
+
+    # Accepted nodes but every tree is None -> no KV group touched.
+    _run(
+        SimpleNamespace(
+            num_sampled=torch.tensor([3, 1], dtype=torch.int32, device=device),
+            accepted_arenas=torch.zeros(num_reqs, 8, dtype=torch.long, device=device),
+        ),
+        [None, None],
+    )
+    assert torch.equal(storage, snapshot)
+
+    # No KV views at all -> the runner returns before touching anything.
+    fake_self = SimpleNamespace(
+        tree_verifier=SimpleNamespace(
+            num_sampled=torch.tensor([3, 3], dtype=torch.int32, device=device),
+            accepted_arenas=torch.zeros(num_reqs, 8, dtype=torch.long, device=device),
+        ),
+        _kv_cache_views_by_name=None,
+        block_tables=_FakeBlockTables([block_table]),
+        req_states=SimpleNamespace(
+            num_computed_tokens=SimpleNamespace(
+                gpu=torch.zeros(num_reqs, dtype=torch.int32, device=device)
+            )
+        ),
+        device=device,
+    )
+    ib_no_attrs = _df2t_compaction_ib(num_reqs, [None, None])
+    ib_no_attrs.trees = [
+        SimpleNamespace(depths=torch.zeros(4, dtype=torch.long, device=device))
+    ] * num_reqs
+    GPUModelRunner._compact_df2t_accepted_kv(fake_self, ib_no_attrs)
+    assert torch.equal(storage, snapshot)
