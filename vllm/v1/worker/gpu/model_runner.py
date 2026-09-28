@@ -317,6 +317,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._pending_tree_flex_mask: (
             tuple[int, torch.Tensor, torch.Tensor, int] | None
         ) = None
+        # df2t fa4 tree verify: same staging for the FlashAttention-4 mask_mod
+        # vehicle (``tree_attention_backend == "fa4"``, the default). Stays
+        # None except on fa4-tree batches.
+        self._pending_tree_fa4_mask: (
+            tuple[int, torch.Tensor, torch.Tensor, int] | None
+        ) = None
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -1369,10 +1375,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             f"tokens for a {tree.token_ids.shape[0]}-node tree"
                         )
 
-        # df2t flex verify: stage the per-request tree mask inputs (context
+        # df2t flex/fa4 verify: stage the per-request tree mask inputs (context
         # length C per request, ancestor-or-self words) so execute_model can
-        # attach them to the Flex metadata after prepare_attn.
+        # attach them to the Flex/FA4 metadata after prepare_attn.
         self._stage_tree_flex_mask(use_df2t_trees, trees, num_reqs, idx_mapping)
+        self._stage_tree_fa4_mask(use_df2t_trees, trees, num_reqs, idx_mapping)
 
         # The general branch also serves a no-draft batch with k != 1, and
         # compact_batch's budget is only primed when drafts are scheduled.
@@ -1642,6 +1649,151 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "verify forward on the FlexAttention backend, but no "
                 "FlexAttentionMetadata was produced. Select FlexAttention "
                 "for the target (or set tree_attention_backend='fa4')."
+            )
+
+    def _stage_tree_fa4_mask(
+        self,
+        use_df2t_trees: bool,
+        trees: "list[TreeDraft | None] | None",
+        num_reqs: int,
+        idx_mapping: torch.Tensor,
+    ) -> None:
+        """Stage the df2t fa4-tree per-request mask inputs, or clear them.
+
+        Only active on df2t tree batches with ``tree_attention_backend ==
+        "fa4"`` (the default); attaches the FA4 CuTE-DSL mask ``mask_mod`` in
+        ``execute_model``. For every other batch the pending field is cleared
+        so no stale mask leaks into a later step.
+        """
+        spec = self.speculative_config
+        self._pending_tree_fa4_mask = None
+        if not (
+            use_df2t_trees and spec is not None and spec.tree_attention_backend == "fa4"
+        ):
+            return
+        from vllm.v1.worker.gpu.spec_decode.df2t.attention import (
+            pack_tree_mask_inputs,
+        )
+
+        c_per_req = self.req_states.num_computed_tokens.gpu[idx_mapping].to(torch.int32)
+        # Defensive: the tree verify block only exists on decode steps with a
+        # non-empty context; a fresh-prompt prefill (C == 0) would attend
+        # nothing and a mixed step is unsupported, so fail closed.
+        assert bool((c_per_req > 0).all().item()), (
+            "df2t fa4 tree verify requires a decode batch with context (C > 0)"
+        )
+        words = pack_tree_mask_inputs(
+            trees, num_reqs, spec.max_tree_budget, self.device
+        )
+        self._pending_tree_fa4_mask = (
+            num_reqs,
+            c_per_req,
+            words,
+            spec.max_tree_budget,
+        )
+
+    def _fa4_tree_verify_layer_names(self) -> set[str]:
+        """Layer names whose group runs the df2t tree verify block on FA4.
+
+        These are the target model's FlashAttention full-attention layers (the
+        df2t verify vehicle under ``tree_attention_backend == "fa4"``). A
+        metadata from any other group (a drafter or a prefill/encoder group,
+        running in its own speculator) shares no logical slot space with the
+        tree block and must never receive the tree mask.
+        """
+        from vllm.v1.attention.backends.flash_attn import (
+            FlashAttentionBackend,
+        )
+
+        flash_name = FlashAttentionBackend.get_name()
+        names: set[str] = set()
+        for groups in self.attn_groups:
+            for group in groups:
+                if group.backend.get_name() == flash_name:
+                    names.update(group.layer_names)
+        return names
+
+    def _fa4_tree_page_sizes(self, target_layers: set[str]) -> set[int]:
+        """KV page sizes of the KV cache groups backing the tree layers.
+
+        The FA4 paged ``mask_mod``'s ``kv_idx`` wraps by the KV page size
+        beyond one page (fork-side limitation, see task 14 report), so the
+        attach gate needs the tree group's page size.
+        """
+        sizes: set[int] = set()
+        if getattr(self, "kv_cache_config", None) is None:
+            return sizes
+        for group in self.kv_cache_config.kv_cache_groups:
+            layer_names = getattr(group, "layer_names", None)
+            if layer_names and any(layer in target_layers for layer in layer_names):
+                block_size = group.kv_cache_spec.block_size
+                sizes.add(int(block_size))
+        return sizes
+
+    def _attach_tree_fa4_mask(self, attn_metadata: dict[str, Any] | None) -> None:
+        """Attach the staged df2t fa4 tree mask to the FA4 verify metadata."""
+        pending = self._pending_tree_fa4_mask
+        self._pending_tree_fa4_mask = None
+        if pending is None or attn_metadata is None:
+            return
+        from vllm.v1.attention.backends.flash_attn import (
+            FlashAttentionMetadata,
+        )
+        from vllm.v1.worker.gpu.spec_decode.df2t.attention import (
+            build_fa4_tree_mask,
+        )
+
+        num_reqs, c_per_req, words, b = pending
+        # Fail closed: the FA4 paged mask_mod's kv_idx is the logical block-slot
+        # only while a request's verify KV stays within one KV page; beyond a
+        # page boundary the current mask_mod path wraps kv_idx by the page size
+        # (see the task 14 report on cute/mask.py fastdiv divmod), collapsing
+        # distinct block-slots so the exact per-key tree mask cannot be honored.
+        # Never silently run unmasked attention -- route long-context df2t to
+        # "flex" instead.
+        target_layers = self._fa4_tree_verify_layer_names()
+        page_sizes = self._fa4_tree_page_sizes(target_layers)
+        if page_sizes:
+            # The most restrictive page size: the wrap divisor is the kernel's
+            # page size, and the gate must never under-approximate it.
+            page_size = min(page_sizes)
+            # Per-request node count = nonzero word rows (every real node's
+            # ancestor-or-self word has its self bit set); +1 for the anchor.
+            nodes_per_req = (words != 0).sum(dim=1)
+            max_kv_len = int((c_per_req + 1 + nodes_per_req).max().item())
+            if max_kv_len > page_size:
+                raise RuntimeError(
+                    "df2t tree-verify FA4 mask requires the request KV "
+                    "(context + anchor + nodes) to fit within one KV page, "
+                    f"but the max KV length is {max_kv_len} vs page size "
+                    f"{page_size}. The FA4 paged mask_mod wraps kv_idx by the "
+                    "page size beyond one page and cannot honor the per-key "
+                    "tree mask; use tree_attention_backend='flex' for "
+                    "long-context df2t."
+                )
+        # Only the target verify group(s) (see _fa4_tree_verify_layer_names)
+        # carry the tree block; a second FA group's metadata stays untouched.
+        mask_mod, aux_tensors = build_fa4_tree_mask(num_reqs, c_per_req, words, b)
+        attached = False
+        seen_metadata: set[int] = set()
+        for layer_name, metadata in attn_metadata.items():
+            if layer_name not in target_layers or not isinstance(
+                metadata, FlashAttentionMetadata
+            ):
+                continue
+            if id(metadata) in seen_metadata:
+                continue
+            seen_metadata.add(id(metadata))
+            metadata.df2t_tree_mask_mod = mask_mod
+            metadata.df2t_tree_aux_tensors = aux_tensors
+            attached = True
+        if not attached:
+            raise ValueError(
+                "tree_attention_backend='fa4' requires running the df2t "
+                "verify forward on the FlashAttention-4 backend, but no "
+                "FlashAttentionMetadata carrying FA4 was produced. Select "
+                "FlashAttention for the target (or set "
+                "tree_attention_backend='flex')."
             )
 
     def prepare_attn(
@@ -2109,6 +2261,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         self._attach_tree_flex_mask(attn_metadata)
+        self._attach_tree_fa4_mask(attn_metadata)
 
         input_ids = input_batch.input_ids
         inputs_embeds = None

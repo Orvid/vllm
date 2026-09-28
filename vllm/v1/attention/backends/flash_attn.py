@@ -4,6 +4,7 @@
 
 import copy
 import functools
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -569,6 +570,15 @@ class FlashAttentionMetadata:
     rswa_prefix_lens: torch.Tensor | None = None
     rswa_window: int | None = None
     rswa_window_tensor: torch.Tensor | None = None
+
+    # df2t tree-verify mask on FA4.  The runner attaches the CuTE-DSL mask_mod
+    # and its aux tensors (ancestor words + per-request C offsets) on df2t
+    # verify batches when ``tree_attention_backend == "fa4"``;
+    # ``FlashAttentionImpl.forward`` picks them up and applies them exactly
+    # like the mm-prefix / R-SWA mask mods (causal + window are suppressed
+    # because the tree mask encodes them fully).
+    df2t_tree_mask_mod: Callable | None = None
+    df2t_tree_aux_tensors: list[torch.Tensor] | None = None
 
 
 def _get_sliding_window_configs(
@@ -1283,6 +1293,21 @@ class FlashAttentionImpl(AttentionImpl):
             # Profiling run.
             return output.fill_(0)
 
+        # Fail closed: a staged df2t tree mask can only run on FA4. Under
+        # df2t+fa4 the selection already resolves FA4 (fa_utils), but a
+        # silent downgrade (e.g. a head-dim fallback) must never drop the
+        # per-query tree mask and run plain causal attention.
+        if (
+            getattr(attn_metadata, "df2t_tree_mask_mod", None) is not None
+            and self.vllm_flash_attn_version != 4
+        ):
+            raise RuntimeError(
+                "df2t tree-verify mask requires FlashAttention-4, but the "
+                f"resolved FA version is {self.vllm_flash_attn_version}. "
+                "Use tree_attention_backend='fa4' (default) with FA4 enabled, "
+                "or tree_attention_backend='flex'."
+            )
+
         attn_type = self.attn_type
 
         # IMPORTANT!
@@ -1436,6 +1461,15 @@ class FlashAttentionImpl(AttentionImpl):
                     # mask_mod fully expresses R-SWA; disable FA's own window.
                     sliding_window_size = None
 
+                # df2t tree verify (FA4): the CuTE-DSL mask_mod encodes the
+                # ancestor-or-self tree mask (context + anchor + reachable
+                # nodes), which supersedes FA's causal and window handling.
+                df2t_tree_mask_mod = attn_metadata.df2t_tree_mask_mod
+                df2t_tree_aux = attn_metadata.df2t_tree_aux_tensors
+                if df2t_tree_mask_mod is not None:
+                    causal = False
+                    sliding_window_size = None
+
                 dynamic_causal = None
                 if isinstance(causal, torch.Tensor):
                     if self.vllm_flash_attn_version != 4:
@@ -1481,8 +1515,8 @@ class FlashAttentionImpl(AttentionImpl):
                     dynamic_causal=dynamic_causal,
                     num_splits=num_splits,
                     s_aux=self.sinks,
-                    mask_mod=rswa_mask_mod_fn or mm_mask_mod,
-                    aux_tensors=rswa_aux or mm_aux,
+                    mask_mod=rswa_mask_mod_fn or mm_mask_mod or df2t_tree_mask_mod,
+                    aux_tensors=rswa_aux or mm_aux or df2t_tree_aux,
                 )
                 return output
 
