@@ -13,6 +13,13 @@ logger = init_logger(__name__)
 # The dedicated hd256 kernel requires one 128-token page per tile.
 FA4_HD256_PAGE_SIZE = 128
 
+# df2t's per-query tree mask is only expressible by FA4 or Flex attention.
+# Shared with VllmConfig._validate_df2t_attention (vllm/config/vllm.py).
+DF2T_TREE_ATTN_REQUIRED = (
+    "df2t speculative decoding requires FlashAttention-4 (or "
+    "tree_attention_backend='flex')"
+)
+
 # Track whether upstream flash-attn is available on ROCm.
 # Set during module initialization and never modified afterwards.
 # This module-level flag avoids repeated import attempts and ensures
@@ -132,8 +139,7 @@ def get_flash_attn_version(
             fa_version = 4
         elif df2t_active and not df2t_flex:
             raise RuntimeError(
-                "df2t speculative decoding requires FlashAttention-4 (or "
-                f"tree_attention_backend='flex') but FA4 is unsupported on "
+                f"{DF2T_TREE_ATTN_REQUIRED} but FA4 is unsupported on "
                 f"compute capability {device_capability}. Since flex is not "
                 "the chosen vehicle, refusing to run the df2t tree-verify "
                 "pass on FA2/FA3."
@@ -151,6 +157,18 @@ def get_flash_attn_version(
         ):
             fa_version = vllm_config.attention_config.flash_attn_version
             config_override = True
+
+        # df2t runtime fail-closed must be uniform: an explicit override
+        # outside {fa4} raises here, BEFORE the pre-existing Blackwell
+        # FA3->FA4 normalization below would silently fold a forced fa3 into
+        # fa4. This mirrors the config-time rejection and applies regardless
+        # of vehicle; only a flex-without-override run keeps its carve-out.
+        if df2t_active and config_override and fa_version not in (None, 4):
+            raise RuntimeError(
+                f"{DF2T_TREE_ATTN_REQUIRED}, but an explicit flash_attn_version "
+                f"override forced FA{fa_version}. df2t's per-query tree mask "
+                "cannot run on FA2/FA3; refusing to silently normalize it."
+            )
 
         # 3. fallback for unsupported combinations
         if device_capability.major >= 10 and fa_version == 3:
@@ -253,9 +271,8 @@ def get_flash_attn_version(
         # explicit override, where the flash path is unused.
         if df2t_active and fa_version != 4 and (not df2t_flex or config_override):
             raise RuntimeError(
-                "df2t speculative decoding requires FlashAttention-4 (or "
-                f"tree_attention_backend='flex'), but flash-attention resolved "
-                f"to FA{fa_version}. Refusing a silent FA2/FA3 fallback: an "
+                f"{DF2T_TREE_ATTN_REQUIRED}, but flash-attention resolved to "
+                f"FA{fa_version}. Refusing a silent FA2/FA3 fallback: an "
                 "automatic guard (e.g. VLLM_BATCH_INVARIANT, alibi, or a "
                 "TMEM-limited head_dim) downgraded it, or an explicit "
                 "flash_attn_version override forced a non-fa4 version."

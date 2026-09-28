@@ -3130,13 +3130,13 @@ class VllmConfig:
         if spec_config is None or not spec_config.use_df2t():
             return
 
+        from vllm.v1.attention.backends.fa_utils import DF2T_TREE_ATTN_REQUIRED
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
         fa_version = self.attention_config.flash_attn_version
         if fa_version not in (None, 4):
             raise ValueError(
-                "df2t speculative decoding requires FlashAttention-4 (or "
-                f"tree_attention_backend='flex'), but attention_config."
+                f"{DF2T_TREE_ATTN_REQUIRED}, but attention_config."
                 f"flash_attn_version is {fa_version}. df2t's per-query tree "
                 "mask is only supported by FA4 or Flex attention; refusing to "
                 "run it on FA2/FA3."

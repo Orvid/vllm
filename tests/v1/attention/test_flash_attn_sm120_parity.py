@@ -126,6 +126,66 @@ def _make_cfg(qwen3_config_path, df2t, flex=False, flash_attn_version=None):
     return cfg
 
 
+def _real_df2t_vllm_config(qwen3_config_path, flash_attn_version=None):
+    """A VllmConfig built with a REAL df2t SpeculativeConfig.
+
+    Passing a real SpeculativeConfig means ``VllmConfig.__post_init__`` runs
+    the df2t attention cross-validation (``_validate_df2t_attention``) at
+    construction time, exercising the wiring rather than an isolated method.
+    """
+    from types import SimpleNamespace
+
+    from vllm.config import VllmConfig
+    from vllm.config.speculative import SpeculativeConfig
+
+    base = create_vllm_config(
+        model_name=qwen3_config_path,
+        max_model_len=1024,
+        block_size=BLOCK_SIZE,
+        num_gpu_blocks=64,
+    )
+    if flash_attn_version is not None:
+        base.attention_config.flash_attn_version = flash_attn_version
+    # df2t is incompatible with async scheduling; the base config resolved it
+    # to True without a speculative config, so reset it for the real df2t run.
+    base.scheduler_config.async_scheduling = False
+    draft_model_config = SimpleNamespace(
+        architectures=["DFlash2DraftModel"],
+        hf_config=SimpleNamespace(
+            num_hidden_layers=2,
+            block_size=16,
+            dflash_config={
+                "block_size": 16,
+                "selector_top_k": 3,
+                "mask_token_id": 151643,
+            },
+        ),
+        model="draft",
+        max_model_len=128,
+        get_hidden_size=lambda: 64,
+        get_vocab_size=lambda: 4096,
+        verify_with_parallel_config=lambda *_: None,
+        compute_hash=lambda: "draft-hash",
+    )
+    speculative_config = SpeculativeConfig(
+        method="df2t",
+        num_speculative_tokens=15,
+        draft_model_config=draft_model_config,
+        tree_budget=None,
+    )
+    return VllmConfig(
+        model_config=base.model_config,
+        cache_config=base.cache_config,
+        parallel_config=base.parallel_config,
+        scheduler_config=base.scheduler_config,
+        device_config=base.device_config,
+        load_config=base.load_config,
+        compilation_config=base.compilation_config,
+        attention_config=base.attention_config,
+        speculative_config=speculative_config,
+    )
+
+
 @requires_sm120_fa4
 def test_get_flash_attn_version_gates_fa4_on_df2t(qwen3_config_path):
     """SM120 resolves FA2 by default and only upgrades to FA4 under df2t.
@@ -156,20 +216,63 @@ def test_get_flash_attn_version_gates_fa4_on_df2t(qwen3_config_path):
 def test_df2t_forced_fa2_override_raises(qwen3_config_path):
     """Explicitly forcing FA2 under df2t must error, never silently fall back.
 
-    Both the VllmConfig cross-validation and the runtime selection reject a
-    flash_attn_version override outside {fa4, flex} while a df2t decoder is
-    active.
+    The allowed set is {fa4, flex}: an explicit ``flash_attn_version=2``
+    override is rejected both at VllmConfig construction (real df2t
+    SpeculativeConfig, so ``__post_init__`` runs the cross-validation) and at
+    runtime selection.
     """
-    cfg = _make_cfg(qwen3_config_path, df2t=True, flash_attn_version=2)
     with pytest.raises(ValueError, match="df2t"):
-        cfg._validate_df2t_attention()
+        _real_df2t_vllm_config(qwen3_config_path, flash_attn_version=2)
+
+    cfg = _make_cfg(qwen3_config_path, df2t=True, flash_attn_version=2)
     with set_current_vllm_config(cfg), pytest.raises(RuntimeError, match="df2t"):
         get_flash_attn_version(head_size=HEAD_DIM, kv_cache_block_size=BLOCK_SIZE)
 
     # FA4 is accepted by both seams.
+    _real_df2t_vllm_config(qwen3_config_path, flash_attn_version=4)
     cfg = _make_cfg(qwen3_config_path, df2t=True, flash_attn_version=4)
-    cfg._validate_df2t_attention()
     with set_current_vllm_config(cfg):
+        assert (
+            get_flash_attn_version(head_size=HEAD_DIM, kv_cache_block_size=BLOCK_SIZE)
+            == 4
+        )
+
+
+@requires_sm120_fa4
+def test_df2t_forced_fa3_override_raises_on_major10(monkeypatch, qwen3_config_path):
+    """df2t + an explicit fa3 override on a Blackwell major raises like fa2.
+
+    The pre-existing major>=10 fallback normalizes an explicit fa3 to FA4 for
+    non-df2t runs; under df2t (non-flex) that silent normalization must not
+    apply — the override raises at runtime too. Non-df2t behavior is
+    unchanged.
+    """
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.vllm_flash_attn import flash_attn_interface as fai
+
+    platform_cls = current_platform.__class__
+    monkeypatch.setattr(
+        platform_cls,
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(major=10, minor=0)),
+    )
+    monkeypatch.setattr(fai, "_is_fa4_supported", lambda: (True, None))
+
+    with pytest.raises(ValueError, match="df2t"):
+        _real_df2t_vllm_config(qwen3_config_path, flash_attn_version=3)
+
+    with (
+        set_current_vllm_config(
+            _make_cfg(qwen3_config_path, df2t=True, flash_attn_version=3)
+        ),
+        pytest.raises(RuntimeError, match="df2t"),
+    ):
+        get_flash_attn_version(head_size=HEAD_DIM, kv_cache_block_size=BLOCK_SIZE)
+
+    # Non-df2t + explicit fa3 on major>=10 still normalizes to FA4.
+    with set_current_vllm_config(
+        _make_cfg(qwen3_config_path, df2t=False, flash_attn_version=3)
+    ):
         assert (
             get_flash_attn_version(head_size=HEAD_DIM, kv_cache_block_size=BLOCK_SIZE)
             == 4
