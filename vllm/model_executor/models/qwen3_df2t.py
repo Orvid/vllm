@@ -42,9 +42,10 @@ class DF2TQwen3ForCausalLM(DFlash2Qwen3ForCausalLM):
             Per-token confidence, shape ``[num_tokens]``, in float32.
 
         """
-        assert self.df2t_conf_head is not None, (
-            "df2t_conf_head is None: set dflash_config.enable_confidence_head."
-        )
+        if self.df2t_conf_head is None:
+            raise RuntimeError(
+                "df2t_conf_head is None: set dflash_config.enable_confidence_head."
+            )
         return self.df2t_conf_head(hidden_states.float()).squeeze(-1)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
@@ -61,17 +62,19 @@ class DF2TQwen3ForCausalLM(DFlash2Qwen3ForCausalLM):
                 "Checkpoint carries df2t_conf_head weights but "
                 "dflash_config.enable_confidence_head is not set; ignoring them."
             )
-        elif self.df2t_conf_head is not None and not head_weights:
-            raise RuntimeError(
-                "dflash_config.enable_confidence_head is set but the checkpoint "
-                "carries no df2t_conf_head weights."
-            )
+        elif self.df2t_conf_head is not None:
+            expected = frozenset(("df2t_conf_head.weight", "df2t_conf_head.bias"))
+            if head_weights.keys() != expected:
+                raise RuntimeError(
+                    "dflash_config.enable_confidence_head is set but the "
+                    "df2t_conf_head weights are incomplete; expected "
+                    f"{sorted(expected)}, got {sorted(head_weights)}."
+                )
 
         super().load_weights(rest_weights)
         if head_weights and self.df2t_conf_head is not None:
             self.df2t_conf_head.weight.data.copy_(head_weights["df2t_conf_head.weight"])
-            if "df2t_conf_head.bias" in head_weights:
-                self.df2t_conf_head.bias.data.copy_(head_weights["df2t_conf_head.bias"])
+            self.df2t_conf_head.bias.data.copy_(head_weights["df2t_conf_head.bias"])
 
 
 EntryClass = DF2TQwen3ForCausalLM

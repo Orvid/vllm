@@ -158,6 +158,24 @@ def test_confidence_head_raises_when_enabled_without_weights(tmp_path, dist_init
         model.load_weights([])
 
 
+def test_confidence_head_rejects_incomplete_weights(tmp_path, dist_init):
+    """An enabled head must fail loudly, not with a raw KeyError or a silently
+    random bias, when the checkpoint supplies partial head weights."""
+    bias_only = _build_model(tmp_path, enable_confidence_head=True)
+    with pytest.raises(RuntimeError, match="df2t_conf_head.*incomplete"):
+        bias_only.load_weights([("df2t_conf_head.bias", torch.randn(1))])
+
+    weight_only = _build_model(tmp_path, enable_confidence_head=True)
+    with pytest.raises(RuntimeError, match="df2t_conf_head.*incomplete"):
+        weight_only.load_weights([("df2t_conf_head.weight", torch.randn(1, 64))])
+
+
+def test_compute_confidence_raises_without_head(tmp_path, dist_init):
+    model = _build_model(tmp_path, enable_confidence_head=False)
+    with pytest.raises(RuntimeError, match="enable_confidence_head"):
+        model.compute_confidence(torch.randn(2, 64))
+
+
 def test_registry_resolves_df2t_draft_model():
     assert (
         ModelRegistry.models["DF2TDraftModel"].load_model_cls() is DF2TQwen3ForCausalLM
