@@ -222,6 +222,26 @@ def _df2t_verify_rejects_logprobs(sampling_states, idx_mapping_np) -> None:
         )
 
 
+def _df2t_validate_decode_context(c_per_req: torch.Tensor) -> None:
+    """Fail closed clearly if a df2t tree step co-batches a fresh prefill.
+
+    The per-query tree mask only exists on decode steps with a non-empty
+    context (``C > 0``); a ``C == 0`` request in the same tree batch would have
+    its own attention masked away, so mixed admission is refused rather than
+    silently corrupting the prefill.
+    """
+    if bool((c_per_req > 0).all().item()):
+        return
+    num_bad = int((c_per_req <= 0).sum().item())
+    raise RuntimeError(
+        "df2t tree-verify steps only support decode batches with context; "
+        f"{num_bad} request(s) in this batch have no computed context yet "
+        "(fresh prefills co-scheduled with a df2t tree step). This admission "
+        "case is not yet supported; prefill new requests before tree decode "
+        "or limit concurrency so prefills do not interleave with tree steps."
+    )
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -1622,12 +1642,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         c_per_req = self.req_states.num_computed_tokens.gpu[idx_mapping].to(torch.int64)
-        # Defensive: the tree verify block only exists on decode steps with a
-        # non-empty context; a fresh-prompt prefill (C == 0) would attend
-        # nothing and a mixed step is unsupported, so fail closed.
-        assert bool((c_per_req > 0).all().item()), (
-            "df2t flex tree verify requires a decode batch with context (C > 0)"
-        )
+        _df2t_validate_decode_context(c_per_req)
         words = pack_tree_mask_inputs(
             trees, num_reqs, spec.max_tree_budget, self.device
         )
@@ -1721,12 +1736,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         c_per_req = self.req_states.num_computed_tokens.gpu[idx_mapping].to(torch.int32)
-        # Defensive: the tree verify block only exists on decode steps with a
-        # non-empty context; a fresh-prompt prefill (C == 0) would attend
-        # nothing and a mixed step is unsupported, so fail closed.
-        assert bool((c_per_req > 0).all().item()), (
-            "df2t fa4 tree verify requires a decode batch with context (C > 0)"
-        )
+        _df2t_validate_decode_context(c_per_req)
         words = pack_tree_mask_inputs(
             trees, num_reqs, spec.max_tree_budget, self.device
         )
@@ -2640,6 +2650,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
                 self.req_states.draft_tokens[input_batch.idx_mapping],
+                # df2t carries the per-request tree beside the draft tokens;
+                # other speculators return None and keep the plain-token path.
+                trees=getattr(self.speculator, "latest_tree_drafts", None),
             )
             if self.pp_handler is not None:
                 self.pp_handler.broadcast_drafts(
