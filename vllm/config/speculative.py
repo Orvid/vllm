@@ -647,6 +647,7 @@ class SpeculativeConfig:
             "extract_hidden_states",
             "dflash",
             "dspark",
+            "df2t",
         )
         factors.append(uses_aux_hidden_states)
 

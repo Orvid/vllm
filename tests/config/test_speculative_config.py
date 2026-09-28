@@ -110,3 +110,13 @@ def test_df2t_tree_knobs_change_hash():
     base = _build()
     modified = _build(tree_budget=32)
     assert base.compute_hash() != modified.compute_hash()
+
+
+def test_df2t_hash_covers_aux_hidden_state_layers():
+    """df2t drafting consumes aux hidden states (DFlash2 flow, like dflash/
+    dspark); the compute-graph hash must reflect the draft's
+    ``eagle_aux_hidden_state_layer_ids``."""
+    draft = _draft_cfg()
+    draft.hf_config.eagle_aux_hidden_state_layer_ids = [1, 2]  # type: ignore[attr-defined]
+    modified = _build(draft_model_config=draft)
+    assert _build().compute_hash() != modified.compute_hash()
