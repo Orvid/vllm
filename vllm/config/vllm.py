@@ -1546,6 +1546,18 @@ class VllmConfig:
                     "select a different all2all backend."
                 )
             if self.speculative_config is not None:
+                if self.speculative_config.use_df2t():
+                    # df2t deliberately stays off async scheduling: the df2t
+                    # tree is not carried through the async/deferred scheduling
+                    # path (update_draft_token_ids_in_output), so running df2t
+                    # under async would silently degrade the tree to a chain.
+                    # Fail closed rather than produce that.
+                    raise ValueError(
+                        "Async scheduling is not supported with df2t speculative "
+                        "decoding (the df2t tree is not carried through the "
+                        "async/deferred scheduling path). Use non-async "
+                        "scheduling for df2t."
+                    )
                 if (
                     self.speculative_config.method not in get_args(EagleModelTypes)
                     and self.speculative_config.method not in get_args(NgramGPUTypes)
@@ -1577,6 +1589,16 @@ class VllmConfig:
                 # impacts performance of pooling models, so we disable by default.
                 logger.debug(
                     "Disabling asynchronous scheduling by default for pooling model."
+                )
+                self.scheduler_config.async_scheduling = False
+            elif (
+                self.speculative_config is not None
+                and self.speculative_config.use_df2t()
+            ):
+                logger.warning_once(
+                    "Async scheduling is disabled for df2t speculative "
+                    "decoding: the df2t tree is not carried through the "
+                    "async/deferred scheduling path."
                 )
                 self.scheduler_config.async_scheduling = False
             elif (

@@ -1887,6 +1887,96 @@ def test_dflash_allows_async_scheduling(tmp_path: Path):
     assert cfg.scheduler_config.async_scheduling is True
 
 
+def _df2t_speculative_config(tmp_path: Path, parallel_config) -> SpeculativeConfig:
+    """A df2t SpeculativeConfig over locally-written Qwen3 configs (offline)."""
+    from transformers import LlamaConfig
+
+    common = dict(
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=256,
+        max_position_embeddings=2048,
+    )
+    target_path = tmp_path / "target"
+    draft_path = tmp_path / "draft"
+    _write_json(
+        target_path / "config.json",
+        LlamaConfig(architectures=["LlamaForCausalLM"], **common).to_dict(),
+    )
+    _write_json(
+        draft_path / "config.json",
+        dict(
+            common,
+            architectures=["DFlash2DraftModel"],
+            model_type="qwen3",
+            num_hidden_layers=1,
+            layer_types=["sliding_attention"],
+            sliding_window=128,
+            dflash_config=dict(
+                block_size=4,
+                mask_token_id=255,
+                target_layer_ids=[0],
+                conv_group_size=2,
+                conv_kernel_size=2,
+                selector_rank=8,
+                selector_top_k=4,
+            ),
+        ),
+    )
+    model_config = ModelConfig(
+        model=str(target_path), tokenizer_mode="skip", max_model_len=2048
+    )
+    return SpeculativeConfig(
+        method="df2t",
+        model=str(draft_path),
+        num_speculative_tokens=3,
+        target_model_config=model_config,
+        target_parallel_config=parallel_config,
+    )
+
+
+def test_df2t_forced_async_scheduling_raises(tmp_path: Path):
+    """df2t must never run under forced async scheduling: the tree is not
+    carried through the async/deferred path, so fail closed instead of
+    silently degrading to a chain."""
+    parallel_config = ParallelConfig(distributed_executor_backend="uni")
+    speculative_config = _df2t_speculative_config(tmp_path, parallel_config)
+    model_config = speculative_config.target_model_config
+
+    with pytest.raises(ValueError, match="df2t"):
+        VllmConfig(
+            model_config=model_config,
+            scheduler_config=SchedulerConfig(
+                max_model_len=2048,
+                is_encoder_decoder=False,
+                async_scheduling=True,
+            ),
+            parallel_config=parallel_config,
+            speculative_config=speculative_config,
+        )
+
+
+def test_df2t_disables_async_scheduling_by_default(tmp_path: Path):
+    """df2t deliberately defaults to non-async scheduling (the tree is not
+    carried through the async/deferred path)."""
+    parallel_config = ParallelConfig(distributed_executor_backend="uni")
+    speculative_config = _df2t_speculative_config(tmp_path, parallel_config)
+    model_config = speculative_config.target_model_config
+    cfg = VllmConfig(
+        model_config=model_config,
+        scheduler_config=SchedulerConfig(
+            max_model_len=2048,
+            is_encoder_decoder=False,
+        ),
+        parallel_config=parallel_config,
+        speculative_config=speculative_config,
+    )
+    assert cfg.scheduler_config.async_scheduling is False
+
+
 @pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize("tp_size", [1, 2])
 @pytest.mark.parametrize("target_ep", [False, True], ids=["ep-off", "ep-on"])
