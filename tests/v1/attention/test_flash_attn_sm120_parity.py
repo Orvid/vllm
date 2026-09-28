@@ -102,14 +102,28 @@ def qwen3_config_path(tmp_path_factory):
 # --------------------------------------------------------------------------- #
 
 
-def _fake_spec_config(df2t: bool):
+def _fake_spec_config(df2t: bool, flex: bool = False):
     import types
 
     return types.SimpleNamespace(
         method="df2t" if df2t else "dflash",
         use_df2t=lambda: df2t,
         num_speculative_tokens=5,
+        tree_attention_backend="flex" if flex else "fa4",
     )
+
+
+def _make_cfg(qwen3_config_path, df2t, flex=False, flash_attn_version=None):
+    cfg = create_vllm_config(
+        model_name=qwen3_config_path,
+        max_model_len=1024,
+        block_size=BLOCK_SIZE,
+        num_gpu_blocks=64,
+    )
+    cfg.speculative_config = _fake_spec_config(df2t=df2t, flex=flex)
+    if flash_attn_version is not None:
+        cfg.attention_config.flash_attn_version = flash_attn_version
+    return cfg
 
 
 @requires_sm120_fa4
@@ -123,27 +137,92 @@ def test_get_flash_attn_version_gates_fa4_on_df2t(qwen3_config_path):
         get_flash_attn_version(head_size=HEAD_DIM, kv_cache_block_size=BLOCK_SIZE) == 2
     )
 
-    cfg = create_vllm_config(
-        model_name=qwen3_config_path,
-        max_model_len=1024,
-        block_size=BLOCK_SIZE,
-        num_gpu_blocks=64,
-    )
-    cfg.speculative_config = _fake_spec_config(df2t=False)
-    with set_current_vllm_config(cfg):
+    with set_current_vllm_config(_make_cfg(qwen3_config_path, df2t=False)):
         assert (
             get_flash_attn_version(head_size=HEAD_DIM, kv_cache_block_size=BLOCK_SIZE)
             == 2
         )
 
-    cfg.speculative_config = _fake_spec_config(df2t=True)
-    with set_current_vllm_config(cfg):
+    with set_current_vllm_config(_make_cfg(qwen3_config_path, df2t=True)):
         assert (
             get_flash_attn_version(head_size=HEAD_DIM, kv_cache_block_size=BLOCK_SIZE)
             == 4
         )
 
     assert is_fa_version_supported(4)
+
+
+@requires_sm120_fa4
+def test_df2t_forced_fa2_override_raises(qwen3_config_path):
+    """Explicitly forcing FA2 under df2t must error, never silently fall back.
+
+    Both the VllmConfig cross-validation and the runtime selection reject a
+    flash_attn_version override outside {fa4, flex} while a df2t decoder is
+    active.
+    """
+    cfg = _make_cfg(qwen3_config_path, df2t=True, flash_attn_version=2)
+    with pytest.raises(ValueError, match="df2t"):
+        cfg._validate_df2t_attention()
+    with set_current_vllm_config(cfg), pytest.raises(RuntimeError, match="df2t"):
+        get_flash_attn_version(head_size=HEAD_DIM, kv_cache_block_size=BLOCK_SIZE)
+
+    # FA4 is accepted by both seams.
+    cfg = _make_cfg(qwen3_config_path, df2t=True, flash_attn_version=4)
+    cfg._validate_df2t_attention()
+    with set_current_vllm_config(cfg):
+        assert (
+            get_flash_attn_version(head_size=HEAD_DIM, kv_cache_block_size=BLOCK_SIZE)
+            == 4
+        )
+
+
+@requires_sm120_fa4
+def test_df2t_force_fa4_spans_other_majors(monkeypatch, qwen3_config_path):
+    """df2t forces FA4 on every architecture, not just SM120.
+
+    The real device is SM120; we mock the platform capability to a non-sm120
+    major and the FA4-support probe so the all-arch rule (df2t overrides the
+    SM90 FA3 default) and the flex escape hatch are exercised offline.
+    """
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.vllm_flash_attn import flash_attn_interface as fai
+
+    platform_cls = current_platform.__class__
+
+    monkeypatch.setattr(
+        platform_cls,
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(major=9, minor=0)),
+    )
+    monkeypatch.setattr(fai, "_is_fa4_supported", lambda: (True, None))
+
+    # fa4 vehicle on a simulated SM90 major: FA4 wins over the FA3 default.
+    with set_current_vllm_config(_make_cfg(qwen3_config_path, df2t=True)):
+        assert (
+            get_flash_attn_version(head_size=HEAD_DIM, kv_cache_block_size=BLOCK_SIZE)
+            == 4
+        )
+    # flex vehicle is accepted too (no raise), FA4 still resolves on sm90.
+    with set_current_vllm_config(_make_cfg(qwen3_config_path, df2t=True, flex=True)):
+        assert (
+            get_flash_attn_version(head_size=HEAD_DIM, kv_cache_block_size=BLOCK_SIZE)
+            == 4
+        )
+    # fa4 unsupported + non-flex vehicle (simulated SM80) must raise...
+    monkeypatch.setattr(
+        platform_cls,
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(major=8, minor=0)),
+    )
+    monkeypatch.setattr(fai, "_is_fa4_supported", lambda: (False, "not supported"))
+    with (
+        set_current_vllm_config(_make_cfg(qwen3_config_path, df2t=True)),
+        pytest.raises(RuntimeError, match="df2t"),
+    ):
+        get_flash_attn_version(head_size=HEAD_DIM, kv_cache_block_size=BLOCK_SIZE)
+    # ...while the flex vehicle stays a valid fa4-less handle.
+    with set_current_vllm_config(_make_cfg(qwen3_config_path, df2t=True, flex=True)):
+        get_flash_attn_version(head_size=HEAD_DIM, kv_cache_block_size=BLOCK_SIZE)
 
 
 # --------------------------------------------------------------------------- #

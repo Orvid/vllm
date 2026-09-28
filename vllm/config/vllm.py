@@ -1425,6 +1425,7 @@ class VllmConfig:
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)
 
         self.try_verify_and_update_config()
+        self._validate_df2t_attention()
         self._resolve_and_verify_engram_config()
 
         self._check_watermarking_unsupported()
@@ -3114,6 +3115,56 @@ class VllmConfig:
             unsupported.append("batch-sharded sampling")
 
         return unsupported
+
+    def _validate_df2t_attention(self) -> None:
+        """df2t tree verify requires FA4 or Flex attention on every arch.
+
+        The per-query tree mask is only expressible by FlashAttention-4 (the
+        default ``tree_attention_backend="fa4"``) or FlexAttention
+        (``tree_attention_backend="flex"``). An explicit override to FA2/FA3
+        or to a non-{fa4, flex} attention backend cannot run the df2t verify
+        pass correctly, so reject it here rather than silently falling back.
+        Non-df2t configs are untouched.
+        """
+        spec_config = self.speculative_config
+        if spec_config is None or not spec_config.use_df2t():
+            return
+
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        fa_version = self.attention_config.flash_attn_version
+        if fa_version not in (None, 4):
+            raise ValueError(
+                "df2t speculative decoding requires FlashAttention-4 (or "
+                f"tree_attention_backend='flex'), but attention_config."
+                f"flash_attn_version is {fa_version}. df2t's per-query tree "
+                "mask is only supported by FA4 or Flex attention; refusing to "
+                "run it on FA2/FA3."
+            )
+
+        allowed_backends = {
+            AttentionBackendEnum.FLASH_ATTN,
+            AttentionBackendEnum.FLEX_ATTENTION,
+        }
+        backend = self.attention_config.backend
+        if backend is not None and backend not in allowed_backends:
+            raise ValueError(
+                "df2t speculative decoding requires FlashAttention-4 (fa4) "
+                f"or Flex attention on the target, but attention_config."
+                f"backend is {backend}. Refusing a backend that cannot "
+                "express the per-query tree mask."
+            )
+        bad_kinds = [
+            f"{kind}={value}"
+            for kind, value in self.attention_config.backend_per_kind.items()
+            if value not in allowed_backends
+        ]
+        if bad_kinds:
+            raise ValueError(
+                "df2t speculative decoding requires FA4 or Flex attention on "
+                "the target, but attention_config.backend_per_kind overrides "
+                f"{bad_kinds} are outside {{fa4, flex}}."
+            )
 
     def _validate_adaptive_verification(self) -> None:
         spec_config = self.speculative_config
