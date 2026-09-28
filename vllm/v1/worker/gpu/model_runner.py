@@ -1072,6 +1072,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and self.model_state.encoder_runner.has_cudagraph()
         )
         capture_decoder = self.cudagraph_manager.needs_capture()
+        if (
+            capture_decoder
+            and self.speculative_config is not None
+            and (self.speculative_config.use_df2t())
+        ):
+            # df2t currently runs its tree-verify decode eagerly; capturing the
+            # target decode graph would replay the chain layout over tree
+            # batches and silently corrupt them. Eager is the current mode
+            # (tracked pending: CG-capture of the uniform 1+B verify shape).
+            raise RuntimeError(
+                "df2t's tree-verify decode is not yet CUDA-graph-captured; "
+                "run df2t eagerly (--enforce-eager or -cc.cudagraph_mode=none) "
+                "for now."
+            )
         if not capture_encoder and not capture_decoder:
             logger.warning(
                 "Skipping encoder and decoder CUDA graph capture. To enable "

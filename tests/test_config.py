@@ -1982,25 +1982,27 @@ def test_df2t_defaults_to_async_scheduling(tmp_path: Path):
     assert cfg.scheduler_config.async_scheduling is True
 
 
-def test_df2t_rejects_cudagraph_capture(tmp_path: Path):
-    """df2t tree verify runs eagerly and is not graph-captured; combining it
-    with CUDA-graph capture must fail closed instead of silently mishandling."""
+def test_df2t_cudagraphs_are_not_config_rejected(tmp_path: Path):
+    """CUDA-graph capture itself is not yet supported for the df2t tree-verify
+    decode, but the config must not blanket-forbid df2t + cudagraphs: capture is
+    refused eagerly at capture time (see GPUModelRunner.capture_model), not at
+    config time."""
     parallel_config = ParallelConfig(distributed_executor_backend="uni")
     speculative_config = _df2t_speculative_config(tmp_path, parallel_config)
     model_config = speculative_config.target_model_config
-    with pytest.raises(ValueError, match="df2t"):
-        VllmConfig(
-            model_config=model_config,
-            scheduler_config=SchedulerConfig(
-                max_model_len=2048,
-                is_encoder_decoder=False,
-            ),
-            parallel_config=parallel_config,
-            speculative_config=speculative_config,
-            compilation_config=CompilationConfig(
-                cudagraph_mode=CUDAGraphMode.PIECEWISE
-            ),
-        )
+    cfg = VllmConfig(
+        model_config=model_config,
+        scheduler_config=SchedulerConfig(
+            max_model_len=2048,
+            is_encoder_decoder=False,
+        ),
+        parallel_config=parallel_config,
+        speculative_config=speculative_config,
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE, cudagraph_mode=CUDAGraphMode.PIECEWISE
+        ),
+    )
+    assert cfg.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
 
 
 @pytest.mark.skip_global_cleanup
