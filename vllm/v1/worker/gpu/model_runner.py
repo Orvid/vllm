@@ -1758,23 +1758,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     names.update(group.layer_names)
         return names
 
-    def _fa4_tree_page_sizes(self, target_layers: set[str]) -> set[int]:
-        """KV page sizes of the KV cache groups backing the tree layers.
+    def _fa4_tree_page_sizes(self, target_layers: set[str]) -> bool:
+        """Whether a KV cache group backs at least one tree-verify layer.
 
         The FA4 paged ``mask_mod``'s ``kv_idx`` is the absolute logical
         block-slot (fork fix threads the page table into ``compute_fastdiv_
         mods``, mirroring sm100; see task 14 fix report), which requires the
         tree group's page size to be determinable at attach.
         """
-        sizes: set[int] = set()
         if getattr(self, "kv_cache_config", None) is None:
-            return sizes
+            return False
         for group in self.kv_cache_config.kv_cache_groups:
             layer_names = getattr(group, "layer_names", None)
             if layer_names and any(layer in target_layers for layer in layer_names):
-                block_size = group.kv_cache_spec.block_size
-                sizes.add(int(block_size))
-        return sizes
+                return True
+        return False
 
     def _attach_tree_fa4_mask(self, attn_metadata: dict[str, Any] | None) -> None:
         """Attach the staged df2t fa4 tree mask to the FA4 verify metadata."""
