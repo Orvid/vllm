@@ -27,6 +27,23 @@ from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import (
 _DEVICES = ["cpu", "cuda"]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_df2t_verify_rejects_logprobs_requests():
+    """A df2t request that asks for logprobs must fail closed, never silently
+    return empty logprobs (the tree-verify path does not emit them yet)."""
+    import numpy as np
+
+    from vllm.v1.worker.gpu.model_runner import _df2t_verify_rejects_logprobs
+    from vllm.v1.worker.gpu.sample.states import SamplingStates
+
+    ss = SamplingStates(4, 128)
+    # No request asks for logprobs -> allowed.
+    _df2t_verify_rejects_logprobs(ss, np.arange(4))
+    ss.num_logprobs[1] = 1
+    with pytest.raises(NotImplementedError, match="df2t"):
+        _df2t_verify_rejects_logprobs(ss, np.arange(4))
+
+
 def _random_trees(
     num_reqs: int, B: int, vocab: int, seed: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

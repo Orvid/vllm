@@ -148,6 +148,7 @@ from vllm.v1.worker.gpu.sample.logits_processor import build_custom_logits_proce
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
+from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
@@ -206,6 +207,19 @@ def _validate_df2t_async_tree_carry(
                 f"{req_id}: {len(tokens)} real draft token(s) were scheduled "
                 "with no stashed tree."
             )
+
+
+def _df2t_verify_rejects_logprobs(sampling_states, idx_mapping_np) -> None:
+    """Fail closed if a df2t request asked for logprobs (not yet supported).
+
+    The df2t tree-verify path does not emit logprobs; a request that asked for
+    them must not get silent empty logprobs back.
+    """
+    if sampling_states.max_num_logprobs(idx_mapping_np) > NO_LOGPROBS:
+        raise NotImplementedError(
+            "df2t tree verification does not yet emit logprobs; remove "
+            "`logprobs` from the sampling params or disable df2t."
+        )
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -2016,6 +2030,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             target[r, : 1 + b] = processed[cu[r] : cu[r + 1]]
 
         ss = self.sampler.sampling_states
+        _df2t_verify_rejects_logprobs(ss, input_batch.idx_mapping_np)
         idx = input_batch.idx_mapping
         seeds = None
         if ss.any_explicit_seed(input_batch.idx_mapping_np):
