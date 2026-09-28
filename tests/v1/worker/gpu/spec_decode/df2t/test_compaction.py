@@ -92,14 +92,19 @@ def test_compaction_zeroes_stale_scattered_slots():
     num_slots, H, D = 12, 3, 6
     C = 2
     # Every accepted node actually moves (depth != 1 + arena) so each scattered
-    # slot is a stale source that must come back zeroed.
+    # slot is a stale source that must come back zeroed. Depths are chosen so
+    # no scattered slot coincides with another node's canonical slot (an
+    # aliased source would be preserved, not zeroed -- see the aliasing tests).
     arenas = [0, 3, 6]
-    depths = [2, 3, 4]
+    depths = [2, 6, 8]
     slot_mapping = torch.roll(
         torch.arange(num_slots, dtype=torch.long, device="cuda"), 3
     )
     scatter_slot, _ = _scatter_and_canon_slots(C, arenas, depths)
     scatter_phys = _phys(slot_mapping, scatter_slot)
+    _, canon_slot = _scatter_and_canon_slots(C, arenas, depths)
+    canon_phys = _phys(slot_mapping, canon_slot)
+    assert len(set(scatter_phys) & set(canon_phys)) == 0
 
     view, storage = _make_layer(num_slots, H, D)
     for phys in scatter_phys:
@@ -278,3 +283,77 @@ def test_compaction_stride_guard_accepts_lbnc_rejects_lbhnc():
     assert torch.equal(
         storage[0, canon_phys[0]], torch.full((H, D), 6.0, device="cuda")
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compaction_aliased_source_is_not_zeroed():
+    """An accepted node's scattered slot ``C + 1 + arena`` can equal another
+    node's canonical slot ``C + depth`` (e.g. arenas [1, 2] / depths [1, 2]).
+    Compaction must still move every node's KV to its canonical slot and only
+    zero sources that are not any destination: zeroing this node's source would
+    clobber the other node's relocated KV."""
+    num_slots, H, D = 16, 2, 3
+    C = 0
+    arenas = [1, 2]
+    depths = [1, 2]
+    slot_mapping = torch.arange(num_slots, dtype=torch.long, device="cuda")
+    scatter_slot, canon_slot = _scatter_and_canon_slots(C, arenas, depths)
+    # scatter == [2, 3], canon == [1, 2]; node 2's canonical slot (2) is node
+    # 1's scattered slot, so a naive "zero every source" would lose node 2.
+    assert scatter_slot == [2, 3] and canon_slot == [1, 2]
+
+    view, storage = _make_layer(num_slots, H, D)
+    for i in range(2):
+        storage[0, scatter_slot[i]] = torch.full((H, D), float(i + 1), device="cuda")
+
+    compact_accepted_chain(
+        torch.tensor(arenas, dtype=torch.long, device="cuda"),
+        torch.tensor(depths, dtype=torch.long, device="cuda"),
+        slot_mapping,
+        [view],
+        C,
+    )
+
+    # Both nodes live at their canonical slots; only the truly stale source
+    # (slot 3) is zeroed, slot 2 is node 2's canonical KV, not a zero.
+    assert torch.equal(storage[0, 1], torch.full((H, D), 1.0, device="cuda"))
+    assert torch.equal(storage[0, 2], torch.full((H, D), 2.0, device="cuda"))
+    assert torch.equal(storage[0, 3], torch.zeros((H, D), device="cuda"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compaction_aliased_source_mapping_shifted():
+    """The aliasing hazard under a NON-identity block-slot -> physical mapping:
+    relocation stays correct through ``slot_mapping`` and the colliding source
+    slot is preserved, not zeroed."""
+    num_slots, H, D, C = 16, 2, 3, 2
+    arenas = [1, 2]
+    depths = [1, 2]
+    slot_mapping = torch.roll(
+        torch.arange(num_slots, dtype=torch.long, device="cuda"), 3
+    )
+    scatter_slot, canon_slot = _scatter_and_canon_slots(C, arenas, depths)
+    scatter_phys = _phys(slot_mapping, scatter_slot)
+    canon_phys = _phys(slot_mapping, canon_slot)
+    assert len(set(scatter_phys + canon_phys)) == 3  # one aliased pair
+
+    view, storage = _make_layer(num_slots, H, D)
+    for i in range(2):
+        storage[0, scatter_phys[i]] = torch.full((H, D), float(3 + i), device="cuda")
+
+    compact_accepted_chain(
+        torch.tensor(arenas, dtype=torch.long, device="cuda"),
+        torch.tensor(depths, dtype=torch.long, device="cuda"),
+        slot_mapping,
+        [view],
+        C,
+    )
+
+    for i in range(2):
+        assert torch.equal(
+            storage[0, canon_phys[i]],
+            torch.full((H, D), float(3 + i), device="cuda"),
+        )
+    stale = [p for p in scatter_phys if p not in canon_phys]
+    for p in stale:
+        assert torch.equal(storage[0, p], torch.zeros((H, D), device="cuda"))

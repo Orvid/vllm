@@ -11,6 +11,7 @@ scattered slots so rejected sibling K/V is never readable.
 
 from collections.abc import Sequence
 
+import torch
 from torch import Tensor
 
 from vllm.triton_utils import tl, triton
@@ -19,38 +20,54 @@ _CopyBlock = 256
 
 
 @triton.jit
-def _compact_kernel(
+def _gather_kernel(
     src_off_ptr,  # [a] int64 flat source element offsets
-    dst_off_ptr,  # [a] int64 flat destination element offsets
-    copy_mask_ptr,  # [a] int1: 0 when a node already lives at its canonical slot
+    scratch_ptr,  # [a, NUM_EL]
     kv_ptr,  # flat per-layer cache [num_slots * NUM_EL]
     a,
     NUM_EL: tl.constexpr,  # elements per slot (num_heads * content)
     BLOCK: tl.constexpr,  # copy granularity
 ):
     node = tl.program_id(0).to(tl.int64)
-    do_copy = tl.load(copy_mask_ptr + node)
     base_src = tl.load(src_off_ptr + node)
+    offs = tl.arange(0, BLOCK)
+    for start in tl.range(0, NUM_EL, BLOCK):
+        inc = start + offs
+        valid = inc < NUM_EL
+        val = tl.load(kv_ptr + base_src + inc, mask=valid, other=0)
+        tl.store(scratch_ptr + node * NUM_EL + inc, val, mask=valid)
+
+
+@triton.jit
+def _scatter_kernel(
+    dst_off_ptr,  # [a] int64 flat destination element offsets
+    scratch_ptr,  # [a, NUM_EL]
+    kv_ptr,  # flat per-layer cache [num_slots * NUM_EL]
+    a,
+    NUM_EL: tl.constexpr,  # elements per slot (num_heads * content)
+    BLOCK: tl.constexpr,  # copy granularity
+):
+    node = tl.program_id(0).to(tl.int64)
     base_dst = tl.load(dst_off_ptr + node)
     offs = tl.arange(0, BLOCK)
     for start in tl.range(0, NUM_EL, BLOCK):
         inc = start + offs
-        valid = (inc < NUM_EL) & do_copy
-        val = tl.load(kv_ptr + base_src + inc, mask=valid, other=0)
+        valid = inc < NUM_EL
+        val = tl.load(scratch_ptr + node * NUM_EL + inc, mask=valid, other=0)
         tl.store(kv_ptr + base_dst + inc, val, mask=valid)
 
 
 @triton.jit
 def _zero_kernel(
-    off_ptr,  # [a] int64 flat element offsets of the stale source slots
-    copy_mask_ptr,  # [a] int1
+    off_ptr,  # [a] int64 flat element offsets of stale source slots
+    stale_ptr,  # [a] int1: 1 when the source is stale and must be zeroed
     kv_ptr,  # flat per-layer cache [num_slots * NUM_EL]
     a,
     NUM_EL: tl.constexpr,  # elements per slot (num_heads * content)
     BLOCK: tl.constexpr,  # copy granularity
 ):
     node = tl.program_id(0).to(tl.int64)
-    do_zero = tl.load(copy_mask_ptr + node)
+    do_zero = tl.load(stale_ptr + node)
     base = tl.load(off_ptr + node)
     offs = tl.arange(0, BLOCK)
     for start in tl.range(0, NUM_EL, BLOCK):
@@ -90,6 +107,13 @@ def compact_accepted_chain(
     ``depth == 1 + arena`` already lives at its canonical slot and is left
     untouched. Nothing is launched (or written) when ``num_accepted == 0``.
 
+    Scattered and canonical slots of different accepted nodes may coincide (a
+    node whose canonical slot ``C + depth`` is another node's scattered slot
+    ``C + 1 + arena``), so the copies go through a scratch buffer (all sources
+    are read before any destination is written) and only sources that are not
+    any destination are zeroed — otherwise the stale-slot zero would clobber an
+    accepted node's relocated KV.
+
     """
     a = int(num_accepted) if num_accepted is not None else int(accept_arenas.shape[0])
     if a == 0 or not kv_caches:
@@ -103,7 +127,11 @@ def compact_accepted_chain(
     dst_block_slot = c + depths
     src_phys = slot_mapping.gather(0, src_block_slot)
     dst_phys = slot_mapping.gather(0, dst_block_slot)
-    copy_mask = src_phys != dst_phys
+    move = src_phys != dst_phys
+    if not bool(move.any().item()):
+        # Every accepted node already lives at its canonical slot.
+        return
+    stale = move & ~torch.isin(src_phys, dst_phys)
 
     for layer in kv_caches:
         if layer.ndim != 4:
@@ -126,11 +154,21 @@ def compact_accepted_chain(
             )
         src_off = src_phys * elems
         dst_off = dst_phys * elems
+        # Read every source before any destination write so overlapping
+        # scattered/canonical slots cannot read a half-written slot.
+        scratch = torch.empty(a, elems, dtype=layer.dtype, device=layer.device)
         grid = (a,)
-        _compact_kernel[grid](
+        _gather_kernel[grid](
             src_off,
+            scratch,
+            layer,
+            a,
+            NUM_EL=elems,
+            BLOCK=_CopyBlock,
+        )
+        _scatter_kernel[grid](
             dst_off,
-            copy_mask,
+            scratch,
             layer,
             a,
             NUM_EL=elems,
@@ -138,7 +176,7 @@ def compact_accepted_chain(
         )
         _zero_kernel[grid](
             src_off,
-            copy_mask,
+            stale,
             layer,
             a,
             NUM_EL=elems,
