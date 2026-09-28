@@ -157,6 +157,7 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     resolve_adaptive_cudagraph_mode,
 )
 from vllm.v1.worker.gpu.spec_decode.df2t.budget import BudgetPolicy
+from vllm.v1.worker.gpu.spec_decode.df2t.compaction import compact_accepted_chain
 from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import TreeDraft
 from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import TreeVerifier
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
@@ -220,26 +221,6 @@ def _df2t_verify_rejects_logprobs(sampling_states, idx_mapping_np) -> None:
             "df2t tree verification does not yet emit logprobs; remove "
             "`logprobs` from the sampling params or disable df2t."
         )
-
-
-def _df2t_validate_decode_context(c_per_req: torch.Tensor) -> None:
-    """Fail closed clearly if a df2t tree step co-batches a fresh prefill.
-
-    The per-query tree mask only exists on decode steps with a non-empty
-    context (``C > 0``); a ``C == 0`` request in the same tree batch would have
-    its own attention masked away, so mixed admission is refused rather than
-    silently corrupting the prefill.
-    """
-    if bool((c_per_req > 0).all().item()):
-        return
-    num_bad = int((c_per_req <= 0).sum().item())
-    raise RuntimeError(
-        "df2t tree-verify steps only support decode batches with context; "
-        f"{num_bad} request(s) in this batch have no computed context yet "
-        "(fresh prefills co-scheduled with a df2t tree step). This admission "
-        "case is not yet supported; prefill new requests before tree decode "
-        "or limit concurrency so prefills do not interleave with tree steps."
-    )
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -838,6 +819,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_caches = [
             cache for cache in kv_caches_dict.values() if cache.device == self.device
         ]
+        self._kv_cache_views_by_name = {
+            name: cache
+            for name, cache in kv_caches_dict.items()
+            if cache.device == self.device
+        }
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
@@ -1642,7 +1628,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         c_per_req = self.req_states.num_computed_tokens.gpu[idx_mapping].to(torch.int64)
-        _df2t_validate_decode_context(c_per_req)
+        # Defensive: the tree verify block only exists on decode steps with a
+        # non-empty context; a fresh-prompt prefill (C == 0) would attend
+        # nothing and a mixed step is unsupported, so fail closed.
+        assert bool((c_per_req > 0).all().item()), (
+            "df2t flex tree verify requires a decode batch with context (C > 0)"
+        )
         words = pack_tree_mask_inputs(
             trees, num_reqs, spec.max_tree_budget, self.device
         )
@@ -1736,7 +1727,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         c_per_req = self.req_states.num_computed_tokens.gpu[idx_mapping].to(torch.int32)
-        _df2t_validate_decode_context(c_per_req)
+        # Defensive: the tree verify block only exists on decode steps with a
+        # non-empty context; a fresh-prompt prefill (C == 0) would attend
+        # nothing and a mixed step is unsupported, so fail closed.
+        assert bool((c_per_req > 0).all().item()), (
+            "df2t fa4 tree verify requires a decode batch with context (C > 0)"
+        )
         words = pack_tree_mask_inputs(
             trees, num_reqs, spec.max_tree_budget, self.device
         )
@@ -1974,6 +1970,58 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert sampler_output is not None
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
 
+    def _compact_df2t_accepted_kv(self, input_batch: InputBatch) -> None:
+        """Relocate accepted-tree KV to canonical slots (df2t KV compaction).
+
+        The tree verify writes each accepted node's K/V at its scattered
+        tree-block slot ``C + 1 + arena`` (Task 6 layout); inference reads
+        context by ``position -> slot`` (``C + depth``), so without compaction
+        the accepted chain's K/V is unreachable and the next step attends
+        garbage. ``compact_accepted_chain`` copies each accepted node's K/V to
+        the canonical slot and zeroes the stale scattered slot.
+        """
+        verifier = self.tree_verifier
+        if verifier is None or getattr(self, "_kv_cache_views_by_name", None) is None:
+            return
+        num_sampled = verifier.num_sampled[: input_batch.num_reqs]
+        if not bool((num_sampled > 1).any().item()):
+            return
+        trees = input_batch.trees
+        if not trees:
+            return
+        block_tables = self.block_tables.gather_block_tables(
+            input_batch.idx_mapping,
+            num_reqs_padded=input_batch.num_reqs_after_padding,
+        )
+        idx_mapping_np = input_batch.idx_mapping_np
+        for r in range(input_batch.num_reqs):
+            n_sampled = int(num_sampled[r].item())
+            if n_sampled <= 1:
+                continue
+            tree = trees[r]
+            if tree is None:
+                continue
+            n_acc = n_sampled - 1
+            arenas = verifier.accepted_arenas[r, 1 : 1 + n_acc]
+            depths = tree.depths[arenas]
+            c = int(self.req_states.num_computed_tokens.gpu[idx_mapping_np[r]].item())
+            max_delta = int(max(int(1 + arenas.max().item()), int(depths.max().item())))
+            slots = c + torch.arange(max_delta + 1, device=self.device)
+            for g, group in enumerate(self.kv_cache_config.kv_cache_groups):
+                views = [
+                    self._kv_cache_views_by_name[n]
+                    for n in group.layer_names
+                    if n in self._kv_cache_views_by_name
+                ]
+                if not views:
+                    continue
+                block_size = int(group.kv_cache_spec.block_size)
+                req_bt = block_tables[g][r]
+                phys = req_bt[slots // block_size] * block_size + slots % block_size
+                compact_accepted_chain(
+                    arenas, depths, phys, views, 0, num_accepted=n_acc
+                )
+
     def _df2t_tree_verify(
         self,
         logits: torch.Tensor,
@@ -2060,6 +2108,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.idx_mapping,
             self.sampler.req_states.prefill_len.gpu,
         )
+        # Accepted-tree KV lives at scattered C+1+arena slots; move it to the
+        # canonical C+depth slots so the next step's position-addressed attention
+        # reads the accepted chain (not garbage).
+        self._compact_df2t_accepted_kv(input_batch)
         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
         return SamplerOutput(
             sampled_token_ids=sampled,

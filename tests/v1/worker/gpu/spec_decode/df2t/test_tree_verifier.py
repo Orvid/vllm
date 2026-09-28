@@ -394,6 +394,8 @@ def test_model_runner_df2t_tree_verify_output_contract():
             apply_sampling_params=apply_sampling_params,
         ),
         device=device,
+        # KV compaction runs in the real runner; not exercised here.
+        _compact_df2t_accepted_kv=lambda _ib: None,
     )
 
     out = GPUModelRunner._df2t_tree_verify(fake_self, logits, ib)
@@ -475,6 +477,8 @@ def test_model_runner_df2t_tree_verify_mixed_batch():
             apply_sampling_params=apply_sampling_params,
         ),
         device=device,
+        # KV compaction runs in the real runner; not exercised here.
+        _compact_df2t_accepted_kv=lambda _ib: None,
     )
 
     out = GPUModelRunner._df2t_tree_verify(fake_self, logits, ib)

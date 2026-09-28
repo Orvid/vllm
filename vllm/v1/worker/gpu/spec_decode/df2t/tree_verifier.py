@@ -76,6 +76,11 @@ class TreeVerifier:
         self.vocab_size = vocab_size
         self.sampled = torch.zeros(max_num_reqs, B + 1, dtype=torch.long, device=device)
         self.num_sampled = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
+        # Accepted node arena index per depth (chain order), for the KV
+        # compaction that relocates accepted-tree KV to canonical slots.
+        self.accepted_arenas = torch.full(
+            (max_num_reqs, B + 1), -1, dtype=torch.long, device=device
+        )
 
     def _processed(
         self,
@@ -204,6 +209,7 @@ class TreeVerifier:
         cur = torch.full((R,), -1, dtype=torch.long, device=device)
         done = torch.zeros(R, dtype=torch.bool, device=device)
         self.num_sampled[:R].zero_()
+        self.accepted_arenas[:R].fill_(-1)
         arena = torch.arange(B, device=device)
 
         for d in range(B + 1):
@@ -236,5 +242,9 @@ class TreeVerifier:
                 self.num_sampled[stop_lids] = d + 1
                 done[stop_lids] = True
             cur[lids] = torch.where(child_ok_l, child_arena_l, cur[lids])
+            # Record each accepted arena for the next depth (compaction input).
+            accept_lids = lids[child_ok_l]
+            if accept_lids.numel():
+                self.accepted_arenas[accept_lids, d + 1] = child_arena_l[child_ok_l]
 
         return self.sampled[:R, : B + 1], self.num_sampled[:R]
