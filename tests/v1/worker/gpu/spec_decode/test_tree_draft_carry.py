@@ -86,3 +86,17 @@ def test_no_tree_path_returns_placeholders_unchanged():
     assert res.req_ids == ["0", "1"]
     assert res.draft_token_ids == [[-1, -1, -1], [-1, -1, -1]]
     assert res.spec_tree_draft is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_tree_length_mismatch_raises():
+    """A trees list whose length differs from the batch request count must
+    raise, never silently mismatched to the wrong request."""
+    h = DraftTokensHandler()
+    batch = SimpleNamespace(req_ids=["0", "1"], has_structured_output_reqs=False)
+    with pytest.raises(ValueError, match="trees length"):
+        h.set_draft_tokens(
+            batch,
+            torch.zeros(2, 4, device="cuda", dtype=torch.long),
+            trees=[_tree()],
+        )

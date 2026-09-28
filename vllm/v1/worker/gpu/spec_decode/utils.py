@@ -54,6 +54,12 @@ class DraftTokensHandler:
     ) -> None:
         self.req_ids = input_batch.req_ids
         self.num_draft_tokens = draft_tokens.shape[1]
+        if trees is not None and len(trees) != len(self.req_ids):
+            raise ValueError(
+                f"trees length ({len(trees)}) does not match req_ids "
+                f"({len(self.req_ids)}); per-request trees must be ordered in "
+                "parallel to the batch requests."
+            )
         self.trees = (
             [t.to_lists() if t is not None else None for t in trees]
             if trees is not None
