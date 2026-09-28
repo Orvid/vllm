@@ -83,10 +83,18 @@ def test_init_speculator_routes_df2t() -> None:
 def test_generate_draft_builds_tree_and_draft_tokens() -> None:
     """DF2T ``_generate_draft`` must build the per-request tree over the same
     candidate transition scores and fill ``draft_tokens`` from the tree node
-    token ids (emit order, padded to the per-step width)."""
+    token ids (emit order, padded to the per-step width).
+
+    The fake ``_score_candidates`` returns the PRODUCTION [R, L, K, K]
+    predecessor->successor score shape (``_score_edges`` yields ``blpr,blcr->
+    blpc``), so the real TreeBuilder consumption path is exercised; each
+    request's tree must then match the torch ``build_tree_naive`` oracle
+    bit-for-bit on the same scores/candidates.
+    """
     from types import SimpleNamespace
 
     from vllm.v1.worker.gpu.spec_decode.df2t.speculator import DF2TSpeculator
+    from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import build_tree_naive
 
     torch.manual_seed(0)
     spec = init_speculator(_fake_vllm_config(), torch.device("cuda"))
@@ -94,6 +102,7 @@ def test_generate_draft_builds_tree_and_draft_tokens() -> None:
     num_reqs, steps = 3, spec.num_speculative_steps
     K = spec.top_k
     hidden = 64
+    captured: dict[str, torch.Tensor] = {}
 
     def fake_run_model(*_a, **_k):
         return torch.randn(num_reqs * steps, hidden, device="cuda")
@@ -101,11 +110,14 @@ def test_generate_draft_builds_tree_and_draft_tokens() -> None:
     def fake_compute_candidates(h):
         cand = torch.randint(0, 512, (h.shape[0], K), device="cuda")
         unary = torch.randn(h.shape[0], K, device="cuda")
+        captured["cand_flat"] = cand
         return cand, unary
 
     def fake_score_candidates(cand, unary, hidden):
-        R = hidden.shape[0]
-        return torch.randn(R, K, K, device="cuda")
+        # Production shape: [num_reqs, L, K, K], not the old [R, K, K] fake.
+        scores = torch.randn(cand.shape[0], cand.shape[1], K, K, device="cuda")
+        captured["scores"] = scores
+        return scores
 
     spec._run_model = fake_run_model
     spec.model = SimpleNamespace(compute_candidates=fake_compute_candidates)
@@ -120,9 +132,22 @@ def test_generate_draft_builds_tree_and_draft_tokens() -> None:
     drafts = spec.latest_tree_drafts
     assert drafts is not None and len(drafts) == num_reqs
     assert all(d is not None for d in drafts)
-    for d in drafts:
-        assert d.token_ids.shape[0] == d.num_nodes.item() > 0
-        assert (d.arena == torch.arange(d.token_ids.shape[0], device="cuda")).all()
+
+    # The serve-time tree must be the same top-B prefix tree the torch oracle
+    # would produce from the same candidate transition scores: node count,
+    # token ids, depths and parents all agree bit-for-bit.
+    cand_full = captured["cand_flat"].view(num_reqs, steps, K)
+    scores = captured["scores"]
+    assert scores.shape == (num_reqs, steps, K, K)
+    for r in range(num_reqs):
+        ref = build_tree_naive(
+            scores[r].cpu(), cand_full[r].cpu(), spec.nodes_max, spec.max_depth
+        )
+        n = int(drafts[r].num_nodes.item())
+        assert n == len(ref.token_ids)
+        assert torch.equal(drafts[r].token_ids[:n].cpu(), ref.token_ids)
+        assert torch.equal(drafts[r].depths[:n].cpu(), ref.depths)
+        assert torch.equal(drafts[r].parents[:n].cpu(), ref.parents)
 
     # draft_tokens width == the scheduler's per-step width; each request's draft
     # row is its tree's highest-priority node token ids (emit order). Padding
