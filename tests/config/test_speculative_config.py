@@ -82,6 +82,15 @@ def test_df2t_rejects_missing_num_speculative_tokens():
         cfg._validate_df2t()
 
 
+def test_df2t_rejects_draft_without_hf_config():
+    """A dummy draft with the right architecture but no ``hf_config`` must raise
+    a clean error, not an AttributeError."""
+    draft = _draft_cfg()
+    draft.hf_config = None  # type: ignore[attr-defined]
+    with pytest.raises(ValueError, match="HF config"):
+        _build(draft_model_config=draft)
+
+
 def test_df2t_get_num_draft_tokens():
     cfg = _build()
     cfg.tree_budget = 32

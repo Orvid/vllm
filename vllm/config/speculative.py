@@ -2012,10 +2012,14 @@ class SpeculativeConfig:
                 "nodes_ceiling must not exceed max_tree_budget: "
                 f"{self.nodes_ceiling} > {self.max_tree_budget}"
             )
+        hf_config = getattr(self.draft_model_config, "hf_config", None)
+        if hf_config is None:
+            raise ValueError(
+                "df2t requires the draft model config to expose an HF config "
+                "(for dflash_config.block_size); got none."
+            )
         block_size = getattr(
-            getattr(self.draft_model_config.hf_config, "dflash_config", {}),
-            "block_size",
-            None,
+            getattr(hf_config, "dflash_config", {}), "block_size", None
         )
         trained = (int(block_size) - 1) if block_size else self.num_speculative_tokens
         if self.max_tree_depth is None:
