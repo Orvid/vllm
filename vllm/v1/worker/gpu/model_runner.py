@@ -71,6 +71,7 @@ from vllm.v1.outputs import (
     DraftTokenIds,
     ECConnectorOutput,
     ModelRunnerOutput,
+    StashedTree,
 )
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
@@ -184,6 +185,27 @@ from vllm.v1.worker.utils import (
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
+
+
+def _validate_df2t_async_tree_carry(
+    draft_tokens: dict[str, list[int]],
+    spec_tree_draft: dict[str, StashedTree],
+) -> None:
+    """Fail closed when real df2t drafts were scheduled without a stashed tree.
+
+    Async scheduling carries df2t trees beside the draft tokens through the
+    deferred output path (``update_draft_token_ids_in_output``): a request
+    with real draft tokens but no stashed tree means the carry was dropped,
+    which would silently degrade the tree to a chain. A tree-less step (the
+    padding ``-1`` draft placeholders) is legitimate and ignored.
+    """
+    for req_id, tokens in draft_tokens.items():
+        if any(tok != -1 for tok in tokens) and req_id not in spec_tree_draft:
+            raise RuntimeError(
+                "df2t async scheduling dropped the tree for request "
+                f"{req_id}: {len(tokens)} real draft token(s) were scheduled "
+                "with no stashed tree."
+            )
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -1326,6 +1348,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and self.speculative_config is not None
             and self.speculative_config.use_df2t()
         )
+        if (
+            draft_tokens
+            and self.speculative_config is not None
+            and self.speculative_config.use_df2t()
+            and self.scheduler_config.async_scheduling
+        ):
+            _validate_df2t_async_tree_carry(
+                draft_tokens, scheduler_output.spec_tree_draft
+            )
         if not draft_tokens and self.model_state.num_new_sampled_tokens_per_step == 1:
             # No draft token scheduled (common case).
             total_num_draft_tokens = 0
