@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode.df2t.budget import BudgetPolicy
 from vllm.v1.worker.gpu.spec_decode.df2t.tree_builder import TreeBuilder
 from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import TreeDraft
@@ -31,6 +32,44 @@ class DF2TSpeculator(DFlash2Speculator):
         self.tree_builder = TreeBuilder(
             self.max_num_reqs, self.max_depth, self.top_k, self.nodes_max, device
         )
+        # Arena -> accepted-chain depth table for the drafter's next-step
+        # context (row ``r`` column ``arena`` = chain depth of the accepted
+        # node at that arena, 0 when not accepted). Filled by
+        # ``_df2t_accepted_arena_depth`` from the runner's TreeVerifier.
+        self._df2t_depth = torch.zeros(
+            self.max_num_reqs, self.nodes_max, dtype=torch.int64, device=device
+        )
+
+    def _df2t_accepted_arena_depth(
+        self, input_batch: InputBatch, num_sampled: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Accepted-chain arena->depth context for the next draft step.
+
+        The tree verify places node ``arena`` at target row ``ctx_start + 1 +
+        arena``, and the accepted chain is a scattered set of arenas
+        (``TreeVerifier.accepted_arenas[r, d]``, one per chain depth ``d``).
+        The drafter's next-step context must store those nodes at their
+        canonical chain positions ``C + depth`` — what the KV compaction
+        already relocated the accepted KV to — so ``accepted_depth[r, arena]``
+        maps an arena to its chain depth. A request with no accepted chain
+        leaves its row all-zero, and the prep kernel falls back to the plain
+        (linear) context those requests use.
+        """
+        tv = self.tree_verifier
+        if tv is None:
+            return None
+        num_reqs = input_batch.num_reqs
+        w = self.nodes_max
+        acc = tv.accepted_arenas[:num_reqs, 1 : 1 + w]
+        mask = acc >= 0
+        self._df2t_depth.zero_()
+        if bool(mask.any().item()):
+            rows, depth_idx = mask.nonzero(as_tuple=True)
+            arenas = acc[mask]
+            depths = depth_idx + 1
+            ok = arenas < w
+            self._df2t_depth[rows[ok], arenas[ok]] = depths[ok]
+        return self._df2t_depth
 
     def _generate_draft(
         self,

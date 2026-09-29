@@ -84,6 +84,11 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.max_num_tokens, dtype=torch.int64, device=device
         )
 
+        # DF2T only: the accepted-chain source (the runner's TreeVerifier) and
+        # the tree node budget that sizes the arena->depth context lookup.
+        self.tree_verifier = None
+        self.nodes_max = 1
+
         # Per-mask-token sampling buffers. Flattened from (num_reqs, num_spec_tokens).
         max_num_sampled_tokens = self.max_num_reqs * self.num_speculative_steps
         self.sample_indices = torch.zeros(
@@ -327,6 +332,27 @@ class DFlashSpeculator(DraftModelSpeculator):
     ) -> None:
         """Publish context features required by a draft's candidate head."""
 
+    def set_tree_verifier(self, verifier: "TreeVerifier | None") -> None:
+        """Attach the df2t accepted-chain source (runner's TreeVerifier).
+
+        Non-df2t speculators keep ``None`` and never build the accepted-chain
+        context; df2t overrides :meth:`_df2t_accepted_arena_depth` to consume
+        ``verifier.accepted_arenas``.
+        """
+        self.tree_verifier = verifier
+
+    def _df2t_accepted_arena_depth(
+        self, input_batch: InputBatch, num_sampled: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Return the df2t arena->chain-depth context table, or None.
+
+        ``out[r, arena]`` is the accepted node's chain depth (1-based) when
+        request ``r`` accepted that arena this step, else 0. Non-df2t
+        speculators return None, keeping the linear (``dflash``) input prep
+        byte-for-byte identical.
+        """
+        return None
+
     @torch.inference_mode()
     def propose(
         self,
@@ -405,6 +431,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         # The query slot mapping is written into the shared BlockTables slot_mappings.
         # That buffer's address is what the captured CUDA graph reads from at replay.
         assert self.draft_kv_cache_group_id >= 0
+        # df2t: the accepted-chain arena->depth table (None keeps the linear
+        # dflash input prep untouched).
+        accepted_depth = self._df2t_accepted_arena_depth(input_batch, num_sampled)
         # Support multiple draft KV cache groups by preparing inputs once for each
         for i, gid in enumerate(self.draft_kv_cache_group_ids):
             prepare_dflash_inputs(
@@ -436,6 +465,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.max_num_tokens,
                 self.max_model_len,
                 self.sample_from_anchor,
+                accepted_depth,
+                self.nodes_max,
             )
 
         batch_sync, num_batch_tokens = (
@@ -541,6 +572,8 @@ def _prepare_dflash_inputs_kernel(
     # Block table for slot mapping lookup.
     block_table_ptr,
     block_table_stride,
+    # df2t accepted-chain context (only when USE_DF2T_TREE).
+    accepted_depth_ptr,
     # Scalars
     parallel_drafting_token_id,
     block_size,
@@ -550,11 +583,13 @@ def _prepare_dflash_inputs_kernel(
     max_num_tokens,
     max_model_len,
     cp_rank,
+    nodes_max,
     SAMPLE_FROM_ANCHOR: tl.constexpr,
     PAD_SLOT_ID: tl.constexpr,
     CP_SIZE: tl.constexpr,
     CP_INTERLEAVE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    USE_DF2T_TREE: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     block_idx = tl.program_id(1)
@@ -566,8 +601,6 @@ def _prepare_dflash_inputs_kernel(
     num_ctx = ctx_end - ctx_start
 
     num_rejected = tl.load(num_rejected_ptr + req_idx)
-    valid_ctx_end = ctx_end - num_rejected
-    num_valid_ctx = valid_ctx_end - ctx_start
 
     num_sampled = tl.load(num_sampled_ptr + req_idx)
     if num_sampled > 0:
@@ -576,18 +609,68 @@ def _prepare_dflash_inputs_kernel(
         # Chunked prefilling: splice in the next prefill token.
         bonus_token = tl.load(next_prefill_tokens_ptr + req_state_idx).to(tl.int32)
 
-    last_valid_pos = tl.load(target_positions_ptr + valid_ctx_end - 1)
-    query_base = req_idx * num_query_per_req
-
     j = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     is_ctx = j < num_ctx
-    is_valid_ctx = j < num_valid_ctx
+
+    if USE_DF2T_TREE:
+        # The df2t verify block is in TREE-ARENA order (siblings adjacent), so
+        # the accepted chain is NOT the leading rows of the span and a blind
+        # "last num_rejected rows were rejected" cut picks the wrong context.
+        # accepted_depth[r, arena] holds the accepted node's chain depth (0 for
+        # arenas not on the accepted chain); the accepted context is the anchor
+        # row plus those nodes at canonical positions ``C + depth`` (as the KV
+        # compaction relocated them), and ``last_valid_pos`` is the accepted
+        # tail ``C + num_accepted``. A request that did not verify a tree this
+        # step (chunked/plain prefill, or a first decode with no tree:
+        # ``num_rejected == 0``, since a branching tree always leaves rejected
+        # nodes) falls back to the linear all-rows-valid context.
+        anchor_pos = tl.load(target_positions_ptr + ctx_start)
+        use_chain = num_rejected > 0
+        num_acc = tl.maximum(num_sampled - 1, 0)
+        arena = j - 1
+        arena_c = tl.minimum(tl.maximum(arena, 0), nodes_max - 1)
+        acc_depth = tl.load(
+            accepted_depth_ptr + req_idx * nodes_max + arena_c,
+            mask=is_ctx & (j >= 1),
+            other=0,
+        )
+        is_anchor = is_ctx & (j == 0)
+        is_acc_node = is_ctx & (j >= 1) & (acc_depth > 0)
+        chain_valid = is_anchor | is_acc_node
+        chain_pos = tl.where(
+            is_anchor,
+            anchor_pos,
+            tl.where(is_acc_node, anchor_pos + acc_depth, 0),
+        )
+        fallback_pos = tl.load(
+            target_positions_ptr + ctx_start + tl.where(is_ctx, j, 0),
+            mask=is_ctx,
+            other=0,
+        )
+        is_valid_ctx = tl.where(use_chain, chain_valid, is_ctx)
+        ctx_pos = tl.where(use_chain, chain_pos, fallback_pos)
+        last_valid_pos = tl.where(
+            use_chain,
+            anchor_pos + num_acc,
+            tl.load(target_positions_ptr + ctx_end - 1),
+        )
+        num_valid_ctx = tl.where(use_chain, num_sampled, num_ctx)
+    else:
+        valid_ctx_end = ctx_end - num_rejected
+        num_valid_ctx = valid_ctx_end - ctx_start
+        last_valid_pos = tl.load(target_positions_ptr + valid_ctx_end - 1)
+
+    ctx_pos_idx = ctx_start + tl.where(is_ctx, j, 0)
+    if not USE_DF2T_TREE:
+        is_valid_ctx = j < num_valid_ctx
+        ctx_pos = tl.load(
+            target_positions_ptr + ctx_pos_idx, mask=is_valid_ctx, other=0
+        )
+    query_base = req_idx * num_query_per_req
     is_query = (j >= num_valid_ctx) & (j < num_valid_ctx + num_query_per_req)
     query_off = j - num_valid_ctx
 
     # --- Context positions / slots ---
-    ctx_pos_idx = ctx_start + tl.where(is_ctx, j, 0)
-    ctx_pos = tl.load(target_positions_ptr + ctx_pos_idx, mask=is_valid_ctx, other=0)
     ctx_block_num = ctx_pos // (block_size * CP_SIZE)
     ctx_block_num = tl.minimum(ctx_block_num, block_table_stride - 1)
     ctx_block_id = tl.load(
@@ -748,6 +831,10 @@ def prepare_dflash_inputs(
     max_num_tokens: int,
     max_model_len: int,
     sample_from_anchor: bool = False,
+    # df2t accepted-chain context: arena index -> chain depth (0 = not on the
+    # accepted chain), [max_num_reqs, nodes_max]. None keeps the linear path.
+    accepted_depth: torch.Tensor | None = None,
+    nodes_max: int = 1,
 ) -> None:
     num_reqs = input_batch.num_reqs
     assert num_reqs > 0
@@ -757,6 +844,7 @@ def prepare_dflash_inputs(
     max_tokens_per_req = max_target_query_len + num_query_per_req
     BLOCK_SIZE = min(256, triton.next_power_of_2(max(1, max_tokens_per_req)))
     num_blocks = triton.cdiv(max_tokens_per_req, BLOCK_SIZE)
+    use_df2t = accepted_depth is not None
     _prepare_dflash_inputs_kernel[(num_reqs, num_blocks)](
         input_buffers.input_ids,
         input_buffers.positions,
@@ -781,6 +869,9 @@ def prepare_dflash_inputs(
         input_seeds,
         block_table,
         block_table.stride(0),
+        # Never dereferenced when USE_DF2T_TREE is False; accepted_depth is a
+        # placeholder in that case.
+        accepted_depth if use_df2t else context_positions,
         parallel_drafting_token_id,
         block_size,
         num_query_per_req,
@@ -789,9 +880,11 @@ def prepare_dflash_inputs(
         max_num_tokens,
         max_model_len,
         cp_rank,
+        nodes_max,
         SAMPLE_FROM_ANCHOR=sample_from_anchor,
         PAD_SLOT_ID=PAD_SLOT_ID,
         CP_SIZE=cp_size,
         CP_INTERLEAVE=cp_interleave,
         BLOCK_SIZE=BLOCK_SIZE,
+        USE_DF2T_TREE=use_df2t,
     )

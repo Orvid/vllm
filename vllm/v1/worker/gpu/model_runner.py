@@ -567,6 +567,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.vocab_size,
                         self.device,
                     )
+                    # The df2t drafter conditions its next step on the
+                    # accepted chain; give it the verifier it reads that from.
+                    setter = getattr(self.speculator, "set_tree_verifier", None)
+                    if setter is not None:
+                        setter(self.tree_verifier)
             self.prompt_logprobs_worker = PromptLogprobsWorker(
                 self.max_num_reqs, logprobs_mode=self.model_config.logprobs_mode
             )
