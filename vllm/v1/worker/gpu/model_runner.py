@@ -1642,12 +1642,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         c_per_req = self.req_states.num_computed_tokens.gpu[idx_mapping].to(torch.int64)
-        # Defensive: the tree verify block only exists on decode steps with a
-        # non-empty context; a fresh-prompt prefill (C == 0) would attend
-        # nothing and a mixed step is unsupported, so fail closed.
-        assert bool((c_per_req > 0).all().item()), (
-            "df2t flex tree verify requires a decode batch with context (C > 0)"
-        )
+        # A request with C == 0 (a fresh prefill co-scheduled with a tree
+        # decode step) carries no tree and no context; the flex mask falls back
+        # to per-request causal attention for it (see build_flex_tree_mask), so
+        # it verifies its first token instead of being dropped.
         words = pack_tree_mask_inputs(
             trees, num_reqs, spec.max_tree_budget, self.device
         )
@@ -1741,12 +1739,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         c_per_req = self.req_states.num_computed_tokens.gpu[idx_mapping].to(torch.int32)
-        # Defensive: the tree verify block only exists on decode steps with a
-        # non-empty context; a fresh-prompt prefill (C == 0) would attend
-        # nothing and a mixed step is unsupported, so fail closed.
-        assert bool((c_per_req > 0).all().item()), (
-            "df2t fa4 tree verify requires a decode batch with context (C > 0)"
-        )
+        # A request with C == 0 (a fresh prefill co-scheduled with a tree
+        # decode step) carries no tree and no context; the fa4 mask falls back
+        # to per-request causal attention for it (see _make_fa4_tree_mask_mod),
+        # so it verifies its first token instead of being dropped.
         words = pack_tree_mask_inputs(
             trees, num_reqs, spec.max_tree_budget, self.device
         )
