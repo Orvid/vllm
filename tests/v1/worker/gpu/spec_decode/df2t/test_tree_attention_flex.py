@@ -139,6 +139,33 @@ def test_flex_tree_mask_matches_manual_multi_request():
         assert torch.equal(got[c:], expected[c:]), f"request {r}"
 
 
+def test_flex_tree_mask_contextless_request_is_causal():
+    """A request with C == 0 (fresh prefill co-scheduled with a tree decode)
+    has no tree and no context: the mask falls back to per-request causal
+    attention over its own rows, so it can verify its first token."""
+    max_b = 3
+    # Request 0: a tree request at C == 4. Request 1: C == 0, no tree.
+    n0, n1 = 5, 4
+    query_start_loc = [0, n0, n0 + n1]
+    num_tokens = query_start_loc[-1]
+    request_lookup = torch.zeros(num_tokens, dtype=torch.int32)
+    request_lookup[query_start_loc[0] : query_start_loc[1]] = 0
+    request_lookup[query_start_loc[1] : query_start_loc[2]] = 1
+
+    c_per_req = torch.tensor([4, 0], dtype=torch.long)
+    words = torch.zeros(2, max_b, dtype=torch.long)
+    words[0] = torch.tensor([0b1, 0b11, 0b101], dtype=torch.long)
+
+    mask_mod, _ = build_flex_tree_mask(2, c_per_req, words, max_b, request_lookup)
+    h = torch.zeros(1, dtype=torch.long)
+    q = torch.arange(n1, dtype=torch.long)[:, None].expand(n1, n1)
+    k = torch.arange(n1, dtype=torch.long)[None, :].expand(n1, n1)
+    b = torch.full((n1, n1), query_start_loc[1], dtype=torch.long)
+    got = mask_mod(b, h, q, k)
+    # Causal: row q attends exactly keys 0..q.
+    assert torch.equal(got, k <= q), "contextless request must attend causally"
+
+
 def test_flex_tree_mask_hint_never_prunes_visible_blocks():
     """The BlockSparsityHint is a superset of the real mask at block
     granularity (a block holding any allowed key stays visible) and prunes
@@ -449,9 +476,10 @@ def test_runner_stage_attach_targets_only_the_flex_verify_group():
         start += query_lens[r]
 
 
-def test_runner_stage_rejects_zero_context():
-    """A zero-context (fresh-prompt prefill) staged flex-tree batch fails
-    closed instead of silently running a mask that attends nothing."""
+def test_runner_stage_scopes_zero_context():
+    """A zero-context (fresh-prompt prefill, C == 0) request staged in a
+    flex-tree batch is scoped per-request (causal over its own rows) instead
+    of rejected, so it can verify its first token alongside a tree decode."""
     device = torch.device("cpu")
     spec = type("Spec", (), {"tree_attention_backend": "flex", "max_tree_budget": 64})()
     num_computed = torch.tensor([4, 0], dtype=torch.int32)
@@ -478,9 +506,13 @@ def test_runner_stage_rejects_zero_context():
         ],
     )
 
-    with pytest.raises(AssertionError, match="decode batch"):
-        runner._stage_tree_flex_mask(True, trees, 2, idx_mapping)
-    assert runner._pending_tree_flex_mask is None
+    runner._stage_tree_flex_mask(True, trees, 2, idx_mapping)
+    pending = runner._pending_tree_flex_mask
+    assert pending is not None
+    _, c_per_req, words, _ = pending
+    # The contextless request is staged with a zero anchor length, not dropped.
+    assert c_per_req.tolist() == [4, 0]
+    assert bool((words[1] == 0).all().item())
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

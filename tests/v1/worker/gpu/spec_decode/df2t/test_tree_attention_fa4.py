@@ -921,9 +921,11 @@ def test_runner_stage_attach_fa4_tree_mask():
     assert other_meta.df2t_tree_aux_tensors is None
 
 
-def test_runner_stage_fa4_rejects_zero_context():
-    """A zero-context (fresh-prompt prefill) staged fa4-tree batch fails closed
-    instead of silently running a mask that attends nothing."""
+def test_runner_stage_fa4_scopes_zero_context():
+    """A zero-context (fresh-prompt prefill, C == 0) request staged in an fa4
+    tree batch is scoped per-request (causal over its own rows: see
+    ``_make_fa4_tree_mask_mod``) instead of rejected, so it can verify its
+    first token alongside a tree decode."""
     device = torch.device("cpu")
     spec = type("Spec", (), {"tree_attention_backend": "fa4", "max_tree_budget": 64})()
     num_computed = torch.tensor([4, 0], dtype=torch.int32)
@@ -949,9 +951,13 @@ def test_runner_stage_fa4_rejects_zero_context():
             ]
         ],
     )
-    with pytest.raises(AssertionError, match="decode batch"):
-        runner._stage_tree_fa4_mask(True, trees, 2, idx_mapping)
-    assert runner._pending_tree_fa4_mask is None
+    # No assert: the contextless request is staged with a zero anchor length.
+    runner._stage_tree_fa4_mask(True, trees, 2, idx_mapping)
+    pending = runner._pending_tree_fa4_mask
+    assert pending is not None
+    _, c_per_req, words, _ = pending
+    assert c_per_req.tolist() == [4, 0]
+    assert bool((words[1] == 0).all().item())
 
 
 def test_runner_attach_fa4_fails_closed_when_page_size_undeterminable():
