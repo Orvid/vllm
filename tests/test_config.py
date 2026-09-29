@@ -1982,6 +1982,30 @@ def test_df2t_defaults_to_async_scheduling(tmp_path: Path):
     assert cfg.scheduler_config.async_scheduling is True
 
 
+def test_df2t_reserves_dflash_drafter_slots(tmp_path: Path):
+    """df2t drafts with the DFlash drafter (one bonus query + K mask queries
+    written past the target's query range), so it must reserve the same KV
+    lookahead and drafting slots as dflash. Without the lookahead the drafter
+    writes through unallocated block-table entries into other requests' KV."""
+    parallel_config = ParallelConfig(distributed_executor_backend="uni")
+    speculative_config = _df2t_speculative_config(tmp_path, parallel_config)
+    cfg = VllmConfig(
+        model_config=speculative_config.target_model_config,
+        scheduler_config=SchedulerConfig(
+            max_model_len=2048,
+            is_encoder_decoder=False,
+        ),
+        parallel_config=parallel_config,
+        speculative_config=speculative_config,
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.NONE, cudagraph_mode=CUDAGraphMode.NONE
+        ),
+    )
+    k = speculative_config.num_speculative_tokens
+    assert cfg.num_lookahead_tokens == k + 1
+    assert speculative_config.max_num_new_slots_for_drafting == k
+
+
 def test_df2t_cudagraphs_are_not_config_rejected(tmp_path: Path):
     """CUDA-graph capture itself is not yet supported for the df2t tree-verify
     decode, but the config must not blanket-forbid df2t + cudagraphs: capture is

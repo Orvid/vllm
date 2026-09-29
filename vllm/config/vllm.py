@@ -640,10 +640,11 @@ class VllmConfig:
         speculative_config = self.speculative_config
         if speculative_config is None:
             return 0
-        if speculative_config.use_dflash():
-            # DFlash requires an extra lookahead slot since it uses in-fill-style
-            # decoding instead of standard next-token sampling, so it has a query
-            # for the last sampled token plus queries for each draft token.
+        if speculative_config.use_dflash() or speculative_config.use_df2t():
+            # DFlash (and df2t, which drafts with the DFlash drafter) requires an
+            # extra lookahead slot since it uses in-fill-style decoding instead
+            # of standard next-token sampling, so it has a query for the last
+            # sampled token plus queries for each draft token.
             return self.num_speculative_tokens + 1
         if speculative_config.use_eagle() or speculative_config.uses_draft_model():
             # DSpark (covered by use_eagle) drafts a block of num_speculative_tokens
