@@ -13,6 +13,8 @@ multi-node batches, treats ``num_accepted == 0`` as a no-op, and rejects
 layouts where the flat slot-addressing would corrupt (e.g. LBHNC).
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -357,3 +359,196 @@ def test_compaction_aliased_source_mapping_shifted():
     stale = [p for p in scatter_phys if p not in canon_phys]
     for p in stale:
         assert torch.equal(storage[0, p], torch.zeros((H, D), device="cuda"))
+
+
+def _make_batched_cache(group_specs, block_size, num_blocks, dtype=torch.float32):
+    """Multi-group / multi-layer LBNHC cache sharing one raw backing.
+
+    Each layer's view is ``as_strided`` over one ``buf`` exactly like
+    ``create_kv_cache_views``: logical ``[num_blocks, heads, tokens_per_block,
+    content]`` with per-slot-contiguous LBNHC strides. Returns ``(views,
+    buf)`` where a physical slot ``s`` of a layer sits at flat element offset
+    ``s * elems`` from the layer's base.
+    """
+    layers = [(name, h, d) for grp in group_specs for name, h, d in grp]
+    total = sum(h * d for _, h, d in layers) * block_size * num_blocks
+    buf = torch.zeros(total, dtype=dtype, device="cuda")
+    views = {}
+    offset = 0
+    for name, h, d in layers:
+        elems = h * d
+        views[name] = torch.as_strided(
+            buf,
+            (num_blocks, h, block_size, d),
+            (block_size * elems, d, elems, 1),
+            storage_offset=offset,
+        )
+        offset += elems * block_size * num_blocks
+    return views, buf
+
+
+def _rand_chain_batch(R, W, num_blocks, seed):
+    """Random accepted chains with canonical/aliased/plain depths dispersed."""
+    torch.manual_seed(seed)
+    num_sampled = torch.randint(
+        1, W + 1, (R,), dtype=torch.int32, device="cuda"
+    )
+    accepted_arenas = torch.full((R, W + 1), -1, dtype=torch.long, device="cuda")
+    num_computed = torch.randint(0, num_blocks - 2, (R,), dtype=torch.int32,
+                                 device="cuda")
+    block_tables = torch.randint(
+        0, num_blocks, (R, 6), dtype=torch.long, device="cuda"
+    )
+    trees = []
+    tree_present = []
+    for r in range(R):
+        n = int(num_sampled[r].item()) - 1
+        depths = torch.zeros(W, dtype=torch.long, device="cuda")
+        tree_present.append(True)
+        for j in range(1, n + 1):
+            arena = torch.randint(0, W, (1,)).item()
+            accepted_arenas[r, j] = arena
+            mode = torch.randint(0, 3, (1,)).item()
+            if mode == 0:
+                depths[arena] = 1 + arena  # already canonical
+            elif mode == 1:
+                depths[arena] = torch.randint(1, W + 1, (1,)).item()
+            else:
+                depths[arena] = torch.randint(1, W + 1, (1,)).item()
+        trees.append(SimpleNamespace(depths=depths))
+    return num_sampled, accepted_arenas, num_computed, block_tables, trees
+
+
+def _old_compact_reference(
+    views_by_name, group_specs, block_size, num_sampled, accepted_arenas,
+    num_computed, block_tables, trees, R,
+):
+    for r in range(R):
+        n_sampled = int(num_sampled[r].item())
+        if n_sampled <= 1:
+            continue
+        n_acc = n_sampled - 1
+        arenas = accepted_arenas[r, 1 : 1 + n_acc]
+        depths = trees[r].depths[arenas.clamp(min=0)]
+        c = int(num_computed[r].item())
+        max_delta = max(
+            int(1 + arenas.max().item()), int(depths.max().item())
+        )
+        slots = c + torch.arange(max_delta + 1, device="cuda")
+        for grp in group_specs:
+            layer_views = [views_by_name[n] for n, _, _ in grp if n in views_by_name]
+            if not layer_views:
+                continue
+            req_bt = block_tables[r]
+            phys = req_bt[slots // block_size] * block_size + slots % block_size
+            compact_accepted_chain(
+                arenas, depths, phys, layer_views, 0, num_accepted=n_acc
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_batched_compaction_matches_reference_bit_identical():
+    """``Df2tKVCompaction.compact`` (two fixed-shape all-layer launches) is
+    bit-identical to the per-(request, group, layer) ``compact_accepted_chain``
+    reference on a multi-group / multi-layer LBNHC cache, across randomized
+    batches that exercise relocation, the already-canonical skip, and the
+    aliasing protection."""
+    from vllm.v1.worker.gpu.spec_decode.df2t.compaction import (
+        Df2tKVCompaction,
+    )
+
+    R, W = 5, 7
+    block_size, num_blocks = 16, 64
+    group_specs = [
+        [("l.2", 2, 3), ("l.8", 2, 3), ("l.14", 2, 3)],
+        [("l.4", 1, 5), ("l.10", 1, 5)],
+        [("l.1", 4, 4)],
+    ]
+    for seed in range(6):
+        views, buf = _make_batched_cache(group_specs, block_size, num_blocks)
+        num_sampled, accepted_arenas, num_computed, block_tables, trees = (
+            _rand_chain_batch(R, W, num_blocks, seed)
+        )
+        groups = [
+            SimpleNamespace(
+                layer_names=[n for n, _, _ in grp],
+                kv_cache_spec=SimpleNamespace(block_size=block_size),
+            )
+            for grp in group_specs
+        ]
+        _old_compact_reference(
+            views,
+            group_specs,
+            block_size,
+            num_sampled,
+            accepted_arenas,
+            num_computed,
+            block_tables,
+            trees,
+            R,
+        )
+        torch.cuda.synchronize()
+        reference = buf.clone()
+        buf.zero_()
+        torch.cuda.synchronize()
+        compactor = Df2tKVCompaction(
+            R, W, views, groups, torch.device("cuda")
+        )
+        compactor.compact(
+            num_sampled,
+            accepted_arenas,
+            trees,
+            num_computed,
+            [block_tables] * len(groups),
+            R,
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(buf, reference), f"seed {seed} diverged"
+        # The kernels run once per slab: a single (slab, L)-grid pair covers
+        # the whole batch, so exactly one gather and one scatter+zero launch.
+        assert compactor._slab >= R * W
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_batched_compaction_treeless_requests_untouched():
+    """Requests without a tree (or with no accepted chain) must leave their KV
+    byte-for-byte untouched even when the batch otherwise compacts."""
+    from vllm.v1.worker.gpu.spec_decode.df2t.compaction import (
+        Df2tKVCompaction,
+    )
+
+    R, W = 4, 6
+    block_size, num_blocks = 16, 64
+    group_specs = [[("l.0", 2, 3)], [("l.1", 1, 4)]]
+    views, buf = _make_batched_cache(group_specs, block_size, num_blocks)
+    groups = [
+        SimpleNamespace(
+            layer_names=[n for n, _, _ in grp],
+            kv_cache_spec=SimpleNamespace(block_size=block_size),
+        )
+        for grp in group_specs
+    ]
+    buf.fill_(3.5)
+    snapshot = buf.clone()
+    torch.manual_seed(9)
+    accepted_arenas = torch.full((R, W + 1), -1, dtype=torch.long, device="cuda")
+    num_computed = torch.zeros(R, dtype=torch.int32, device="cuda")
+    block_tables = torch.zeros(R, 4, dtype=torch.long, device="cuda")
+    num_sampled = torch.tensor([1, 3, 1, 1], dtype=torch.int32, device="cuda")
+    trees = [
+        None,
+        SimpleNamespace(depths=torch.arange(W, device="cuda")),
+        None,
+        None,
+    ]
+    compactor = Df2tKVCompaction(R, W, views, groups, torch.device("cuda"))
+    compactor.compact(
+        num_sampled,
+        accepted_arenas,
+        trees,
+        num_computed,
+        [block_tables] * len(groups),
+        R,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(buf, snapshot)
