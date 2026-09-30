@@ -147,6 +147,7 @@ class DF2TSpeculator(DFlash2Speculator):
         Args:
             num_reqs: Number of requests in the batch being scheduled. Must be
                 <= the number of rows the tree buffers were last written for.
+
         """
         if self._last_tree is None:
             return None
