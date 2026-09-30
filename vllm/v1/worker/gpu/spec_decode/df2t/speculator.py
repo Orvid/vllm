@@ -61,14 +61,18 @@ class DF2TSpeculator(DFlash2Speculator):
         num_reqs = input_batch.num_reqs
         w = self.nodes_max
         acc = tv.accepted_arenas[:num_reqs, 1 : 1 + w]
-        mask = acc >= 0
+        # Fixed-shape arena->depth build: column ``d`` of ``accepted_arenas``
+        # holds the arena accepted at chain depth ``d + 1`` (-1 = none), so
+        # ``depth_vals`` is the chain depth and the -1 paddings reduce to 0 as
+        # the max over their column, writing nothing except the all-zero guard
+        # row. Fixed shapes keep this a device-local op (no data-dependent
+        # ``nonzero``/host sync) on the per-step hot path.
+        valid = acc >= 0
+        depth_vals = torch.arange(w, device=self.device) + 1
         self._df2t_depth.zero_()
-        if bool(mask.any().item()):
-            rows, depth_idx = mask.nonzero(as_tuple=True)
-            arenas = acc[mask]
-            depths = depth_idx + 1
-            ok = arenas < w
-            self._df2t_depth[rows[ok], arenas[ok]] = depths[ok]
+        self._df2t_depth[:num_reqs].scatter_reduce_(
+            1, acc.clamp(min=0), torch.where(valid, depth_vals, 0), reduce="amax"
+        )
         return self._df2t_depth
 
     def _generate_draft(
