@@ -10,12 +10,9 @@ pin that engine-level seam: the graft fires only under async scheduling with
 df2t, forwards the previous batch's ``DraftTokenIds`` (per-request trees intact)
 to the freshly scheduled output, and stays inert when disabled or draft-less.
 
-A full end-to-end multi-request async run (sync == async at T=0) is not
-assertable today: any request still at ``C == 0`` (a fresh prefill) co-scheduled
-with a df2t tree-verify decode hits the pre-existing ``C > 0`` mixed-batch guard
-(see ``_stage_fa4_tree_mask_inputs``), which is a tracked, out-of-scope design
-item. The per-request routing of a grafted tree into the scheduler output is
-covered in ``test_scheduler.py``.
+The end-to-end multi-request async run is covered in
+``test_df2t_async_engine.py``; the per-request routing of a grafted tree into
+the scheduler output is covered in ``test_scheduler.py``.
 """
 
 from types import SimpleNamespace

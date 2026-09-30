@@ -6,13 +6,17 @@ co-scheduled with a tree decode verifies its first token instead of asserting.
 Before the mask-scoping fix, a C == 0 request (a fresh prompt prefilling in
 the same batch as a df2t tree-verify decode) tripped the pre-existing
 ``C > 0`` guard in ``_stage_tree_fa4_mask``/``_stage_tree_flex_mask`` and
-crashed the worker. The fix scopes the tree mask per-request: a contextless
-request has no tree and no context, so it falls back to per-request causal
-attention over its own rows and draws its first token normally. This test
-drives the real sync engine at default batching (the two requests share the
-first step) for both tree attention vehicles and asserts the contextless
-request's output is exactly the greedy target walk (the dflash chain) — the
-correct first token, with no assert.
+crashed the worker. The fix scopes the tree mask per-request: a treeless
+request falls back to per-request causal attention over its own rows and draws
+its first token normally. This test drives the real sync engine at default
+batching (the two requests share the first step) for both tree attention
+vehicles.
+
+Exact T=0 token parity is only a valid oracle in fp32: in bf16 the target's
+own greedy walk flips on one-ulp logit ties with batch shape (even without
+speculative decoding). The flex vehicle therefore checks full parity against
+the plain target in fp32; FA4 has no fp32 path, so its test checks the first
+tokens, which is what the co-batch fix guards.
 """
 
 import gc
@@ -34,28 +38,33 @@ def _offline_models_present() -> bool:
     return os.path.isdir(_TARGET) and os.path.isdir(_DRAFT)
 
 
-def _run_engine(*, tree_attention_backend: str, backend_mode: str) -> list[list[int]]:
+def _run_engine(
+    *, method: str | None, tree_attention_backend: str = "fa4", dtype: str = "bfloat16"
+) -> list[list[int]]:
     from vllm import LLM, SamplingParams
 
-    speculative_config = {
-        "method": "df2t",
-        "model": _DRAFT,
-        "num_speculative_tokens": 15,
-    }
-    if tree_attention_backend == "flex":
-        speculative_config["tree_attention_backend"] = "flex"
-    if backend_mode == "dflash":
-        speculative_config["method"] = "dflash"
+    speculative_config = None
+    if method is not None:
+        speculative_config = {
+            "method": method,
+            "model": _DRAFT,
+            "num_speculative_tokens": 15,
+        }
+        if method == "df2t":
+            speculative_config["tree_attention_backend"] = tree_attention_backend
     llm = LLM(
         model=_TARGET,
         speculative_config=speculative_config,
         enforce_eager=True,
         async_scheduling=False,
         max_model_len=192,
-        dtype="bfloat16",
+        dtype=dtype,
         gpu_memory_utilization=0.45,
         trust_remote_code=True,
         disable_log_stats=True,
+        attention_config=(
+            {"backend": "FLEX_ATTENTION"} if dtype == "float32" else None
+        ),
     )
     out = llm.generate(_PROMPTS, SamplingParams(max_tokens=16, temperature=0.0))
     ids = [list(o.outputs[0].token_ids) for o in out]
@@ -69,28 +78,22 @@ def _run_engine(*, tree_attention_backend: str, backend_mode: str) -> list[list[
 )
 def test_df2t_co_batch_fresh_prefill_verifies_fa4() -> None:
     """A fresh-prefill (C == 0) request co-scheduled with a df2t tree decode
-    (default batching, fa4 vehicle) no longer asserts and verifies its first
-    token correctly: its output equals the greedy target walk (dflash chain)."""
-    chain = _run_engine(tree_attention_backend="fa4", backend_mode="dflash")[1]
-    ids = _run_engine(tree_attention_backend="fa4", backend_mode="df2t")
-    assert ids[1] == chain, (
-        "the contextless co-batched request must verify its first token "
-        "correctly (no assert, no mask-token garbage)"
+    (default batching, fa4 vehicle) no longer asserts and both requests draw
+    the greedy target's first token."""
+    reference = _run_engine(method=None)
+    ids = _run_engine(method="df2t", tree_attention_backend="fa4")
+    assert [r[0] for r in ids] == [r[0] for r in reference], (
+        "the co-batched requests must verify their first token correctly "
+        "(no assert, no mask-token garbage)"
     )
-    # The tree-decode request's own first token is also the greedy draw.
-    chain0 = _run_engine(tree_attention_backend="fa4", backend_mode="dflash")[0]
-    assert ids[0][0] == chain0[0]
 
 
 @pytest.mark.skipif(
     not _offline_models_present(), reason="offline df2t models not present"
 )
-def test_df2t_co_batch_fresh_prefill_verifies_flex() -> None:
-    """Same co-batch fresh-prefill scenario on the flex tree-verify vehicle:
-    no C > 0 assert and the contextless request's first token is correct."""
-    chain = _run_engine(tree_attention_backend="flex", backend_mode="dflash")[1]
-    ids = _run_engine(tree_attention_backend="flex", backend_mode="df2t")
-    assert ids[1] == chain, (
-        "the contextless co-batched request must verify its first token "
-        "correctly on the flex vehicle"
-    )
+def test_df2t_co_batch_fresh_prefill_lossless_flex_fp32() -> None:
+    """Same co-batch fresh-prefill scenario on the flex tree-verify vehicle in
+    fp32: both requests' T=0 output equals the plain target's greedy walk."""
+    reference = _run_engine(method=None, dtype="float32")
+    ids = _run_engine(method="df2t", tree_attention_backend="flex", dtype="float32")
+    assert ids == reference, "df2t co-batch output diverges from the target"

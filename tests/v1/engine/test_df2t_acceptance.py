@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """End-to-end df2t drafter-context acceptance gate.
 
 The df2t drafter must condition its next draft on the accepted chain (the
@@ -8,9 +9,12 @@ wrong the drafter proposed from garbage hidden states and acceptance
 collapsed to the degenerate floor (~1-3 accepted tokens per 32 drafted, i.e.
 ``mean accepted / draft`` ~0.05). This test drives the real engine on the
 offline Qwen3-0.6B + df2t drafter, reads the spec-decode counters, and asserts
-the acceptance length is materially above that floor, plus a 128-token T=0
-losslessness check (df2t output == the dflash greedy chain) on the prompt that
-is robustly lossless at length.
+the acceptance length is materially above that floor, plus a T=0 losslessness
+check (df2t output == the plain target's greedy walk) over the whole batch.
+
+Exact T=0 token parity is only a valid oracle in fp32: in bf16 the target's
+own greedy walk flips on one-ulp logit ties with batch shape (even without
+speculative decoding), so the parity check runs fp32 on the flex vehicle.
 """
 
 import gc
@@ -26,11 +30,6 @@ if not current_platform.is_cuda():
 _TARGET = "/mnt/e/dev/Qwen3-0.6B"
 _DRAFT = "/mnt/e/dev/Qwen3-0.6B-DF2T-CATMIX-B16"
 _NUM_SPEC = 15
-
-# Prompt 0 is robustly lossless (df2t T=0 == the dflash greedy chain) up to
-# 128 tokens on a single-request run. Other prompts exercise pre-existing
-# target-side verify/compaction issues unrelated to the drafter, so only
-# prompt 0 is used for the output-parity assertion.
 _PROMPTS = [
     "The capital of France is",
     "The largest planet in the solar system is",
@@ -55,25 +54,31 @@ def _offline_models_present() -> bool:
 
 
 def _run_engine(
-    method: str, prompts: list[str], max_tokens: int
+    method: str | None, prompts: list[str], max_tokens: int, fp32: bool = False
 ) -> tuple[list[list[int]], int, int, int]:
     from vllm import LLM, SamplingParams
 
-    llm = LLM(
-        model=_TARGET,
-        speculative_config={
+    speculative_config = None
+    if method is not None:
+        speculative_config = {
             "method": method,
             "model": _DRAFT,
             "num_speculative_tokens": _NUM_SPEC,
-        },
+        }
+        if fp32:
+            speculative_config["tree_attention_backend"] = "flex"
+    llm = LLM(
+        model=_TARGET,
+        speculative_config=speculative_config,
         enforce_eager=True,
         async_scheduling=False,
         max_num_batched_tokens=256,
         max_model_len=512,
-        dtype="bfloat16",
+        dtype="float32" if fp32 else "bfloat16",
         gpu_memory_utilization=0.45,
         trust_remote_code=True,
         disable_log_stats=False,
+        attention_config={"backend": "FLEX_ATTENTION"} if fp32 else None,
     )
     outs = llm.generate(prompts, SamplingParams(max_tokens=max_tokens, temperature=0.0))
     ids = [list(o.outputs[0].token_ids) for o in outs]
@@ -100,8 +105,8 @@ def test_df2t_acceptance_above_degenerate_floor_and_lossless() -> None:
     tokens per draft step (acceptance length ~1.05) — no speculative speedup.
     The gate asserts a mean accepted-per-draft well above that floor (measured
     ~1.8-2.5 after the fix, comparable to or above the dflash chain's own
-    ~1.9), and that the df2t T=0 output matches the dflash greedy chain over a
-    128-token single-request run (output distribution must be unchanged).
+    ~1.9), and that the batched df2t T=0 output matches the plain target's
+    greedy walk in fp32 (output distribution must be unchanged).
 
     The draft-count child guard is a sample-size check only: the degenerate
     floor produces *more* drafts per request (it accepts almost nothing), so
@@ -109,9 +114,7 @@ def test_df2t_acceptance_above_degenerate_floor_and_lossless() -> None:
     enough to stay green in the high-acceptance regime, where each draft spans
     more tokens and the per-request draft count shrinks.
     """
-    ids, num_drafts, num_draft_tokens, num_accepted = _run_engine(
-        "df2t", _PROMPTS, 64
-    )
+    ids, num_drafts, num_draft_tokens, num_accepted = _run_engine("df2t", _PROMPTS, 64)
     min_drafts = _DRAFTS_PER_REQ_FLOOR * len(_PROMPTS)
     assert num_drafts >= min_drafts, (
         f"too few drafts to judge acceptance: {num_drafts} < {min_drafts} "
@@ -130,13 +133,7 @@ def test_df2t_acceptance_above_degenerate_floor_and_lossless() -> None:
         f"(mean accepted/draft {mean_accepted:.3f}); the drafter is not "
         "conditioning on the accepted chain."
     )
-    # Output parity: df2t T=0 must equal the dflash greedy chain over the
-    # verified 128-token window. Run prompt 0 as an isolated single request
-    # (fresh engine per method) where df2t is consistently lossless; the
-    # acceptance fix must not change the output distribution.
-    chain = _run_engine("dflash", [_PROMPTS[0]], 128)[0][0]
-    got = _run_engine("df2t", [_PROMPTS[0]], 128)[0][0]
-    assert got == chain, (
-        "df2t T=0 output diverges from the dflash greedy chain over 128 tokens "
-        "(drafter-context fix must not change output distribution)."
-    )
+    reference = _run_engine(None, _PROMPTS, 64, fp32=True)[0]
+    got = _run_engine("df2t", _PROMPTS, 64, fp32=True)[0]
+    for i, (g, want) in enumerate(zip(got, reference)):
+        assert g == want, f"prompt {i}: df2t T=0 output diverges from the target"
