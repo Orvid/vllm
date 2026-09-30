@@ -10,6 +10,7 @@ scattered slots so rejected sibling K/V is never readable.
 """
 
 from collections.abc import Sequence
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -73,6 +74,139 @@ def _zero_kernel(
     for start in tl.range(0, NUM_EL, BLOCK):
         inc = start + offs
         tl.store(kv_ptr + base + inc, 0, mask=(inc < NUM_EL) & do_zero)
+
+
+@triton.jit
+def _plan_group_kernel(
+    num_sampled_ptr,  # [R] int32 per-request emitted-token count
+    has_tree_ptr,  # [R] int8 1 when the request carries a tree
+    arenas_ptr,  # [R, 1 + W] int64 accepted arena per chain depth (-1 = none)
+    depth_ptr,  # [R, W] int64 per-arena tree node depth (0 = padding)
+    c_ptr,  # [R] int64 anchor block-slot C per request
+    bt_ptr,  # [R, nb] int64 per-group block table
+    out_src,  # [G, max_a] int64 source phys slot per entry
+    out_dst,  # [G, max_a] int64 destination phys slot per entry
+    out_enter,  # [G, max_a] int8 1 when the entry must move
+    out_stale,  # [G, max_a] int8 1 when the source is stale and must be zeroed
+    a,  # R * W live entry count
+    W,  # accepted-chain width (plan columns per request)
+    nb,  # blocks per request row
+    bs,  # tokens per block
+    g,  # this kernel's kv-cache group index
+    astride,  # row stride of accepted_arenas (1 + W)
+    max_a,  # persistent stride of the [G, max_a] plan buffers
+):
+    i = tl.program_id(0).to(tl.int64)
+    r = i // W
+    j = i - r * W
+    n_acc = tl.load(num_sampled_ptr + r) - 1
+    ht = tl.load(has_tree_ptr + r)
+    valid = (j < n_acc) & (ht != 0)
+    arena = tl.load(arenas_ptr + r * astride + 1 + j)
+    ar = tl.maximum(arena, 0)
+    depth = tl.load(depth_ptr + r * W + ar)
+    c = tl.load(c_ptr + r)
+    s_block = c + 1 + arena
+    d_block = c + depth
+    s_bidx = tl.minimum(s_block // bs, nb - 1)
+    d_bidx = tl.minimum(d_block // bs, nb - 1)
+    src_phys = tl.load(bt_ptr + r * nb + s_bidx) * bs + s_block % bs
+    dst_phys = tl.load(bt_ptr + r * nb + d_bidx) * bs + d_block % bs
+    move = src_phys != dst_phys
+    stale = move & valid
+    # A stale source is zeroed only when it is not some entry's destination
+    # (aliasing protection): scan every entry's destination, matching
+    # ``torch.isin(src, dst)`` exactly (cross-request included).
+    for k in tl.range(0, a):
+        rk = k // W
+        jk = k - rk * W
+        ark = tl.maximum(tl.load(arenas_ptr + rk * astride + 1 + jk), 0)
+        dk = tl.load(depth_ptr + rk * W + ark)
+        dbk = tl.load(c_ptr + rk) + dk
+        dbidx = tl.minimum(dbk // bs, nb - 1)
+        dpk = tl.load(bt_ptr + rk * nb + dbidx) * bs + dbk % bs
+        stale = stale & (src_phys != dpk)
+    base = g * max_a
+    tl.store(out_src + base + i, src_phys)
+    tl.store(out_dst + base + i, dst_phys)
+    tl.store(out_enter + base + i, (valid & move).to(tl.int8))
+    tl.store(out_stale + base + i, stale.to(tl.int8))
+
+
+@triton.jit
+def _gather_all_kernel(
+    kv_base,  # first layer's cache view (base pointer of the shared backing)
+    layer_off_ptr,  # [L] int64 element offset of each layer from kv_base
+    elems_ptr,  # [L] int32 elements per slot per layer (num_heads * content)
+    group_of_ptr,  # [L] int32 kv-cache group each layer belongs to
+    src_ptr,  # [G, a] int64 source phys slot per (group, entry)
+    enter_ptr,  # [G, a] int8: 1 when the entry must move
+    scratch_ptr,  # [SLAB, L, MAX_EL] per-(entry, layer) scratch
+    slab_off,  # global entry offset of this slab launch
+    a,  # live entry count reaching into this slab
+    g_stride,  # row stride of the [G, a] plan buffers
+    L,  # number of layer views
+    MAX_EL: tl.constexpr,  # scratch element capacity per (entry, layer)
+    BLOCK: tl.constexpr,  # copy granularity
+):
+    i = tl.program_id(0).to(tl.int64)
+    layer = tl.program_id(1)
+    g = tl.load(group_of_ptr + layer)
+    el = tl.load(elems_ptr + layer).to(tl.int64)
+    entry = slab_off + i
+    do = tl.load(enter_ptr + g * g_stride + entry)
+    phys = tl.load(src_ptr + g * g_stride + entry)
+    base_off = tl.load(layer_off_ptr + layer) + phys * el
+    offs = tl.arange(0, BLOCK)
+    for start in tl.range(0, el, BLOCK):
+        inc = start + offs
+        valid = inc < el
+        val = tl.load(kv_base + base_off + inc, mask=valid, other=0)
+        tl.store(
+            scratch_ptr + (i * L + layer) * MAX_EL + inc,
+            val,
+            mask=valid & (do != 0) & (entry < a),
+        )
+
+
+@triton.jit
+def _scatter_zero_all_kernel(
+    kv_base,  # first layer's cache view (base pointer of the shared backing)
+    layer_off_ptr,  # [L] int64 element offset of each layer from kv_base
+    elems_ptr,  # [L] int32 elements per slot per layer
+    group_of_ptr,  # [L] int32 kv-cache group each layer belongs to
+    dst_ptr,  # [G, a] int64 destination phys slot per (group, entry)
+    src_ptr,  # [G, a] int64 source phys slot per (group, entry)
+    stale_ptr,  # [G, a] int8: 1 when the source is stale and must be zeroed
+    enter_ptr,  # [G, a] int8: 1 when the entry must move
+    scratch_ptr,  # [SLAB, L, MAX_EL] per-(entry, layer) scratch
+    slab_off,  # global entry offset of this slab launch
+    a,  # live entry count reaching into this slab
+    g_stride,  # row stride of the [G, a] plan buffers
+    L,  # number of layer views
+    MAX_EL: tl.constexpr,  # scratch element capacity per (entry, layer)
+    BLOCK: tl.constexpr,  # copy granularity
+):
+    i = tl.program_id(0).to(tl.int64)
+    layer = tl.program_id(1)
+    g = tl.load(group_of_ptr + layer)
+    el = tl.load(elems_ptr + layer).to(tl.int64)
+    entry = slab_off + i
+    idx = g * g_stride + entry
+    do = tl.load(enter_ptr + idx)
+    stale = tl.load(stale_ptr + idx)
+    base_dst = tl.load(layer_off_ptr + layer) + tl.load(dst_ptr + idx) * el
+    base_src = tl.load(layer_off_ptr + layer) + tl.load(src_ptr + idx) * el
+    offs = tl.arange(0, BLOCK)
+    for start in tl.range(0, el, BLOCK):
+        inc = start + offs
+        valid = (inc < el) & (entry < a)
+        val = tl.load(
+            scratch_ptr + (i * L + layer) * MAX_EL + inc, mask=valid, other=0
+        )
+        tl.store(kv_base + base_dst + inc, val, mask=valid & (do != 0))
+        tl.store(kv_base + base_src + inc, 0, mask=valid & (stale != 0))
+
 
 
 def compact_accepted_chain(
@@ -182,3 +316,264 @@ def compact_accepted_chain(
             NUM_EL=elems,
             BLOCK=_CopyBlock,
         )
+
+
+_ScratchBudgetBytes = 256 * 1024 * 1024
+
+
+class Df2tKVCompaction:
+    """Batched, host-sync-free compaction of one step's accepted chains.
+
+    Vectorizes what ``compact_accepted_chain`` does per (request, group,
+    layer) into a fixed-shape per-step plan (built by one small triton kernel
+    per kv-cache group) and two fixed-shape triton launches (one gather, one
+    fused scatter + stale-zero) that cover every layer of every group in a
+    single grid. All per-(request, group) host syncs and the many-small-launch
+    fan-out of the correctness-first wiring are gone; the whole step is
+    device-only and every buffer below is persistent (refreshed in place,
+    never allocated on the hot path) — the pattern the CUDA-graph
+    infrastructure primed.
+
+    Per step, :meth:`compact` is called with the verifier's accepted-chain
+    output, per-request tree depths/block tables, and builds ``k`` = the
+    group-major plan ``[G, R * W]`` (src/dst slots, enter/stale masks), then
+    launches ``_gather_all_kernel`` and ``_scatter_zero_all_kernel`` over a
+    ``(slab, L)`` grid. Every accepted node's KV is relocated from its
+    scattered ``C + 1 + arena`` slot to the canonical ``C + depth`` slot and
+    the stale (non-aliased) sources are zeroed, with the same aliasing
+    protection the primitive guarantees: all sources are read before any
+    destination is written, and a source that is some destination is never
+    zeroed. A node whose canonical slot already equals its scattered slot is
+    left byte-for-byte untouched.
+    """
+
+    _ScratchBudgetBytes = _ScratchBudgetBytes
+
+    def __init__(
+        self,
+        max_num_reqs: int,
+        W: int,
+        views_by_name: dict[str, Tensor],
+        kv_cache_groups: Sequence[Any],
+        device: torch.device,
+    ):
+        """Persist the layer metadata and plan/scratch buffers.
+
+        Args:
+            max_num_reqs: Upper bound on requests in a step; sizes the runtime
+                plan rows (``max_num_reqs * W``).
+            W: Accepted-chain width (``TreeVerifier.accepted_arenas`` has
+                ``1 + W`` columns); one plan column per chain depth.
+            views_by_name: The runner's per-layer KV cache views
+                (``_kv_cache_views_by_name``), ``[B, H, N, C]`` in the LBNHC
+                layout.
+            kv_cache_groups: The runner's ``kv_cache_config.kv_cache_groups``;
+                ``group.layer_names`` lists the group's layers and
+                ``group.kv_cache_spec.block_size`` its block size.
+            device: The device the views live on.
+
+        """
+        self._W = W
+        self._max_a = max_num_reqs * W
+        self._device = device
+        self.block_sizes: list[int] = []
+        layers: list[tuple[int, Tensor]] = []
+        for g, group in enumerate(kv_cache_groups):
+            bs = getattr(group.kv_cache_spec, "block_size", None)
+            if bs is None:
+                raise ValueError(
+                    "df2t compaction needs a uniform block_size on every "
+                    "kv-cache group"
+                )
+            if not isinstance(bs, int):
+                # UniformTypeKVCacheSpecs resolves to an int block_size.
+                bs = int(bs)
+            self.block_sizes.append(bs)
+            for name in group.layer_names:
+                layer = views_by_name.get(name)
+                if layer is None:
+                    continue
+                if layer.ndim != 4:
+                    raise ValueError(
+                        "df2t compaction needs 4D [B, H, N, C] per-layer "
+                        f"caches; got shape {tuple(layer.shape)}"
+                    )
+                _, num_heads, tokens_per_block, content = layer.shape
+                elems = num_heads * content
+                if layer.stride() != (
+                    tokens_per_block * elems,
+                    content,
+                    elems,
+                    1,
+                ):
+                    raise ValueError(
+                        "df2t compaction requires per-slot-contiguous "
+                        f"(LBNHC) layer caches; got strides {layer.stride()}"
+                    )
+                layers.append((g, layer))
+
+        self._G = len(kv_cache_groups)
+        self._L = len(layers)
+        if self._L == 0:
+            self._empty = True
+            return
+        self._empty = False
+        if any(layer.device.type != device.type for _, layer in layers):
+            raise ValueError("df2t compaction views must live on one device")
+
+        self._group_of = torch.empty(self._L, dtype=torch.int32, device=device)
+        self._elems = torch.empty(self._L, dtype=torch.int32, device=device)
+        self._layer_off = torch.empty(self._L, dtype=torch.int64, device=device)
+        base_layer = min(layers, key=lambda gl: gl[1].data_ptr())[1]
+        itemsize = base_layer.element_size()
+        for idx, (g, layer) in enumerate(layers):
+            self._group_of[idx] = g
+            _, num_heads, _, content = layer.shape
+            self._elems[idx] = num_heads * content
+            self._layer_off[idx] = (
+                (layer.data_ptr() - base_layer.data_ptr()) // itemsize
+            )
+        self._kv_base = base_layer
+        self._max_el = int(self._elems.max().item())
+
+        # Persistent plan + scratch. Rows [G, max_a]; details via g_stride.
+        self._src = torch.zeros(
+            self._G, self._max_a, dtype=torch.int64, device=device
+        )
+        self._dst = torch.zeros(
+            self._G, self._max_a, dtype=torch.int64, device=device
+        )
+        self._enter = torch.zeros(
+            self._G, self._max_a, dtype=torch.int8, device=device
+        )
+        self._stale = torch.zeros(
+            self._G, self._max_a, dtype=torch.int8, device=device
+        )
+        self._tree_depth = torch.zeros(
+            max_num_reqs, W, dtype=torch.int64, device=device
+        )
+        self._has_tree = torch.zeros(
+            max_num_reqs, dtype=torch.bool, device=device
+        )
+        # Scratch rows are (entry, layer) slabs of MAX_EL elements; a slab
+        # holds all layers of one contiguous run of entries so the batch is
+        # covered in a small number of (slab, L)-grid launches.
+        row_bytes = self._L * self._max_el * itemsize
+        slab = max(1, self._ScratchBudgetBytes // row_bytes)
+        self._slab = min(slab, self._max_a)
+        self._scratch = torch.zeros(
+            self._slab * self._L * self._max_el,
+            dtype=base_layer.dtype,
+            device=device,
+        )
+        self._g_stride = self._max_a
+
+    def _build_tree_depths(self, trees: Sequence[Any], R: int) -> Tensor:
+        td = self._tree_depth[:R].zero_()
+        for r, tree in enumerate(trees):
+            if tree is None:
+                continue
+            d = tree.depths
+            n = min(d.numel(), self._W)
+            if n:
+                td[r, :n].copy_(d[:n])
+        return td
+
+    def compact(
+        self,
+        num_sampled: Tensor,
+        accepted_arenas: Tensor,
+        trees: Sequence[Any],
+        num_computed: Tensor,
+        block_tables: Sequence[Tensor],
+        R: int,
+    ) -> None:
+        """Relocate one step's accepted chains for ``R`` requests.
+
+        No host syncs and no allocation happen here; inactive entries are
+        masked out in the kernels. The per-group phys slots are derived from
+        the block tables with the LBNHC
+        ``phys = block * block_size + slot % block_size`` mapping, mirrored
+        from the wiring.
+
+        Args:
+            num_sampled: ``[R]`` int32 emitted-token count per request (the
+                verifier's ``num_sampled``).
+            accepted_arenas: ``[max_reqs, 1 + W]`` int64 accepted arena per
+                chain depth per request (``-1`` = none).
+            trees: Per-request ``TreeDraft`` (or ``None``); provides each
+                request's node depths indexed by arena.
+            num_computed: ``[R]`` int32 anchor block-slot ``C`` per request
+                (already gathered by the caller through ``idx_mapping``).
+            block_tables: Per-group block tables ``[R, num_blocks]``.
+            R: Number of requests.
+
+        """
+        if self._empty or R == 0:
+            return
+        W = self._W
+        a = R * W
+        has_tree = self._has_tree[:R].zero_()
+        for r, tree in enumerate(trees[:R]):
+            if tree is not None:
+                has_tree[r] = True
+        depth = self._build_tree_depths(trees, R)
+        astride = accepted_arenas.shape[1]
+        for g, bt in enumerate(block_tables):
+            _plan_group_kernel[(a,)](
+                num_sampled,
+                has_tree,
+                accepted_arenas,
+                depth,
+                num_computed,
+                bt,
+                self._src,
+                self._dst,
+                self._enter,
+                self._stale,
+                a,
+                W,
+                bt.shape[1],
+                self.block_sizes[g],
+                g,
+                astride,
+                self._g_stride,
+            )
+
+        g_stride = self._g_stride
+        L = self._L
+        for so in range(0, a, self._slab):
+            a_so = min(a - so, self._slab)
+            grid = (self._slab, L)
+            _gather_all_kernel[grid](
+                self._kv_base,
+                self._layer_off,
+                self._elems,
+                self._group_of,
+                self._src,
+                self._enter,
+                self._scratch,
+                so,
+                a_so,
+                g_stride,
+                L,
+                MAX_EL=self._max_el,
+                BLOCK=_CopyBlock,
+            )
+            _scatter_zero_all_kernel[grid](
+                self._kv_base,
+                self._layer_off,
+                self._elems,
+                self._group_of,
+                self._dst,
+                self._src,
+                self._stale,
+                self._enter,
+                self._scratch,
+                so,
+                a_so,
+                g_stride,
+                L,
+                MAX_EL=self._max_el,
+                BLOCK=_CopyBlock,
+            )
