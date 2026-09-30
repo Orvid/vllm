@@ -21,7 +21,7 @@ import gc
 import time
 from contextlib import AbstractContextManager
 from copy import deepcopy
-from typing import Any, NamedTuple
+from typing import Any, Callable, NamedTuple
 
 import numpy as np
 import torch
@@ -361,6 +361,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._pending_tree_fa4_mask: (
             tuple[int, torch.Tensor, torch.Tensor, int] | None
         ) = None
+        # Persistent CUDA-graph aux pools for the FA4 tree mask (ancestor
+        # words ``[max_num_reqs, max_tree_budget]`` int64 and per-request
+        # anchor-length ``[max_num_reqs]`` int32). The captured tree-verify
+        # graph reads these at fixed addresses, so each step's values are
+        # written in place (``fill_tree_mask_inputs``) between replays.
+        self._df2t_tree_mask_words: torch.Tensor | None = None
+        self._df2t_tree_mask_c: torch.Tensor | None = None
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -1071,6 +1078,51 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
     @torch.inference_mode()
+    def _make_df2t_capture_mask_attach(self) -> Callable[[dict[str, Any]], None]:
+        """Return a hook attaching the FA4 tree mask to captured metadata.
+
+        The static df2t path captures its ``1 + B`` uniform tree-verify decode
+        through the V2 uniform FULL-graph machinery. The tree ``mask_mod`` and
+        its aux pools are data-dependent per step, so capture bakes the
+        ``mask_mod`` closure plus the persistent aux buffer addresses into the
+        graph and refreshes the buffer contents before each replay (see
+        ``_stage_tree_fa4_mask``). The returned closure runs per captured
+        descriptor, attaching the mask to that descriptor's freshly built
+        metadata.
+        """
+        spec = self.speculative_config
+        assert spec is not None
+        if spec.tree_attention_backend != "fa4":
+            raise RuntimeError(
+                "df2t CUDA-graph capture of the tree-verify decode currently "
+                f"supports tree_attention_backend='fa4' only, got "
+                f"'{spec.tree_attention_backend}'. Run df2t with "
+                "'fa4' (the default) under cudagraph mode, or keep flex eager "
+                "(-cc.cudagraph_mode=none)."
+            )
+        width = spec.max_tree_budget
+        self._ensure_df2t_tree_mask_buffers(width)
+        # Pre-fill the pools so the captured descriptor sees a valid (treeless)
+        # mask; real steps refresh them before replay.
+        assert self._df2t_tree_mask_words is not None
+        assert self._df2t_tree_mask_c is not None
+        self._df2t_tree_mask_words.zero_()
+        self._df2t_tree_mask_c.zero_()
+
+        def attach(attn_metadata: dict[str, Any] | None) -> None:
+            # The pools are sized max_num_reqs; a captured descriptor uses at
+            # most that many (padded) requests, so hand the full pools over.
+            self._attach_fa4_tree_mask_impl(
+                attn_metadata,
+                self.max_num_reqs,
+                self._df2t_tree_mask_c,
+                self._df2t_tree_mask_words,
+                width,
+            )
+
+        return attach
+
+    @torch.inference_mode()
     def capture_model(self, *, profile_only: bool = False) -> int:
         assert self.cudagraph_manager is not None
         capture_encoder = (
@@ -1078,20 +1130,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and self.model_state.encoder_runner.has_cudagraph()
         )
         capture_decoder = self.cudagraph_manager.needs_capture()
+        df2t_capture_mask_attach: Callable[[dict[str, Any]], None] | None = None
         if (
             capture_decoder
             and self.speculative_config is not None
             and (self.speculative_config.use_df2t())
         ):
-            # df2t currently runs its tree-verify decode eagerly; capturing the
-            # target decode graph would replay the chain layout over tree
-            # batches and silently corrupt them. Eager is the current mode
-            # (tracked pending: CG-capture of the uniform 1+B verify shape).
-            raise RuntimeError(
-                "df2t's tree-verify decode is not yet CUDA-graph-captured; "
-                "run df2t eagerly (--enforce-eager or -cc.cudagraph_mode=none) "
-                "for now."
-            )
+            # df2t captures its uniform 1+B target tree-verify decode through
+            # the V2 uniform FULL-graph machinery, with the FA4 tree mask
+            # baked into the captured metadata (see
+            # _make_df2t_capture_mask_attach). Configs the capture cannot yet
+            # support (flex, or a cudagraph mode without FULL) fail closed
+            # here rather than replaying the tree batch with the wrong mask.
+            df2t_capture_mask_attach = self._make_df2t_capture_mask_attach()
         if not capture_encoder and not capture_decoder:
             logger.warning(
                 "Skipping encoder and decoder CUDA graph capture. To enable "
@@ -1129,6 +1180,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         lora_capture_hook=create_lora_capture_hook(
                             self.lora_config, self
                         ),
+                        df2t_tree_mask_attach=df2t_capture_mask_attach,
                     )
                     if self.speculator is not None:
                         with use_workspace_lane(self._draft_workspace_lane):
@@ -1719,6 +1771,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "for the target (or set tree_attention_backend='fa4')."
             )
 
+    def _ensure_df2t_tree_mask_buffers(self, width: int) -> None:
+        """Allocate the persistent FA4 tree-mask aux pools (once).
+
+        ``width`` is the target attention mask arena width (``max_tree_budget``).
+        The buffers stay fixed-address across steps so the captured tree-verify
+        graph can read their refreshed contents at replay.
+        """
+        if self._df2t_tree_mask_words is not None:
+            return
+        self._df2t_tree_mask_words = torch.zeros(
+            self.max_num_reqs, width, dtype=torch.long, device=self.device
+        )
+        self._df2t_tree_mask_c = torch.zeros(
+            self.max_num_reqs, dtype=torch.int32, device=self.device
+        )
+
     def _stage_tree_fa4_mask(
         self,
         use_df2t_trees: bool,
@@ -1730,8 +1798,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         Only active on df2t tree batches with ``tree_attention_backend ==
         "fa4"`` (the default); attaches the FA4 CuTE-DSL mask ``mask_mod`` in
-        ``execute_model``. For every other batch the pending field is cleared
-        so no stale mask leaks into a later step.
+        ``execute_model``. Writes into the persistent aux pools so the values
+        are visible to the captured tree graph at replay. For every other
+        batch the pending field is cleared so no stale mask leaks into a later
+        step.
         """
         spec = self.speculative_config
         self._pending_tree_fa4_mask = None
@@ -1740,20 +1810,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ):
             return
         from vllm.v1.worker.gpu.spec_decode.df2t.attention import (
-            pack_tree_mask_inputs,
+            fill_tree_mask_inputs,
         )
 
-        c_per_req = self.req_states.num_computed_tokens.gpu[idx_mapping].to(torch.int32)
-        # A request without a tree (a prefill chunk co-scheduled with a tree
-        # decode step) keeps all-zero words; the fa4 mask falls back to
-        # per-request causal attention for it (see _make_fa4_tree_mask_mod).
-        words = pack_tree_mask_inputs(
-            trees, num_reqs, spec.max_tree_budget, self.device
+        width = spec.max_tree_budget
+        self._ensure_df2t_tree_mask_buffers(width)
+        assert self._df2t_tree_mask_words is not None
+        assert self._df2t_tree_mask_c is not None
+        c_per_req = self.req_states.num_computed_tokens.gpu[idx_mapping]
+        fill_tree_mask_inputs(
+            self._df2t_tree_mask_words,
+            self._df2t_tree_mask_c,
+            trees,
+            num_reqs,
+            width,
+            c_per_req,
         )
+        # The whole persistent pool is handed to build_fa4_tree_mask (its
+        # asserts accept >= num_reqs rows); only rows < num_reqs hold live
+        # data. The same pool addresses are baked into the captured graph.
         self._pending_tree_fa4_mask = (
             num_reqs,
-            c_per_req,
-            words,
+            self._df2t_tree_mask_c,
+            self._df2t_tree_mask_words,
             spec.max_tree_budget,
         )
 
@@ -1800,6 +1879,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._pending_tree_fa4_mask = None
         if pending is None:
             return
+        num_reqs, c_per_req, words, b = pending
+        self._attach_fa4_tree_mask_impl(attn_metadata, num_reqs, c_per_req, words, b)
+
+    def _attach_fa4_tree_mask_impl(
+        self,
+        attn_metadata: dict[str, Any] | None,
+        num_reqs: int,
+        c_per_req: torch.Tensor,
+        words: torch.Tensor,
+        b: int,
+    ) -> None:
+        """Attach the FA4 tree ``mask_mod`` + aux to the target verify layers.
+
+        Shared by the per-step path (fresh metadata over ''_pending_tree_fa4__
+        mask'') and by CUDA-graph capture (the captured metadata over the
+        persistent aux pools), so both bake the same mask semantics.
+        """
         if attn_metadata is None:
             # A staged tree mask must never silently vanish: no attention
             # metadata produced on a df2t fa4-tree batch is a hard failure.
@@ -1815,7 +1911,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             build_fa4_tree_mask,
         )
 
-        num_reqs, c_per_req, words, b = pending
         # Only the target verify group(s) (see _fa4_tree_verify_layer_names)
         # carry the tree block; a second FA group's metadata stays untouched.
         target_layers = self._fa4_tree_verify_layer_names()

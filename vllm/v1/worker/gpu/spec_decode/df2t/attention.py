@@ -54,6 +54,48 @@ def pack_tree_mask_inputs(
     return words
 
 
+def fill_tree_mask_inputs(
+    words_out: torch.Tensor,
+    c_per_req_out: torch.Tensor,
+    trees: "list[TreeDraft | None] | None",
+    num_reqs: int,
+    B: int,
+    c_per_req: torch.Tensor,
+) -> None:
+    """Fill a persistent ``[>= num_reqs, B]`` ancestor-words buffer and its
+    per-request anchor-length buffer for this step, in place.
+
+    The FA4 tree ``mask_mod`` reads its aux tensors by scalar index, so under
+    CUDA graphs those aux tensors must be stable graph-input buffers whose
+    contents are refreshed between replays (same addresses, new values). This
+    helper writes into pre-allocated persistent buffers (``words_out`` /
+    ``c_per_req_out``) instead of allocating per step.
+
+    Args:
+        words_out: [max_num_reqs, B] int64, zeroed then filled for the first
+            ``num_reqs`` rows with each request's ancestor-or-self words;
+            requests without a tree (or below the tree's node count) keep zero
+            rows, whose bits never match.
+        c_per_req_out: [max_num_reqs] int32, filled for the first
+            ``num_reqs`` rows with each request's anchor context length ``C``.
+        trees: [num_reqs] per-request ``TreeDraft`` or None for requests
+            without a tree.
+        num_reqs: Batch size (rows populated; the rest are zeroed).
+        B: Node-count ceiling (``max_tree_budget``).
+        c_per_req: [num_reqs] anchor context lengths (int64 or int32).
+
+    """
+    words_out.zero_()
+    c_per_req_out[:num_reqs].copy_(c_per_req.to(torch.int32))
+    if c_per_req_out.numel() > num_reqs:
+        c_per_req_out[num_reqs:].zero_()
+    if trees is None:
+        return
+    for r, tree in enumerate(trees[:num_reqs]):
+        if tree is not None:
+            words_out[r, : tree.words.shape[0]] = tree.words
+
+
 def build_flex_tree_mask(
     num_reqs: int,
     C_per_req: torch.Tensor,
@@ -236,10 +278,12 @@ def build_fa4_tree_mask(
     """Build the df2t tree verify FA4 ``mask_mod`` and its aux tensors.
 
     Args:
-        num_reqs: Number of requests in the batch.
-        C_per_req: [num_reqs] int32 anchor context length (block-slot ``C``)
+        num_reqs: Number of requests in the batch. ``C_per_req``/``words`` may
+            be larger (persistent CUDA-graph aux pools sized ``max_num_reqs``);
+            only the first ``num_reqs`` rows carry live data.
+        C_per_req: [>= num_reqs] int32 anchor context length (block-slot ``C``)
             per request, read by scalar index in the mask_mod.
-        words: [num_reqs, B] int64 ancestor-or-self bitmask over arena
+        words: [>= num_reqs, B] int64 ancestor-or-self bitmask over arena
             indices (bit ``j`` set iff node ``j`` is an ancestor or itself of
             the query node), read by scalar index in the mask_mod.
         B: Node-count ceiling (the width of ``words``).
@@ -255,8 +299,12 @@ def build_fa4_tree_mask(
         ``words`` and ``aux_tensors[1]`` is ``C_per_req``.
 
     """
-    assert C_per_req.shape == (num_reqs,)
-    assert words.shape == (num_reqs, B)
+    assert C_per_req.shape[0] >= num_reqs, (C_per_req.shape, num_reqs)
+    assert words.shape[0] >= num_reqs and words.shape[1] == B, (
+        words.shape,
+        num_reqs,
+        B,
+    )
     return _make_fa4_tree_mask_mod(B), [words, C_per_req]
 
 

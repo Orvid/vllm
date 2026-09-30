@@ -597,6 +597,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         use_aux_hidden_state_outputs: bool = False,
         lora_capture_hook: Callable[[int, int, int], None] | None = None,
         progress_bar_desc: str = "Capturing CUDA graphs",
+        df2t_tree_mask_attach: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
@@ -674,6 +675,11 @@ class ModelCudaGraphManager(CudaGraphManager):
             if desc.num_ubatches > 1:
                 # Prepare and park threads before capture; finish runs inside it.
                 assert self.ubatch_runner is not None
+                if df2t_tree_mask_attach is not None:
+                    raise RuntimeError(
+                        "df2t CUDA-graph capture does not support "
+                        "microbatched (DBO) FULL graphs."
+                    )
                 ubatch_state = self.ubatch_runner.prepare(
                     InputBatch.make_dummy(num_reqs, num_tokens, input_buffers),
                     block_tables.get_dummy_block_tables(num_reqs),
@@ -707,6 +713,12 @@ class ModelCudaGraphManager(CudaGraphManager):
                 max_query_len=desc.max_query_len or desc.uniform_token_count,
                 pcp_manager=pcp_manager,
             )
+            if df2t_tree_mask_attach is not None:
+                # df2t: bake the tree-verify mask_mod + its persistent aux
+                # pool addresses into this descriptor's metadata so the
+                # captured graph applies tree-apportioned attention; the pool
+                # contents are refreshed before each replay.
+                df2t_tree_mask_attach(attn_metadata)
 
             # Capture with dummy rows marked as padding.
             input_buffers.is_padding.fill_(True)

@@ -932,11 +932,15 @@ def _fake_runner(spec, req_states, device, attn_groups, kv_cache_config=None):
     if kv_cache_config is None:
         kv_cache_config = _fake_fa4_kv_cache_config(block_size=16)
     runner = types.SimpleNamespace(
+        spec=spec,
         speculative_config=spec,
         req_states=req_states,
         device=device,
+        max_num_reqs=4,
         _pending_tree_flex_mask=None,
         _pending_tree_fa4_mask=None,
+        _df2t_tree_mask_words=None,
+        _df2t_tree_mask_c=None,
         attn_groups=attn_groups,
         kv_cache_config=kv_cache_config,
     )
@@ -945,6 +949,8 @@ def _fake_runner(spec, req_states, device, attn_groups, kv_cache_config=None):
         "_fa4_tree_verify_layer_names",
         "_fa4_tree_page_sizes",
         "_attach_tree_fa4_mask",
+        "_attach_fa4_tree_mask_impl",
+        "_ensure_df2t_tree_mask_buffers",
     ):
         setattr(runner, name, types.MethodType(getattr(GPUModelRunner, name), runner))
     return runner
@@ -997,8 +1003,13 @@ def test_runner_stage_attach_fa4_tree_mask():
     assert runner._pending_tree_fa4_mask is None
     assert target_meta.df2t_tree_mask_mod is not None
     assert target_meta.df2t_tree_aux_tensors is not None
-    assert target_meta.df2t_tree_aux_tensors[0].shape == (2, 64)
-    assert target_meta.df2t_tree_aux_tensors[1].tolist() == [4, 2]
+    # The aux tensors are the persistent pools: only the first num_reqs rows
+    # carry live values (rows/cols beyond hold zeros).
+    words, c_per_req = target_meta.df2t_tree_aux_tensors
+    assert words.shape == (4, 64)
+    assert c_per_req.shape == (4,)
+    assert c_per_req[:2].tolist() == [4, 2]
+    assert c_per_req[2:].tolist() == [0, 0]
     assert other_meta.df2t_tree_mask_mod is None
     assert other_meta.df2t_tree_aux_tensors is None
 
@@ -1038,7 +1049,7 @@ def test_runner_stage_fa4_scopes_zero_context():
     pending = runner._pending_tree_fa4_mask
     assert pending is not None
     _, c_per_req, words, _ = pending
-    assert c_per_req.tolist() == [4, 0]
+    assert c_per_req[:2].tolist() == [4, 0]
     assert bool((words[1] == 0).all().item())
 
 
