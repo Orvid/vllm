@@ -8,9 +8,9 @@ wrong the drafter proposed from garbage hidden states and acceptance
 collapsed to the degenerate floor (~1-3 accepted tokens per 32 drafted, i.e.
 ``mean accepted / draft`` ~0.05). This test drives the real engine on the
 offline Qwen3-0.6B + df2t drafter, reads the spec-decode counters, and asserts
-the acceptance length is materially above that floor, plus a T=0 losslessness
-spot-check (df2t output == the dflash greedy chain) on the prompt that is
-robustly lossless.
+the acceptance length is materially above that floor, plus a 128-token T=0
+losslessness check (df2t output == the dflash greedy chain) on the prompt that
+is robustly lossless at length.
 """
 
 import gc
@@ -27,10 +27,10 @@ _TARGET = "/mnt/e/dev/Qwen3-0.6B"
 _DRAFT = "/mnt/e/dev/Qwen3-0.6B-DF2T-CATMIX-B16"
 _NUM_SPEC = 15
 
-# Prompt 0 is robustly lossless (df2t T=0 == the dflash greedy chain) even
-# inside a batched sync run; other prompts exercise pre-existing target-side
-# verify/compaction issues unrelated to the drafter, so only prompt 0 is used
-# for the output-parity assertion.
+# Prompt 0 is robustly lossless (df2t T=0 == the dflash greedy chain) up to
+# 128 tokens on a single-request run. Other prompts exercise pre-existing
+# target-side verify/compaction issues unrelated to the drafter, so only
+# prompt 0 is used for the output-parity assertion.
 _PROMPTS = [
     "The capital of France is",
     "The largest planet in the solar system is",
@@ -39,6 +39,15 @@ _PROMPTS = [
     "The mitochondria is known as the powerhouse",
     "Water boils at 100 degrees",
 ]
+
+# Per-request draft-count floor for the acceptance sample. Acceptance is what
+# discriminates the buggy floor (mean accepted/draft ~0.05), not the draft
+# count — the degenerate drafter actually produces *more* drafts per request
+# because it accepts almost nothing. This is only a sample-size guard, kept low
+# enough that it stays green in the high-acceptance regime (acceptance length
+# ~5 -> ~12 drafts per 64-token request) while still requiring the run to have
+# actually done repeated speculative steps.
+_DRAFTS_PER_REQ_FLOOR = 6
 
 
 def _offline_models_present() -> bool:
@@ -91,13 +100,23 @@ def test_df2t_acceptance_above_degenerate_floor_and_lossless() -> None:
     tokens per draft step (acceptance length ~1.05) — no speculative speedup.
     The gate asserts a mean accepted-per-draft well above that floor (measured
     ~1.8-2.5 after the fix, comparable to or above the dflash chain's own
-    ~1.9), and that the df2t T=0 output matches the dflash greedy chain on a
-    single-request run (output distribution must be unchanged).
+    ~1.9), and that the df2t T=0 output matches the dflash greedy chain over a
+    128-token single-request run (output distribution must be unchanged).
+
+    The draft-count child guard is a sample-size check only: the degenerate
+    floor produces *more* drafts per request (it accepts almost nothing), so
+    the acceptance assert is what discriminates it. The guard is kept low
+    enough to stay green in the high-acceptance regime, where each draft spans
+    more tokens and the per-request draft count shrinks.
     """
     ids, num_drafts, num_draft_tokens, num_accepted = _run_engine(
         "df2t", _PROMPTS, 64
     )
-    assert num_drafts > 100, f"too few drafts to judge acceptance: {num_drafts}"
+    min_drafts = _DRAFTS_PER_REQ_FLOOR * len(_PROMPTS)
+    assert num_drafts >= min_drafts, (
+        f"too few drafts to judge acceptance: {num_drafts} < {min_drafts} "
+        f"({num_drafts / len(_PROMPTS):.1f} drafts/request)"
+    )
     mean_accepted = num_accepted / num_drafts
     print(
         "\n  df2t acceptance:"
@@ -111,13 +130,13 @@ def test_df2t_acceptance_above_degenerate_floor_and_lossless() -> None:
         f"(mean accepted/draft {mean_accepted:.3f}); the drafter is not "
         "conditioning on the accepted chain."
     )
-    # Output parity: df2t T=0 must equal the dflash greedy chain. Run prompt 0
-    # as an isolated single request (fresh engine per method) where df2t is
-    # consistently lossless; the acceptance fix must not change the output
-    # distribution.
-    chain = _run_engine("dflash", [_PROMPTS[0]], 64)[0][0]
-    got = _run_engine("df2t", [_PROMPTS[0]], 64)[0][0]
+    # Output parity: df2t T=0 must equal the dflash greedy chain over the
+    # verified 128-token window. Run prompt 0 as an isolated single request
+    # (fresh engine per method) where df2t is consistently lossless; the
+    # acceptance fix must not change the output distribution.
+    chain = _run_engine("dflash", [_PROMPTS[0]], 128)[0][0]
+    got = _run_engine("df2t", [_PROMPTS[0]], 128)[0][0]
     assert got == chain, (
-        "df2t T=0 output diverges from the dflash greedy chain "
+        "df2t T=0 output diverges from the dflash greedy chain over 128 tokens "
         "(drafter-context fix must not change output distribution)."
     )
