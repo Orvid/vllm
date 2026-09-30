@@ -157,8 +157,14 @@ def _gather_all_kernel(
     g = tl.load(group_of_ptr + layer)
     el = tl.load(elems_ptr + layer).to(tl.int64)
     entry = slab_off + i
-    do = tl.load(enter_ptr + g * g_stride + entry)
-    phys = tl.load(src_ptr + g * g_stride + entry)
+    # ``a`` is this slab's live entry count, so ``i < a`` is the correct
+    # in-slab / in-batch guard (``entry < a`` would compare a global entry
+    # against a per-slab count and erase every slab after the first). It also
+    # keeps the plan loads inside [G, max_a]: ``entry < slab_off + a <= a_batch
+    # <= g_stride``.
+    in_plan = i < a
+    do = tl.load(enter_ptr + g * g_stride + entry, mask=in_plan, other=0)
+    phys = tl.load(src_ptr + g * g_stride + entry, mask=in_plan, other=0)
     base_off = tl.load(layer_off_ptr + layer) + phys * el
     offs = tl.arange(0, BLOCK)
     for start in tl.range(0, el, BLOCK):
@@ -168,7 +174,7 @@ def _gather_all_kernel(
         tl.store(
             scratch_ptr + (i * L + layer) * MAX_EL + inc,
             val,
-            mask=valid & (do != 0) & (entry < a),
+            mask=valid & (do != 0) & in_plan,
         )
 
 
@@ -196,14 +202,22 @@ def _scatter_zero_all_kernel(
     el = tl.load(elems_ptr + layer).to(tl.int64)
     entry = slab_off + i
     idx = g * g_stride + entry
-    do = tl.load(enter_ptr + idx)
-    stale = tl.load(stale_ptr + idx)
-    base_dst = tl.load(layer_off_ptr + layer) + tl.load(dst_ptr + idx) * el
-    base_src = tl.load(layer_off_ptr + layer) + tl.load(src_ptr + idx) * el
+    # Same in-slab guard as the gather kernel (``a`` is this slab's live
+    # count): never touch entries of later slabs or read the plan buffers past
+    # the batch on the final partial slab.
+    in_plan = i < a
+    do = tl.load(enter_ptr + idx, mask=in_plan, other=0)
+    stale = tl.load(stale_ptr + idx, mask=in_plan, other=0)
+    base_dst = tl.load(layer_off_ptr + layer) + tl.load(
+        dst_ptr + idx, mask=in_plan, other=0
+    ) * el
+    base_src = tl.load(layer_off_ptr + layer) + tl.load(
+        src_ptr + idx, mask=in_plan, other=0
+    ) * el
     offs = tl.arange(0, BLOCK)
     for start in tl.range(0, el, BLOCK):
         inc = start + offs
-        valid = (inc < el) & (entry < a)
+        valid = (inc < el) & in_plan
         val = tl.load(
             scratch_ptr + (i * L + layer) * MAX_EL + inc, mask=valid, other=0
         )
