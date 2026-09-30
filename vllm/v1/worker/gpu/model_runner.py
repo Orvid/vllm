@@ -158,7 +158,7 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     resolve_adaptive_cudagraph_mode,
 )
 from vllm.v1.worker.gpu.spec_decode.df2t.budget import BudgetPolicy
-from vllm.v1.worker.gpu.spec_decode.df2t.compaction import compact_accepted_chain
+from vllm.v1.worker.gpu.spec_decode.df2t.compaction import Df2tKVCompaction
 from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import TreeDraft
 from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import TreeVerifier
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
@@ -2117,8 +2117,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         tree-block slot ``C + 1 + arena`` (Task 6 layout); inference reads
         context by ``position -> slot`` (``C + depth``), so without compaction
         the accepted chain's K/V is unreachable and the next step attends
-        garbage. ``compact_accepted_chain`` copies each accepted node's K/V to
-        the canonical slot and zeroes the stale scattered slot.
+        garbage. ``Df2tKVCompaction`` relocates every accepted node's K/V to
+        the canonical slot and zeroes the stale scattered slot, in a single
+        fixed-shape per-step plan and two launches (gather, then fused
+        scatter + stale-zero) covering all requests, groups and layers with no
+        host syncs on the per-step path.
         """
         verifier = self.tree_verifier
         if verifier is None or getattr(self, "_kv_cache_views_by_name", None) is None:
@@ -2129,38 +2132,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         trees = input_batch.trees
         if not trees:
             return
+        compaction = getattr(self, "_df2t_compaction", None)
+        if compaction is None:
+            max_num_reqs = max(
+                getattr(self, "max_num_reqs", input_batch.num_reqs),
+                input_batch.num_reqs,
+            )
+            compaction = Df2tKVCompaction(
+                max_num_reqs,
+                verifier.accepted_arenas.shape[1] - 1,
+                self._kv_cache_views_by_name,
+                self.kv_cache_config.kv_cache_groups,
+                self.device,
+            )
+            self._df2t_compaction = compaction
+        num_computed = self.req_states.num_computed_tokens.gpu[input_batch.idx_mapping]
         block_tables = self.block_tables.gather_block_tables(
             input_batch.idx_mapping,
             num_reqs_padded=input_batch.num_reqs_after_padding,
         )
-        idx_mapping_np = input_batch.idx_mapping_np
-        for r in range(input_batch.num_reqs):
-            n_sampled = int(num_sampled[r].item())
-            if n_sampled <= 1:
-                continue
-            tree = trees[r]
-            if tree is None:
-                continue
-            n_acc = n_sampled - 1
-            arenas = verifier.accepted_arenas[r, 1 : 1 + n_acc]
-            depths = tree.depths[arenas]
-            c = int(self.req_states.num_computed_tokens.gpu[idx_mapping_np[r]].item())
-            max_delta = int(max(int(1 + arenas.max().item()), int(depths.max().item())))
-            slots = c + torch.arange(max_delta + 1, device=self.device)
-            for g, group in enumerate(self.kv_cache_config.kv_cache_groups):
-                views = [
-                    self._kv_cache_views_by_name[n]
-                    for n in group.layer_names
-                    if n in self._kv_cache_views_by_name
-                ]
-                if not views:
-                    continue
-                block_size = int(group.kv_cache_spec.block_size)
-                req_bt = block_tables[g][r]
-                phys = req_bt[slots // block_size] * block_size + slots % block_size
-                compact_accepted_chain(
-                    arenas, depths, phys, views, 0, num_accepted=n_acc
-                )
+        compaction.compact(
+            num_sampled,
+            verifier.accepted_arenas,
+            trees,
+            num_computed,
+            block_tables,
+            input_batch.num_reqs,
+        )
 
     def _df2t_tree_verify(
         self,
