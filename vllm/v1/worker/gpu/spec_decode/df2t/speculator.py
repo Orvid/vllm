@@ -129,24 +129,48 @@ class DF2TSpeculator(DFlash2Speculator):
         draft.masked_fill_(pad, self.parallel_drafting_token_id)
         self.draft_tokens[:num_reqs] = draft
 
-    @property
-    def latest_tree_drafts(self) -> "list[TreeDraft | None] | None":
-        """Per-request ``TreeDraft`` (order-parallel to the batch's ``req_ids``)
-        from the most recent ``_generate_draft``, or None before the first step.
-        Only df2t speculators expose this; other speculators keep
-        ``set_draft_tokens`` on the plain draft-token path via None."""
+    def get_latest_tree_drafts(
+        self, num_reqs: int
+    ) -> "list[TreeDraft | None] | None":
+        """Per-request ``TreeDraft`` for the current batch, or None pre-first-step.
+
+        Reads the tree straight from the persistent ``TreeBuilder`` buffers,
+        which every step's tree build overwrites — whether that build ran
+        eagerly or inside the captured drafter CUDA graph on replay. The
+        runner scouts the list to ``num_reqs`` so it stays order-parallel to
+        the batch's ``req_ids`` even when a captured drafter graph was sized
+        for more (padded) requests; ignoring ``self._last_tree``'s own width
+        also avoids returning stale per-descriptor slices after capture. Only
+        df2t speculators expose this; other speculators keep
+        ``set_draft_tokens`` on the plain draft-token path via None.
+
+        Args:
+            num_reqs: Number of requests in the batch being scheduled. Must be
+                <= the number of rows the tree buffers were last written for.
+        """
         if self._last_tree is None:
             return None
-        t = self._last_tree
-        assert t.num_nodes is not None
+        b = self.tree_builder
         return [
             TreeDraft(
-                token_ids=t.token_ids[i],
-                depths=t.depths[i],
-                parents=t.parents[i],
-                arena=t.arena[i],
-                words=t.words[i],
-                num_nodes=t.num_nodes[i : i + 1],
+                token_ids=b.token_ids[i],
+                depths=b.depths[i],
+                parents=b.parents[i],
+                arena=b.arena[i],
+                words=b.words[i],
+                num_nodes=b.num_nodes[i : i + 1],
             )
-            for i in range(t.token_ids.shape[0])
+            for i in range(num_reqs)
         ]
+
+    @property
+    def latest_tree_drafts(self) -> "list[TreeDraft | None] | None":
+        """Back-compat alias over the last drafted row count (tests / eager).
+
+        The runtime seam calls :meth:`get_latest_tree_drafts` with the current
+        batch's ``num_reqs``; this property is kept for callers without batch
+        context (unit tests), scoped to the last build's own width.
+        """
+        if self._last_tree is None:
+            return None
+        return self.get_latest_tree_drafts(self._last_tree.token_ids.shape[0])

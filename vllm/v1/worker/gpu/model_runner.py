@@ -2808,12 +2808,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
+            # df2t carries the per-request tree beside the draft tokens, read
+            # fresh from the (possibly graph-replayed) TreeBuilder buffers for
+            # exactly this batch; other speculators expose None and keep the
+            # plain-token path.
+            _tree_getter = getattr(self.speculator, "get_latest_tree_drafts", None)
+            trees = (
+                _tree_getter(input_batch.num_reqs) if _tree_getter is not None else None
+            )
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
                 self.req_states.draft_tokens[input_batch.idx_mapping],
-                # df2t carries the per-request tree beside the draft tokens;
-                # other speculators return None and keep the plain-token path.
-                trees=getattr(self.speculator, "latest_tree_drafts", None),
+                trees=trees,
             )
             if self.pp_handler is not None:
                 self.pp_handler.broadcast_drafts(
