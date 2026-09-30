@@ -504,9 +504,10 @@ def test_batched_compaction_matches_reference_bit_identical():
         )
         torch.cuda.synchronize()
         assert torch.equal(buf, reference), f"seed {seed} diverged"
-        # The kernels run once per slab: a single (slab, L)-grid pair covers
-        # the whole batch, so exactly one gather and one scatter+zero launch.
+        # A single (slab, L)-grid pair covers the whole batch, and slabs tile
+        # at whole-request boundaries (a W-multiple).
         assert compactor._slab >= R * W
+        assert compactor._slab % W == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -552,3 +553,179 @@ def test_batched_compaction_treeless_requests_untouched():
     )
     torch.cuda.synchronize()
     assert torch.equal(buf, snapshot)
+
+
+def _force_slab_budget(budget: int):
+    """Context manager overriding Df2tKVCompaction's scratch-budget class attr."""
+    from contextlib import contextmanager
+
+    from vllm.v1.worker.gpu.spec_decode.df2t.compaction import (
+        Df2tKVCompaction,
+    )
+
+    @contextmanager
+    def _cm():
+        prev = Df2tKVCompaction._ScratchBudgetBytes
+        Df2tKVCompaction._ScratchBudgetBytes = budget
+        try:
+            yield
+        finally:
+            Df2tKVCompaction._ScratchBudgetBytes = prev
+
+    return _cm()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_batched_compaction_multi_slab_aliasing_at_boundary():
+    """Critical regression: a batch spanning several slabs must keep every
+    intra-request aliased pair exact. Node A's canonical slot equals node B's
+    scattered slot; with non-request-aligned slab tiling the earlier slab's
+    scatter overwrites the later slab's source before its gather (moves
+    already-moved bytes). Slabs now tile at whole-request (W-multiple)
+    boundaries, so each aliased pair stays in one slab and the gather ->
+    scatter ordering holds; the result must be byte-for-byte the per-request
+    reference."""
+    from vllm.v1.worker.gpu.spec_decode.df2t.compaction import (
+        Df2tKVCompaction,
+    )
+
+    R, W = 24, 4
+    block_size, num_blocks = 16, 256
+    nb = 16  # C up to 23*6 + 6 -> slot < 152 -> block index < 10.
+    # max_el = 4 (2x2 / 1x4), L = 2 -> row_bytes = 2 * 4 * 4 = 32.
+    group_specs = [[("l.0", 2, 2)], [("l.1", 1, 4)]]
+    views, buf = _make_batched_cache(group_specs, block_size, num_blocks)
+    groups = [
+        SimpleNamespace(
+            layer_names=[n for n, _, _ in grp],
+            kv_cache_spec=SimpleNamespace(block_size=block_size),
+        )
+        for grp in group_specs
+    ]
+    # Distinct C per request keeps every request's slots disjoint.
+    num_computed = torch.arange(R, dtype=torch.int32, device="cuda") * 6
+    block_tables = (
+        torch.arange(0, nb * block_size, block_size, device="cuda")
+        .unsqueeze(0)
+        .expand(R, nb)
+        .contiguous()
+    )
+    num_sampled = torch.full((R,), 4, dtype=torch.int32, device="cuda")
+    accepted_arenas = torch.full((R, W + 1), -1, dtype=torch.long, device="cuda")
+    trees = []
+    for r in range(R):
+        depths = torch.zeros(W, dtype=torch.long, device="cuda")
+        if r in (6, 13, 19):
+            # Requests straddling the old non-aligned boundaries (26/52/78):
+            # A (col 1) canonical slot equals B (col 3) scattered slot.
+            arena_a, arena_b = 1, 2
+            depths[arena_a] = 1 + arena_b
+            depths[arena_b] = 1 + arena_b
+            accepted_arenas[r, 1] = arena_a
+            accepted_arenas[r, 2] = 0
+            depths[0] = 1
+            accepted_arenas[r, 3] = arena_b
+        else:
+            depths[0] = 1
+            depths[1] = 2
+            accepted_arenas[r, 1] = 0
+            accepted_arenas[r, 2] = 1
+        trees.append(SimpleNamespace(depths=depths))
+
+    _old_compact_reference(
+        views, group_specs, block_size, num_sampled, accepted_arenas,
+        num_computed, block_tables, trees, R,
+    )
+    torch.cuda.synchronize()
+    reference = buf.clone()
+    buf.zero_()
+    torch.cuda.synchronize()
+
+    # L=2, max_el=4, itemsize=4 -> row_bytes=32; budget=26*32 -> raw slab 26
+    # (< a=96, multi-slab) and NOT a W-multiple pre-fix.
+    with _force_slab_budget(26 * 32):
+        compactor = Df2tKVCompaction(R, W, views, groups, torch.device("cuda"))
+        assert compactor._slab < R * W  # the batch really spans slabs
+        assert compactor._slab % W == 0  # and tiles at request boundaries
+        compactor.compact(
+            num_sampled, accepted_arenas, trees, num_computed,
+            [block_tables] * len(groups), R,
+        )
+    torch.cuda.synchronize()
+    assert torch.equal(buf, reference)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_batched_compaction_multi_slab_random_stress():
+    """Randomized multi-slab stress: a batch spanning several request-aligned
+    slabs must stay byte-for-byte identical to the per-request reference
+    across seeds (relocation, already-canonical, and same-request aliasing
+    included)."""
+    from vllm.v1.worker.gpu.spec_decode.df2t.compaction import (
+        Df2tKVCompaction,
+    )
+
+    R, W = 40, 5
+    block_size, num_blocks = 16, 512
+    nb = 24  # C up to 39*8 + 6 -> slot < 320 -> block index < 20.
+    # max_el = 4 (2x2 / 1x4), L = 2 -> row_bytes = 32.
+    group_specs = [[("l.0", 2, 2)], [("l.1", 1, 4)]]
+    views, buf = _make_batched_cache(group_specs, block_size, num_blocks)
+    groups = [
+        SimpleNamespace(
+            layer_names=[n for n, _, _ in grp],
+            kv_cache_spec=SimpleNamespace(block_size=block_size),
+        )
+        for grp in group_specs
+    ]
+    block_tables = (
+        torch.arange(0, nb * block_size, block_size, device="cuda")
+        .unsqueeze(0)
+        .expand(R, nb)
+        .contiguous()
+    )
+    for seed in range(4):
+        torch.manual_seed(seed)
+        num_computed = torch.arange(R, dtype=torch.int32, device="cuda") * 8
+        num_sampled = torch.randint(2, W + 1, (R,), dtype=torch.int32,
+                                    device="cuda")
+        accepted_arenas = torch.full((R, W + 1), -1, dtype=torch.long,
+                                     device="cuda")
+        trees = []
+        for r in range(R):
+            n = int(num_sampled[r].item()) - 1
+            depths = torch.zeros(W, dtype=torch.long, device="cuda")
+            for j in range(1, n + 1):
+                arena = torch.randint(0, W, (1,)).item()
+                accepted_arenas[r, j] = arena
+                mode = torch.randint(0, 3, (1,)).item()
+                if mode == 0:
+                    depths[arena] = 1 + arena
+                elif mode == 1:
+                    depths[arena] = torch.randint(1, W + 1, (1,)).item()
+                else:
+                    depths[arena] = 1 + torch.randint(0, W, (1,)).item()
+            trees.append(SimpleNamespace(depths=depths))
+        buf.zero_()
+        _old_compact_reference(
+            views, group_specs, block_size, num_sampled, accepted_arenas,
+            num_computed, block_tables, trees, R,
+        )
+        torch.cuda.synchronize()
+        reference = buf.clone()
+        buf.zero_()
+        torch.cuda.synchronize()
+        # L=2, max_el=4, itemsize=4 -> row_bytes=32; budget=17*32=544 ->
+        # raw slab 17, W-aligned to 15 (multiple of 5) < a=200 (multi-slab).
+        with _force_slab_budget(17 * 32):
+            compactor = Df2tKVCompaction(
+                R, W, views, groups, torch.device("cuda")
+            )
+            assert compactor._slab < R * W
+            assert compactor._slab % W == 0
+            compactor.compact(
+                num_sampled, accepted_arenas, trees, num_computed,
+                [block_tables] * len(groups), R,
+            )
+        torch.cuda.synchronize()
+        assert torch.equal(buf, reference), f"seed {seed} diverged"
