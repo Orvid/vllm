@@ -114,18 +114,21 @@ def _plan_group_kernel(
     dst_phys = tl.load(bt_ptr + r * nb + d_bidx) * bs + d_block % bs
     move = src_phys != dst_phys
     stale = move & valid
-    # A stale source is zeroed only when it is not some entry's destination
-    # (aliasing protection): scan every entry's destination, matching
-    # ``torch.isin(src, dst)`` exactly (cross-request included).
-    for k in tl.range(0, a):
-        rk = k // W
-        jk = k - rk * W
-        ark = tl.maximum(tl.load(arenas_ptr + rk * astride + 1 + jk), 0)
-        dk = tl.load(depth_ptr + rk * W + ark)
-        dbk = tl.load(c_ptr + rk) + dk
+    # Aliasing protection, exactly the reference's per-request semantics: a
+    # source is stale only when it is not the destination of any valid
+    # accepted node of the SAME request (``torch.isin(src, dst)`` over the
+    # request's own accepted nodes). Cross-request physical slots cannot
+    # coincide in the engine (each request owns disjoint KV blocks), so the
+    # scan is bounded to this request's ``W`` columns and masked by the
+    # per-column validity. O(R * W^2) per group for the whole batch.
+    for k in tl.range(0, W):
+        vk = (k < n_acc) & (ht != 0)
+        ark = tl.maximum(tl.load(arenas_ptr + r * astride + 1 + k), 0)
+        dk = tl.load(depth_ptr + r * W + ark)
+        dbk = c + dk
         dbidx = tl.minimum(dbk // bs, nb - 1)
-        dpk = tl.load(bt_ptr + rk * nb + dbidx) * bs + dbk % bs
-        stale = stale & (src_phys != dpk)
+        dpk = tl.load(bt_ptr + r * nb + dbidx) * bs + dbk % bs
+        stale = stale & ((src_phys != dpk) | (vk == 0))
     base = g * max_a
     tl.store(out_src + base + i, src_phys)
     tl.store(out_dst + base + i, dst_phys)
@@ -335,16 +338,32 @@ class Df2tKVCompaction:
     infrastructure primed.
 
     Per step, :meth:`compact` is called with the verifier's accepted-chain
-    output, per-request tree depths/block tables, and builds ``k`` = the
-    group-major plan ``[G, R * W]`` (src/dst slots, enter/stale masks), then
-    launches ``_gather_all_kernel`` and ``_scatter_zero_all_kernel`` over a
-    ``(slab, L)`` grid. Every accepted node's KV is relocated from its
-    scattered ``C + 1 + arena`` slot to the canonical ``C + depth`` slot and
-    the stale (non-aliased) sources are zeroed, with the same aliasing
-    protection the primitive guarantees: all sources are read before any
-    destination is written, and a source that is some destination is never
-    zeroed. A node whose canonical slot already equals its scattered slot is
-    left byte-for-byte untouched.
+    output, per-request tree depths/block tables, and builds the group-major
+    plan ``[G, R * W]`` (src/dst slots, enter/stale masks), then launches
+    ``_gather_all_kernel`` and ``_scatter_zero_all_kernel`` over a ``(slab,
+    L)`` grid. Every accepted node's KV is relocated from its scattered
+    ``C + 1 + arena`` slot to the canonical ``C + depth`` slot and the stale
+    (non-aliased) sources are zeroed, with the same aliasing protection the
+    reference primitive guarantees: within a slab every source is read before
+    any destination is written, and a source that is some same-request
+    destination is never zeroed. A node whose canonical slot already equals
+    its scattered slot is left byte-for-byte untouched.
+
+    Slabs tile at whole-request boundaries (a slab is a multiple of the chain
+    width ``W``), so a request's aliased src/dst pairs always stay inside one
+    gather -> scatter slab. The stale scan is per-request (matching the
+    reference's per-request ``torch.isin`` exactly): a source is considered
+    stale when it is not the destination of any valid accepted node of the
+    same request. Cross-request physical slots cannot coincide in the engine
+    (each request is allocated its own KV blocks), so no cross-request
+    aliasing can arise; if that invariant ever broke, the move would be
+    handled per-slab anyway (both requests share a slab only when their
+    entries do, and slabs hold whole requests).
+
+    Layer addressing uses per-layer element offsets measured from one base
+    view's ``data_ptr`` at init; it does not assume the layers share a single
+    backing allocation, only per-slot-contiguous (LBNHC) layers, which the
+    stride guard below enforces.
     """
 
     _ScratchBudgetBytes = _ScratchBudgetBytes
@@ -420,6 +439,12 @@ class Df2tKVCompaction:
         self._empty = False
         if any(layer.device.type != device.type for _, layer in layers):
             raise ValueError("df2t compaction views must live on one device")
+        dtype = layers[0][1].dtype
+        if any(layer.dtype != dtype for _, layer in layers):
+            raise ValueError(
+                "df2t compaction requires one dtype across the layer caches; "
+                f"got {dtype} and mixed dtypes"
+            )
 
         self._group_of = torch.empty(self._L, dtype=torch.int32, device=device)
         self._elems = torch.empty(self._L, dtype=torch.int32, device=device)
@@ -434,6 +459,7 @@ class Df2tKVCompaction:
                 (layer.data_ptr() - base_layer.data_ptr()) // itemsize
             )
         self._kv_base = base_layer
+        self._base_ptr = base_layer.data_ptr()
         self._max_el = int(self._elems.max().item())
 
         # Persistent plan + scratch. Rows [G, max_a]; details via g_stride.
@@ -459,8 +485,15 @@ class Df2tKVCompaction:
         # holds all layers of one contiguous run of entries so the batch is
         # covered in a small number of (slab, L)-grid launches.
         row_bytes = self._L * self._max_el * itemsize
-        slab = max(1, self._ScratchBudgetBytes // row_bytes)
-        self._slab = min(slab, self._max_a)
+        raw_slab = max(1, self._ScratchBudgetBytes // row_bytes)
+        # Slabs must tile at whole-request boundaries: a request's aliased
+        # src/dst pairs must stay inside one gather->scatter slab, otherwise a
+        # later slab could gather a source already overwritten by an earlier
+        # slab's scatter. max_a is a multiple of W, so snap the slab down to
+        # the largest W-multiple at or below the budget (minimum one request).
+        self._slab = min((raw_slab // W) * W, self._max_a)
+        if self._slab < W:
+            self._slab = W
         self._scratch = torch.zeros(
             self._slab * self._L * self._max_el,
             dtype=base_layer.dtype,
@@ -511,6 +544,11 @@ class Df2tKVCompaction:
         """
         if self._empty or R == 0:
             return
+        if self._kv_base.data_ptr() != self._base_ptr:
+            raise RuntimeError(
+                "df2t compaction backing KV cache moved after the compactor "
+                "was built; re-create the compactor"
+            )
         W = self._W
         a = R * W
         has_tree = self._has_tree[:R].zero_()
