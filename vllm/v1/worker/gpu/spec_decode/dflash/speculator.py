@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -28,6 +28,9 @@ from vllm.v1.worker.gpu.spec_decode.dflash.utils import load_dflash_model
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 from vllm.v1.worker.utils import AttentionGroup
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import TreeVerifier
 
 logger = init_logger(__name__)
 
@@ -530,6 +533,11 @@ class DFlashSpeculator(DraftModelSpeculator):
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert self.query_cudagraph_manager is not None
             self.query_cudagraph_manager.run_fullgraph(batch_desc)
+            # The replayed graph's tree build wrote batch_desc.num_reqs rows
+            # into the draft builder buffers; mirror that width so a consumer
+            # can fail closed on any over-read. No-op for drafters without a
+            # tree (e.g. dflash itself).
+            self._mark_draft_graph_built(batch_desc.num_reqs)
         else:
             self._generate_draft(
                 num_reqs,
@@ -541,6 +549,15 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
 
         return self.draft_tokens[:num_reqs]
+
+    def _mark_draft_graph_built(self, rows: int) -> None:
+        """Hook: report the row count a replayed draft graph just wrote.
+
+        Drafting runtimes that read fixed-width persistent buffers out from
+        under a captured graph (e.g. df2t's tree) override this to track
+        exactly how many rows the replay wrote, so later reads can fail closed
+        on an over-read. Base implementation is a no-op.
+        """
 
 
 @triton.jit

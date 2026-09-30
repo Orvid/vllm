@@ -157,3 +157,53 @@ def test_generate_draft_builds_tree_and_draft_tokens() -> None:
         n = int(drafts[r].num_nodes.item())
         assert n >= width, "the tree must fill the per-step draft width"
         assert torch.equal(spec.draft_tokens[r], drafts[r].token_ids[:width])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_get_latest_tree_drafts_fails_closed_on_over_read() -> None:
+    """Requesting more trees than the last build wrote must fail closed.
+
+    ``get_latest_tree_drafts(num_reqs)`` reads the persistent TreeBuilder
+    buffers; rows past the last build's width hold stale trees from an older
+    batch, so an over-read must raise instead of handing out garbage. Covers
+    both the eager build (``_generate_draft``) and a replayed drafter graph
+    (``_mark_draft_graph_built``) width sources.
+    """
+    from vllm.v1.worker.gpu.spec_decode.df2t.speculator import DF2TSpeculator
+
+    torch.manual_seed(0)
+    spec = init_speculator(_fake_vllm_config(), torch.device("cuda"))
+    assert isinstance(spec, DF2TSpeculator)
+    num_reqs, steps = 2, spec.num_speculative_steps
+    K = spec.top_k
+
+    spec._run_model = lambda *_a, **_k: torch.randn(
+        num_reqs * steps, 64, device="cuda"
+    )
+    spec.model = SimpleNamespace(
+        compute_candidates=lambda h: (
+            torch.randint(0, 512, (h.shape[0], K), device="cuda"),
+            torch.randn(h.shape[0], K, device="cuda"),
+        )
+    )
+    spec._score_candidates = lambda cand, unary, hidden: torch.randn(
+        cand.shape[0], cand.shape[1], K, K, device="cuda"
+    )
+    spec.sample_indices[: num_reqs * steps] = torch.arange(
+        num_reqs * steps, device="cuda"
+    )
+
+    # No build yet: nothing to read, None (not an over-read).
+    assert spec.latest_tree_drafts is None
+
+    spec._generate_draft(num_reqs, num_reqs * steps, None, None, None)
+    assert spec._last_built_rows == num_reqs
+    assert spec.get_latest_tree_drafts(num_reqs) is not None
+    with pytest.raises(RuntimeError, match="over-read"):
+        spec.get_latest_tree_drafts(num_reqs + 1)
+
+    # A replayed drafter graph reports its own width.
+    spec._mark_draft_graph_built(1)
+    assert spec._last_built_rows == 1
+    with pytest.raises(RuntimeError, match="over-read"):
+        spec.get_latest_tree_drafts(num_reqs)

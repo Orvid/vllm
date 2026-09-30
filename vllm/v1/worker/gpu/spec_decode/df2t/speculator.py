@@ -29,6 +29,10 @@ class DF2TSpeculator(DFlash2Speculator):
         # no-head path matches d.get_num_draft_tokens() exactly.
         self.nodes_max = self.budget.resolve_nodes_max()
         self._last_tree: TreeDraft | None = None
+        # Row count the most recent tree build wrote into the persistent
+        # TreeBuilder buffers (eager build or a replayed drafter graph). Used
+        # to fail closed if a consumer ever asks for more rows than were built.
+        self._last_built_rows = 0
         self.tree_builder = TreeBuilder(
             self.max_num_reqs, self.max_depth, self.top_k, self.nodes_max, device
         )
@@ -116,6 +120,7 @@ class DF2TSpeculator(DFlash2Speculator):
         tree = self.tree_builder.build(scores, candidate_ids)
         assert tree.num_nodes is not None
         self._last_tree = tree
+        self._last_built_rows = num_reqs
 
         # The scheduler reserves num_speculative_steps draft slots per request.
         # Fill them with the highest-priority tree node token ids (emit order)
@@ -148,9 +153,21 @@ class DF2TSpeculator(DFlash2Speculator):
             num_reqs: Number of requests in the batch being scheduled. Must be
                 <= the number of rows the tree buffers were last written for.
 
+        Raises:
+            RuntimeError: if ``num_reqs`` exceeds the rows the most recent tree
+                build wrote (a stale-buffer over-read that would hand out
+                leftover trees from an older batch).
+
         """
         if self._last_tree is None:
             return None
+        if num_reqs > self._last_built_rows:
+            raise RuntimeError(
+                "df2t tree read would over-read the last tree build: "
+                f"{num_reqs} requests but only {self._last_built_rows} rows "
+                "were built. The static path builds exactly one tree per "
+                "batch; a mismatch means draft/tree timing diverged."
+            )
         b = self.tree_builder
         return [
             TreeDraft(
@@ -163,6 +180,10 @@ class DF2TSpeculator(DFlash2Speculator):
             )
             for i in range(num_reqs)
         ]
+
+    def _mark_draft_graph_built(self, rows: int) -> None:
+        """Record the row count a replayed drafter graph just wrote."""
+        self._last_built_rows = rows
 
     @property
     def latest_tree_drafts(self) -> "list[TreeDraft | None] | None":
