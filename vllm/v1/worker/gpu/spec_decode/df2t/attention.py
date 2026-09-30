@@ -86,7 +86,10 @@ def fill_tree_mask_inputs(
 
     """
     words_out.zero_()
-    c_per_req_out[:num_reqs].copy_(c_per_req.to(torch.int32))
+    # The runner's source (req_states.num_computed_tokens.gpu) is int32, so the
+    # dtype cast is a no-op self-return in the hot path and allocates only if a
+    # caller ever feeds a different dtype.
+    c_per_req_out[:num_reqs].copy_(c_per_req.to(c_per_req_out.dtype))
     if c_per_req_out.numel() > num_reqs:
         c_per_req_out[num_reqs:].zero_()
     if trees is None:
