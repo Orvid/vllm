@@ -323,6 +323,88 @@ def test_fa4_tree_mask_matches_manual_and_flex_reference():
 
 
 @requires_sm120_fa4
+def test_fa4_tree_mask_treeless_request_with_context_is_causal():
+    """A request with context (C > 0) but no tree this step (a chunked-prefill
+    continuation or prefix-cache hit co-scheduled with a tree decode) attends
+    causally over its context and its own rows, while the co-batched tree
+    request keeps its ancestor-or-self mask."""
+    tree_c, tree_words, tree_b = 4, [0b1, 0b11, 0b101], 3
+    chunk_c, chunk_rows = 20, 5  # spans the 16-slot page boundary
+    query_lens = [tree_b + 1, chunk_rows]
+    seq_lens = [tree_c + 1 + tree_b, chunk_c + chunk_rows]
+    block_size = 16
+    max_b = tree_b
+    max_blocks = (max(seq_lens) + block_size - 1) // block_size
+    physical = torch.arange(2 * max_blocks, dtype=torch.int32, device=DEVICE).view(
+        2, max_blocks
+    )
+
+    torch.manual_seed(5)
+    Hq, Hkv = 16, 8
+    q = torch.randn(sum(query_lens), Hq, 128, dtype=DTYPE, device=DEVICE)
+    k_cache = torch.randn(
+        2 * max_blocks, block_size, Hkv, 128, dtype=DTYPE, device=DEVICE
+    )
+    v_cache = torch.randn_like(k_cache)
+    kfulls, vfulls = [], []
+    for r, seq_len in enumerate(seq_lens):
+        kf = torch.randn(seq_len, Hkv, 128, dtype=DTYPE, device=DEVICE)
+        vf = torch.randn_like(kf)
+        for i in range(seq_len):
+            page = physical[r, i // block_size]
+            k_cache[page, i % block_size] = kf[i]
+            v_cache[page, i % block_size] = vf[i]
+        kfulls.append(kf)
+        vfulls.append(vf)
+
+    words = torch.zeros(2, max_b, dtype=torch.int64, device=DEVICE)
+    words[0] = torch.tensor(tree_words, dtype=torch.int64, device=DEVICE)
+    c_per_req = torch.tensor([tree_c, chunk_c], dtype=torch.int32, device=DEVICE)
+    cu = torch.tensor(
+        [0, query_lens[0], sum(query_lens)], dtype=torch.int32, device=DEVICE
+    )
+    scale = 128**-0.5
+    mask_mod, aux = build_fa4_tree_mask(2, c_per_req, words, max_b)
+    out = flash_attn_varlen_func(
+        q,
+        k_cache,
+        v_cache,
+        max_seqlen_q=max(query_lens),
+        cu_seqlens_q=cu,
+        max_seqlen_k=max(seq_lens),
+        cu_seqlens_k=None,
+        seqused_k=torch.tensor(seq_lens, dtype=torch.int32, device=DEVICE),
+        block_table=physical,
+        softmax_scale=scale,
+        fa_version=4,
+        num_splits=1,
+        causal=False,
+        window_size=(-1, -1),
+        mask_mod=mask_mod,
+        aux_tensors=aux,
+    )
+
+    n = seq_lens[1]
+    rows = torch.arange(chunk_c, n)[:, None]
+    masks = [
+        _manual_matrix(tree_c, tree_words, tree_b)[tree_c:],
+        torch.arange(n)[None, :] <= rows,
+    ]
+    st = 0
+    for r, m in enumerate(masks):
+        qr = q[st : st + query_lens[r]].float().unsqueeze(0).transpose(1, 2)
+        kk = kfulls[r].transpose(0, 1)[None].float().repeat_interleave(Hq // Hkv, 1)
+        vv = vfulls[r].transpose(0, 1)[None].float().repeat_interleave(Hq // Hkv, 1)
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            qr, kk, vv, attn_mask=m[None, None].to(DEVICE), scale=scale
+        )
+        ref = ref.transpose(1, 2).squeeze(0)
+        err = (out[st : st + query_lens[r]].float() - ref).abs().max().item()
+        assert err < TOL, f"request {r} diverged from its reference: {err}"
+        st += query_lens[r]
+
+
+@requires_sm120_fa4
 def test_fa4_tree_mask_kv_idx_is_logical_blockslot():
     """kv_idx in the FA4 paged mask is the logical block-slot, not an absolute
     physical KV slot: a query told to keep exactly key ``C + 2`` attends the

@@ -1648,10 +1648,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         c_per_req = self.req_states.num_computed_tokens.gpu[idx_mapping].to(torch.int64)
-        # A request with C == 0 (a fresh prefill co-scheduled with a tree
-        # decode step) carries no tree and no context; the flex mask falls back
-        # to per-request causal attention for it (see build_flex_tree_mask), so
-        # it verifies its first token instead of being dropped.
+        # A request without a tree (a prefill chunk co-scheduled with a tree
+        # decode step) keeps all-zero words; the flex mask falls back to
+        # per-request causal attention for it (see build_flex_tree_mask).
         words = pack_tree_mask_inputs(
             trees, num_reqs, spec.max_tree_budget, self.device
         )
@@ -1745,10 +1744,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         c_per_req = self.req_states.num_computed_tokens.gpu[idx_mapping].to(torch.int32)
-        # A request with C == 0 (a fresh prefill co-scheduled with a tree
-        # decode step) carries no tree and no context; the fa4 mask falls back
-        # to per-request causal attention for it (see _make_fa4_tree_mask_mod),
-        # so it verifies its first token instead of being dropped.
+        # A request without a tree (a prefill chunk co-scheduled with a tree
+        # decode step) keeps all-zero words; the fa4 mask falls back to
+        # per-request causal attention for it (see _make_fa4_tree_mask_mod).
         words = pack_tree_mask_inputs(
             trees, num_reqs, spec.max_tree_budget, self.device
         )

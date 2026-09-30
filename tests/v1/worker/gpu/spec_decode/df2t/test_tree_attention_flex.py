@@ -166,6 +166,39 @@ def test_flex_tree_mask_contextless_request_is_causal():
     assert torch.equal(got, k <= q), "contextless request must attend causally"
 
 
+def test_flex_tree_mask_treeless_request_with_context_is_causal():
+    """A request with context (C > 0) but no tree this step (a chunked-prefill
+    continuation or prefix-cache hit co-scheduled with a tree decode) must
+    attend causally over context and its own rows, not just context + row 0,
+    and the block-sparsity hint must never prune those keys."""
+    max_b = 3
+    C, n1 = 6, 4
+    n0 = 5
+    query_start_loc = [0, n0, n0 + n1]
+    request_lookup = torch.zeros(query_start_loc[-1], dtype=torch.int32)
+    request_lookup[query_start_loc[1] :] = 1
+
+    c_per_req = torch.tensor([4, C], dtype=torch.long)
+    words = torch.zeros(2, max_b, dtype=torch.long)
+    words[0] = torch.tensor([0b1, 0b11, 0b101], dtype=torch.long)
+
+    mask_mod, hint = build_flex_tree_mask(2, c_per_req, words, max_b, request_lookup)
+    n = C + n1
+    q = torch.arange(C, n, dtype=torch.long)[:, None].expand(n1, n)
+    k = torch.arange(n, dtype=torch.long)[None, :].expand(n1, n)
+    b = (query_start_loc[1] + torch.arange(n1, dtype=torch.long))[:, None]
+    got = mask_mod(b.expand(n1, n), torch.zeros(1, dtype=torch.long), q, k)
+    assert torch.equal(got, k <= q), "treeless request must attend causally"
+
+    block_size = 2
+    kv_block = torch.arange(n // block_size, dtype=torch.long)[None, :]
+    visible = hint.hint_fn(
+        b[:, 0], torch.arange(C, n, dtype=torch.long), kv_block, block_size
+    )
+    needed = (kv_block * block_size) <= torch.arange(C, n)[:, None]
+    assert (visible | ~needed).all(), "hint pruned a causally visible block"
+
+
 def test_flex_tree_mask_hint_never_prunes_visible_blocks():
     """The BlockSparsityHint is a superset of the real mask at block
     granularity (a block holding any allowed key stays visible) and prunes

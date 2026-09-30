@@ -83,11 +83,13 @@ def build_flex_tree_mask(
         not the batch index) and ``q_idx``/``kv_idx`` are *logical*
         (block-slot) indices. A key is allowed iff it is context (``< C``), the
         anchor (``== C``), or a node (``C + 1 + j``) whose bit ``j`` is set in
-        the query node's word. A request with ``C == 0`` (a fresh prefill
-        co-scheduled with a tree decode) has no tree and no context: its own
-        rows are the block and it falls back to per-request causal attention.
-        All inputs broadcast elementwise, matching the other flex mask mods
-        (``causal_mask_mod`` et al).
+        the query node's word. A request without a tree this step (a prefill
+        chunk, fresh or continuing after cached context, co-scheduled with a
+        tree decode) falls back to per-request causal attention over its
+        context and its own rows. Tree presence is ``words[r, 0] != 0``: node
+        0's ancestor-or-self word always contains itself. All inputs broadcast
+        elementwise, matching the other flex mask mods (``causal_mask_mod`` et
+        al).
 
     """
     assert C_per_req.shape == (num_reqs,)
@@ -112,10 +114,9 @@ def build_flex_tree_mask(
         is_node_query = (q_idx >= C + 1) & (q_idx < C + 1 + B)
         bit = ((words[r, arena] >> node_j) & 1) != 0
         node_allowed = is_node_query & is_node_key & bit
-        # A contextless request (C == 0, e.g. a fresh prefill co-scheduled with
-        # a tree decode) has no tree and no cached context; its own rows are the
-        # block, so fall back to per-request causal attention over them.
-        causal = (C == 0) & (kv_idx <= q_idx)
+        # A treeless request (a prefill chunk co-scheduled with a tree decode)
+        # attends causally over its context and its own rows.
+        causal = (words[r, 0] == 0) & (kv_idx <= q_idx)
         return in_context | is_anchor | node_allowed | causal
 
     def hint_fn(
@@ -136,10 +137,10 @@ def build_flex_tree_mask(
         C = C_per_req[r]
         block_start = kv_block_idx * block_size
         context_or_anchor = block_start <= C[:, None]
-        # Contextless (C == 0) requests attend their own rows causally; keep
-        # every block at or before the query's block (the causal keys live
-        # there), mirroring logical_mask_mod.
-        contextless = (C == 0)[:, None] & (block_start <= logical_q_idx[:, None])
+        # Treeless requests attend causally; keep every block at or before the
+        # query's block (the causal keys live there), mirroring
+        # logical_mask_mod.
+        treeless = (words[r, 0] == 0)[:, None] & (block_start <= logical_q_idx[:, None])
         arena = torch.clamp(logical_q_idx - (C + 1), 0, B - 1)
         is_node_query = (logical_q_idx >= C + 1) & (logical_q_idx < C + 1 + B)
         word_scalar = words[r, arena]
@@ -153,7 +154,7 @@ def build_flex_tree_mask(
         node_visible = is_node_query[:, None] & (
             (word_scalar[:, None] & node_bits) != 0
         )
-        return context_or_anchor | contextless | node_visible
+        return context_or_anchor | treeless | node_visible
 
     return logical_mask_mod, BlockSparsityHint(hint_fn)
 
@@ -214,9 +215,9 @@ def _make_fa4_tree_mask_mod(B: int):
         is_node_query = q >= 1
         bit = ((words[batch_idx[0], arena] >> node_j) & 1) != 0
         node_allowed = is_node_query & is_node_key & bit
-        # Contextless (c == 0) requests have no tree and no context; their own
-        # rows are the block, so fall back to per-request causal attention.
-        causal = (c == 0) & (k <= q)
+        # Treeless requests (node 0's self bit unset) attend causally over
+        # their context and their own rows (query block-slot ``c + q``).
+        causal = (words[batch_idx[0], 0] == 0) & (k <= c + q)
         return scalar_to_ssa(
             in_context | is_anchor | node_allowed | causal, cutlass.Int32
         )
