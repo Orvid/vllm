@@ -713,11 +713,14 @@ class ModelCudaGraphManager(CudaGraphManager):
                 max_query_len=desc.max_query_len or desc.uniform_token_count,
                 pcp_manager=pcp_manager,
             )
-            if df2t_tree_mask_attach is not None:
+            if df2t_tree_mask_attach is not None and desc.cg_mode == CUDAGraphMode.FULL:
                 # df2t: bake the tree-verify mask_mod + its persistent aux
-                # pool addresses into this descriptor's metadata so the
-                # captured graph applies tree-apportioned attention; the pool
-                # contents are refreshed before each replay.
+                # pool addresses into FULL (uniform 1+B decode) metadata only.
+                # The tree mask's q_idx layout is defined just for the
+                # (num_reqs, 1+B) verify block; a PIECEWISE descriptor may
+                # later replay a mixed/prefill batch at a different query
+                # layout, so it must never bake this mask. df2t mixed batches
+                # run eager instead (see GPUModelRunner dispatch).
                 df2t_tree_mask_attach(attn_metadata)
 
             # Capture with dummy rows marked as padding.

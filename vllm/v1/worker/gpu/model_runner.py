@@ -1101,6 +1101,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "'fa4' (the default) under cudagraph mode, or keep flex eager "
                 "(-cc.cudagraph_mode=none)."
             )
+        mode = self.compilation_config.cudagraph_mode
+        if mode is None or not mode.has_full_cudagraphs():
+            # df2t tree-verify capture is the FULL uniform 1+B decode graph
+            # only; a mode without FULL (e.g. PIECEWISE-only) can never serve
+            # it, and baking the mask into PIECEWISE descriptors is unsafe
+            # (wrong q layout for mixed batches). Fail closed rather than
+            # capture graphs that would be replayed without the mask.
+            raise RuntimeError(
+                "df2t CUDA-graph capture requires a cudagraph mode with FULL "
+                "decode graphs (FULL / FULL_DECODE_ONLY / FULL_AND_PIECEWISE), "
+                f"got cudagraph_mode={mode}. Run df2t with a FULL-capable "
+                "cudagraph mode or cudagraph_mode=none (eager)."
+            )
         width = spec.max_tree_budget
         self._ensure_df2t_tree_mask_buffers(width)
         # Pre-fill the pools so the captured descriptor sees a valid (treeless)
@@ -1122,6 +1135,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         return attach
+
+    def _df2t_force_eager(self, uniform_tok_count: int | None) -> bool:
+        """Whether a scheduled batch must run eager under df2t CUDA graphs.
+
+        df2t captures and replays the target tree-verify decode only as a FULL
+        uniform ``(num_reqs, 1 + B)`` graph (the tree mask's q_idx layout is
+        defined for that verify block alone). Any other batch shape — a
+        co-scheduled prefill chunk, a treeless decode, a shape past the
+        captured uniform sizes — keeps `method="dflash"`-like eager semantics
+        instead of falling into a PIECEWISE graph whose query layout would
+        misapply the baked tree mask.
+        """
+        if self.speculative_config is None or not self.speculative_config.use_df2t():
+            return False
+        return uniform_tok_count != self.decode_query_len
 
     @torch.inference_mode()
     def capture_model(self, *, profile_only: bool = False) -> int:
@@ -2038,9 +2066,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert self.sampler is not None
             sampler_output = self.sampler(logits, input_batch)
         elif input_batch.trees is not None:
-            # DF2T tree-traversal verification (v5 spec §3.6). The tree comes
-            # from the scheduler carry; the verifier reads only the target
-            # logits rows, never any drafter probability buffer.
+            # DF2T tree-traversal verification (v5 spec §3.6). The tree was
+            # stashed on the batch by the worker's draft-token handler (read
+            # fresh from the speculator's graph-replayed builder buffers); the
+            # verifier reads only the target logits rows, never any drafter
+            # probability buffer.
             assert self.speculative_config is not None
             assert self.speculative_config.use_df2t()
             assert self.tree_verifier is not None
@@ -2330,6 +2360,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
+        # df2t runs its tree-verify decode on the FULL uniform 1+B graph only;
+        # a non-uniform (mixed/prefill) batch must run eager rather than
+        # dispatch to a PIECEWISE graph, whose query layout is not the verify
+        # block the tree mask is defined for.
+        force_eager = self._df2t_force_eager(uniform_tok_count)
+
         batch_desc, dp_sync = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
@@ -2338,7 +2374,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_size,
             self.dp_rank,
             max_query_len=max_query_len,
-            need_eager=is_profile or skip_compiled,
+            need_eager=is_profile or skip_compiled or force_eager,
             num_active_loras=num_active_loras,
             parallel_config=self.parallel_config,
             allow_ubatching=(

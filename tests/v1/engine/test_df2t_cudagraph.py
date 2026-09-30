@@ -76,3 +76,33 @@ def test_df2t_serves_with_full_cudagraphs_and_matches_eager_single_request() -> 
         "df2t CUDA-graph decode diverges from eager at a single-request shape:\n"
         f"  graph: {graph_ids[:48]}\n  eager: {eager_ids[:48]}"
     )
+
+
+@pytest.mark.skipif(
+    not _offline_models_present(), reason="offline df2t models not present"
+)
+def test_df2t_with_piecewise_only_mode_fails_closed() -> None:
+    """df2t CUDA-graph capture is the FULL uniform 1+B decode graph only; a
+    PIECEWISE-only mode cannot serve it and must fail closed (precise error
+    surfaced in the engine core; the API boundary reports init failure)
+    instead of capturing graphs that would replay without the tree mask."""
+    from vllm.config.compilation import CompilationConfig
+
+    with pytest.raises(RuntimeError, match="Engine core initialization failed"):
+        LLM(
+            model=_TARGET,
+            speculative_config={
+                "method": "df2t",
+                "model": _DRAFT,
+                "num_speculative_tokens": 15,
+                "tree_attention_backend": "fa4",
+            },
+            compilation_config=CompilationConfig(cudagraph_mode="PIECEWISE"),
+            async_scheduling=False,
+            max_num_batched_tokens=256,
+            max_model_len=512,
+            dtype="bfloat16",
+            gpu_memory_utilization=0.5,
+            trust_remote_code=True,
+            disable_log_stats=False,
+        )

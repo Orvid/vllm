@@ -1163,3 +1163,62 @@ def test_runner_attach_fa4_fails_closed_without_fa4_metadata():
     runner._stage_tree_fa4_mask(True, trees, 2, torch.tensor([0, 1], dtype=torch.int32))
     with pytest.raises(ValueError, match="fa4"):
         runner._attach_tree_fa4_mask({"target.attn": _fake_fa4_metadata()})
+
+
+def test_runner_df2t_force_eager_only_when_non_uniform():
+    """df2t must force non-uniform batches to eager (never a PIECEWISE graph):
+    the tree mask's q layout is defined only for the uniform 1+B verify block,
+    so any other shape runs the eager path. Non-df2t runners never force eager
+    on shape alone."""
+    import types
+
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    df2t_spec = type("Spec", (), {"use_df2t": lambda self: True})()
+    r = types.SimpleNamespace(speculative_config=df2t_spec, decode_query_len=16)
+    _force = GPUModelRunner._df2t_force_eager
+    # Uniform 1+B decode may use the FULL graph.
+    assert not _force(r, 16)
+    # Non-uniform / mixed / prefill batches run eager.
+    assert _force(r, 1)
+    assert _force(r, None)
+    assert _force(r, 8)
+
+    # Non-df2t runners never force eager on shape alone.
+    plain = types.SimpleNamespace(
+        speculative_config=type("S", (), {"use_df2t": lambda self: False})(),
+        decode_query_len=16,
+    )
+    assert not _force(plain, 1)
+    assert not _force(plain, None)
+
+
+def test_runner_df2t_capture_mode_fails_closed():
+    """df2t CUDA-graph capture is the FULL uniform 1+B decode graph only: a
+    mode without FULL graphs (PIECEWISE-only / NONE) must fail closed with a
+    precise error rather than capture graphs that could never serve the tree
+    mask."""
+    import types
+
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    fa4_spec = type("Spec", (), {"tree_attention_backend": "fa4"})()
+    _make = GPUModelRunner._make_df2t_capture_mask_attach
+    for bad_mode in (None, CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE):
+        runner = types.SimpleNamespace(
+            speculative_config=fa4_spec,
+            compilation_config=types.SimpleNamespace(cudagraph_mode=bad_mode),
+        )
+        with pytest.raises(RuntimeError, match="requires a cudagraph mode with FULL"):
+            _make(runner)
+
+    # Flex is also rejected before the mode check, even under a FULL mode.
+    flex_runner = types.SimpleNamespace(
+        speculative_config=type("S", (), {"tree_attention_backend": "flex"})(),
+        compilation_config=types.SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE
+        ),
+    )
+    with pytest.raises(RuntimeError, match="tree_attention_backend='fa4' only"):
+        _make(flex_runner)
