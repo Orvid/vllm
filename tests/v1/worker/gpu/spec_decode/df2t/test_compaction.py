@@ -387,8 +387,32 @@ def _make_batched_cache(group_specs, block_size, num_blocks, dtype=torch.float32
     return views, buf
 
 
+def _seed_kv(views, group_specs, block_size, num_slots):
+    """Fill each layer's phys slots [0, num_slots) with a layer/slot-unique
+    nonzero value, so a misplaced relocation (a moved slot's payload landing
+    on the wrong physical slot) is detectable by ``torch.equal``."""
+    layer_idx = 0
+    for grp in group_specs:
+        for name, h, d in grp:
+            if name not in views:
+                continue
+            v = views[name]
+            base = float(layer_idx * 100000)
+            for s in range(num_slots):
+                v[s // block_size, :, s % block_size, :].fill_(base + s + 1)
+            layer_idx += 1
+
+
 def _rand_chain_batch(R, W, num_blocks, seed):
-    """Random accepted chains with canonical/aliased/plain depths dispersed."""
+    """Random realistic accepted chains.
+
+    The verifier's accepted nodes are one tree path: distinct arenas with
+    strictly increasing tree depths, so canonical slots ``C + depth`` are
+    distinct and the gather->scatter result is deterministic (no two nodes
+    write the same canonical slot). Existing non-path depth collisions (two
+    accepted nodes sharing a depth) cannot come out of the verifier and would
+    make "bit-identical to the reference" a racy, ill-defined assertion.
+    """
     torch.manual_seed(seed)
     num_sampled = torch.randint(
         1, W + 1, (R,), dtype=torch.int32, device="cuda"
@@ -400,21 +424,14 @@ def _rand_chain_batch(R, W, num_blocks, seed):
         0, num_blocks, (R, 6), dtype=torch.long, device="cuda"
     )
     trees = []
-    tree_present = []
     for r in range(R):
         n = int(num_sampled[r].item()) - 1
         depths = torch.zeros(W, dtype=torch.long, device="cuda")
-        tree_present.append(True)
+        arena_order = torch.randperm(W)
         for j in range(1, n + 1):
-            arena = torch.randint(0, W, (1,)).item()
+            arena = int(arena_order[j - 1].item())
             accepted_arenas[r, j] = arena
-            mode = torch.randint(0, 3, (1,)).item()
-            if mode == 0:
-                depths[arena] = 1 + arena  # already canonical
-            elif mode == 1:
-                depths[arena] = torch.randint(1, W + 1, (1,)).item()
-            else:
-                depths[arena] = torch.randint(1, W + 1, (1,)).item()
+            depths[arena] = j
         trees.append(SimpleNamespace(depths=depths))
     return num_sampled, accepted_arenas, num_computed, block_tables, trees
 
@@ -476,6 +493,10 @@ def test_batched_compaction_matches_reference_bit_identical():
             )
             for grp in group_specs
         ]
+        num_slots = int(num_computed.max().item()) + W + 2
+        _seed_kv(views, group_specs, block_size, num_slots)
+        torch.cuda.synchronize()
+        initial = buf.clone()
         _old_compact_reference(
             views,
             group_specs,
@@ -489,7 +510,7 @@ def test_batched_compaction_matches_reference_bit_identical():
         )
         torch.cuda.synchronize()
         reference = buf.clone()
-        buf.zero_()
+        buf.copy_(initial)
         torch.cuda.synchronize()
         compactor = Df2tKVCompaction(
             R, W, views, groups, torch.device("cuda")
@@ -616,29 +637,39 @@ def test_batched_compaction_multi_slab_aliasing_at_boundary():
     for r in range(R):
         depths = torch.zeros(W, dtype=torch.long, device="cuda")
         if r in (6, 13, 19):
-            # Requests straddling the old non-aligned boundaries (26/52/78):
-            # A (col 1) canonical slot equals B (col 3) scattered slot.
-            arena_a, arena_b = 1, 2
-            depths[arena_a] = 1 + arena_b
-            depths[arena_b] = 1 + arena_b
-            accepted_arenas[r, 1] = arena_a
-            accepted_arenas[r, 2] = 0
-            depths[0] = 1
-            accepted_arenas[r, 3] = arena_b
+            # Requests straddling the old non-aligned boundaries (26/52/78 in
+            # the pre-fix tiling). A realistic chain (distinct arenas,
+            # strictly increasing depths) where BOTH nodes are real movers and
+            # A's canonical slot equals B's scattered slot: A (entry 24/52/76,
+            # pre-fix earlier slab) scatters C+1 over B's source, then B (entry
+            # 26/54/78, pre-fix later slab) gathers C+1 -- so the pre-fix
+            # tiling reads A's payload for B. Under request-aligned slabs the
+            # pair stays in one gather->scatter slab and both relocations are
+            # exact.
+            accepted_arenas[r, 1] = 1
+            accepted_arenas[r, 2] = 2
+            accepted_arenas[r, 3] = 0  # B: src C+1 == A's dst C+1
+            depths[1] = 1
+            depths[2] = 2
+            depths[0] = 3
         else:
-            depths[0] = 1
-            depths[1] = 2
             accepted_arenas[r, 1] = 0
             accepted_arenas[r, 2] = 1
+            depths[0] = 1
+            depths[1] = 2
         trees.append(SimpleNamespace(depths=depths))
 
+    num_slots = int(num_computed.max().item()) + W + 2
+    _seed_kv(views, group_specs, block_size, num_slots)
+    torch.cuda.synchronize()
+    initial = buf.clone()
     _old_compact_reference(
         views, group_specs, block_size, num_sampled, accepted_arenas,
         num_computed, block_tables, trees, R,
     )
     torch.cuda.synchronize()
     reference = buf.clone()
-    buf.zero_()
+    buf.copy_(initial)
     torch.cuda.synchronize()
 
     # L=2, max_el=4, itemsize=4 -> row_bytes=32; budget=26*32 -> raw slab 26
@@ -695,25 +726,26 @@ def test_batched_compaction_multi_slab_random_stress():
         for r in range(R):
             n = int(num_sampled[r].item()) - 1
             depths = torch.zeros(W, dtype=torch.long, device="cuda")
+            # Realistic chain: distinct arenas, strictly increasing depths.
+            arena_order = torch.randperm(W)
             for j in range(1, n + 1):
-                arena = torch.randint(0, W, (1,)).item()
+                arena = int(arena_order[j - 1].item())
                 accepted_arenas[r, j] = arena
-                mode = torch.randint(0, 3, (1,)).item()
-                if mode == 0:
-                    depths[arena] = 1 + arena
-                elif mode == 1:
-                    depths[arena] = torch.randint(1, W + 1, (1,)).item()
-                else:
-                    depths[arena] = 1 + torch.randint(0, W, (1,)).item()
+                depths[arena] = j
             trees.append(SimpleNamespace(depths=depths))
-        buf.zero_()
+        _seed_kv(
+            views, group_specs, block_size,
+            int(num_computed.max().item()) + W + 2,
+        )
+        torch.cuda.synchronize()
+        initial = buf.clone()
         _old_compact_reference(
             views, group_specs, block_size, num_sampled, accepted_arenas,
             num_computed, block_tables, trees, R,
         )
         torch.cuda.synchronize()
         reference = buf.clone()
-        buf.zero_()
+        buf.copy_(initial)
         torch.cuda.synchronize()
         # L=2, max_el=4, itemsize=4 -> row_bytes=32; budget=17*32=544 ->
         # raw slab 17, W-aligned to 15 (multiple of 5) < a=200 (multi-slab).
