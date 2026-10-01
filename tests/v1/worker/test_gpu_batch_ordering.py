@@ -21,7 +21,11 @@ import torch
 
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm.v1.worker.gpu.model_runner import GPUModelRunner, sort_batch_req_ids
+from vllm.v1.worker.gpu.model_runner import (
+    GPUModelRunner,
+    _resolve_decode_query_len,
+    sort_batch_req_ids,
+)
 from vllm.v1.worker.utils import get_uniform_decode_token_count
 
 
@@ -246,3 +250,20 @@ def test_no_speculator_dispatches_on_query_length_alone():
         "these speculators classify a decode batch by query length alone; use "
         f"get_uniform_decode_token_count instead: {offenders}"
     )
+
+
+def test_df2t_decode_query_len_uses_tree_decode_width():
+    """The target verify decode width for df2t is the tree budget ceiling
+    (``1 + max_tree_budget``), decoupled from ``num_speculative_steps``; other
+    methods keep ``steps + bonus``."""
+    df2t_cfg = SimpleNamespace(use_df2t=lambda: True, tree_decode_width=65)
+    assert (
+        _resolve_decode_query_len(df2t_cfg, num_speculative_steps=15, num_new_sampled_per_step=1)
+        == 65
+    )
+    dflash_cfg = SimpleNamespace(use_df2t=lambda: False)
+    assert (
+        _resolve_decode_query_len(dflash_cfg, num_speculative_steps=15, num_new_sampled_per_step=1)
+        == 16
+    )
+    assert _resolve_decode_query_len(None, num_speculative_steps=7, num_new_sampled_per_step=1) == 8

@@ -224,6 +224,20 @@ def _df2t_verify_rejects_logprobs(sampling_states, idx_mapping_np) -> None:
         )
 
 
+def _resolve_decode_query_len(
+    speculative_config, num_speculative_steps: int, num_new_sampled_per_step: int
+) -> int:
+    """Resolve the per-request decode query width for the target forward.
+
+    For df2t the target verifies the tree budget ceiling
+    (``tree_decode_width = 1 + max_tree_budget``); every other speculative
+    method verifies ``num_speculative_steps + num_new_sampled_per_step``.
+    """
+    if speculative_config is not None and speculative_config.use_df2t():
+        return speculative_config.tree_decode_width
+    return num_speculative_steps + num_new_sampled_per_step
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -481,9 +495,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config, self.model, self.encoder_cache, self.device
         )
 
-        self.decode_query_len = (
-            self.num_speculative_steps
-            + self.model_state.num_new_sampled_tokens_per_step
+        self.decode_query_len = _resolve_decode_query_len(
+            self.speculative_config,
+            self.num_speculative_steps,
+            self.model_state.num_new_sampled_tokens_per_step,
         )
 
         if self.parallel_config.enable_batch_sharded_sampling:
