@@ -74,3 +74,28 @@ def test_triton_builder_clamps_when_fewer_prefixes():
         n = out.num_nodes[r].item()
         assert n == n_expect
     _assert_matches(out, scores, cand, B, L)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_triton_builder_strides_by_drafter_steps():
+    """The drafter emits ``num_speculative_steps`` score rows per request while
+    the tree depth cap L can be smaller (default ``min(num_spec,
+    block_size-1)``). The kernel must read every request's rows at stride
+    ``num_steps``, not ``L``, or requests r > 0 read another request's scores —
+    which silently collapses acceptance on the first non-first decode.
+
+    With num_steps=12 > L=5 over R=3 requests, the kernel reads only the first
+    L rows of each request; the reference matches on the same first-L rows.
+    """
+    R, S, K, B, L = 3, 12, 4, 10, 5
+    scores, cand = _raw_inputs(R, S, K, B, seed=7)
+    tb = TreeBuilder(R, L, K, B, num_steps=S)
+    out = tb.build(scores, cand)
+    for r in range(R):
+        ref = build_tree_naive(scores[r].cpu()[:L], cand[r].cpu()[:L], B, L)
+        n = out.num_nodes[r].item()
+        assert n == len(ref.token_ids)
+        assert torch.equal(out.token_ids[r, :n].cpu(), ref.token_ids)
+        assert torch.equal(out.depths[r, :n].cpu(), ref.depths)
+        assert torch.equal(out.parents[r, :n].cpu(), ref.parents)
+        assert torch.equal(out.words[r, :n].cpu(), ref.words)

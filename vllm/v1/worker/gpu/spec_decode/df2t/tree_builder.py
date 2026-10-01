@@ -25,14 +25,20 @@ from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import TreeDraft
 
 
 @triton.jit
-def _heap_above(mass_ptr, pmass_ptr, path_ptr, hbase, ix, jx):
+def _heap_above(mass_ptr, pmass_ptr, path_ptr, hbase, ix, jx, UMSB):
     im = tl.load(mass_ptr + hbase + ix)
     ip = tl.load(pmass_ptr + hbase + ix)
     it = tl.load(path_ptr + hbase + ix)
     jm = tl.load(mass_ptr + hbase + jx)
     jp = tl.load(pmass_ptr + hbase + jx)
     jt = tl.load(path_ptr + hbase + jx)
-    return (im > jm) | ((im == jm) & ((ip > jp) | ((ip == jp) & (it < jt))))
+    # Paths are packed 4 bits per depth; a depth-16 path can set the int64 sign
+    # bit, so compare paths as UNSIGNED (flip the top bit in both) to keep the
+    # tie-break order deterministic and independent of the sign wrap. For
+    # depths <= 15 the top bit is never set and the flip is order-preserving.
+    return (im > jm) | (
+        (im == jm) & ((ip > jp) | ((ip == jp) & ((it ^ UMSB) < (jt ^ UMSB))))
+    )
 
 
 @triton.jit
@@ -64,8 +70,8 @@ def _heap_swap(
 
 @triton.jit
 def _tree_builder_kernel(
-    scores_ptr,  # [R, L, K, K] f32 transition logits
-    cand_ptr,  # [R, L, K] i64 successor token ids
+    scores_ptr,  # [R, S, K, K] f32 transition logits
+    cand_ptr,  # [R, S, K] i64 successor token ids
     token_out_ptr,  # [R, B] i64
     depth_out_ptr,  # [R, B] i64
     parent_out_ptr,  # [R, B] i64
@@ -80,9 +86,11 @@ def _tree_builder_kernel(
     heap_prank_ptr,  # [R, TWO_B] i32
     heap_pa_ptr,  # [R, TWO_B] i32
     heap_path_ptr,  # [R, TWO_B] i64
+    UMSB,  # int64 constant 1 << 63 for unsigned path comparison
     B: tl.constexpr,  # emitted nodes per request (<= 64)
     K: tl.constexpr,  # successors per row (<= 16)
-    L: tl.constexpr,  # depth cap (<= 15)
+    L: tl.constexpr,  # depth cap (<= 16)
+    S: tl.constexpr,  # score rows per request (drafter block depth)
     TWO_B: tl.constexpr,
     KP: tl.constexpr,  # next power of two >= K
 ):
@@ -93,16 +101,19 @@ def _tree_builder_kernel(
 
     # Pass 1: log-softmax each (depth, predecessor) row and sort successors
     # best-first so rank r means the r-th largest transition log-probability.
+    # The drafter emits S rows per request (block depth) while the tree is
+    # capped at L <= S rows, so scores/cand stride by S even though only the
+    # first L rows are consumed.
     for d in tl.range(L):
         for p in tl.range(K):
             vals = tl.load(
-                scores_ptr + (row * L + d) * (K * K) + p * K + col,
+                scores_ptr + (row * S + d) * (K * K) + p * K + col,
                 mask=ok,
                 other=float("-inf"),
             ).to(tl.float32)
             mx = tl.max(vals, axis=0)
             logp = (vals - mx) - tl.log(tl.sum(tl.exp(vals - mx), axis=0))
-            cands = tl.load(cand_ptr + (row * L + d) * K + col, mask=ok, other=0)
+            cands = tl.load(cand_ptr + (row * S + d) * K + col, mask=ok, other=0)
 
             remaining = tl.where(ok, logp, float("-inf"))
             srow = (row * (L * K) + d * K + p) * K
@@ -170,12 +181,24 @@ def _tree_builder_kernel(
             # reads stay inside the populated entries.
             if li < hn:  # noqa: SIM102
                 if _heap_above(
-                    heap_mass_ptr, heap_pmass_ptr, heap_path_ptr, hbase, li, largest
+                    heap_mass_ptr,
+                    heap_pmass_ptr,
+                    heap_path_ptr,
+                    hbase,
+                    li,
+                    largest,
+                    UMSB,
                 ):
                     largest = li
             if ri < hn:  # noqa: SIM102
                 if _heap_above(
-                    heap_mass_ptr, heap_pmass_ptr, heap_path_ptr, hbase, ri, largest
+                    heap_mass_ptr,
+                    heap_pmass_ptr,
+                    heap_path_ptr,
+                    hbase,
+                    ri,
+                    largest,
+                    UMSB,
                 ):
                     largest = ri
             if largest == i:
@@ -226,7 +249,13 @@ def _tree_builder_kernel(
             while up_go & (iu > 0):
                 pu = (iu - 1) // 2
                 if _heap_above(
-                    heap_mass_ptr, heap_pmass_ptr, heap_path_ptr, hbase, iu, pu
+                    heap_mass_ptr,
+                    heap_pmass_ptr,
+                    heap_path_ptr,
+                    hbase,
+                    iu,
+                    pu,
+                    UMSB,
                 ):
                     _heap_swap(
                         heap_mass_ptr,
@@ -264,7 +293,13 @@ def _tree_builder_kernel(
             while up_go & (iu > 0):
                 pu = (iu - 1) // 2
                 if _heap_above(
-                    heap_mass_ptr, heap_pmass_ptr, heap_path_ptr, hbase, iu, pu
+                    heap_mass_ptr,
+                    heap_pmass_ptr,
+                    heap_path_ptr,
+                    hbase,
+                    iu,
+                    pu,
+                    UMSB,
                 ):
                     _heap_swap(
                         heap_mass_ptr,
@@ -310,14 +345,25 @@ class TreeBuilder:
         K: int,
         B: int,
         device: torch.device | str = "cuda",
+        num_steps: int | None = None,
     ) -> None:
-        assert L <= 15, "tree depth cap must be <= 15 for the packed path"
+        assert L <= 16, "tree depth cap must be <= 16 for the packed path"
         assert K <= 16, "successor count must be <= 16"
         assert B <= 64, "emitted nodes must be <= 64"
+        if num_steps is None:
+            num_steps = L
+        # The drafter emits num_steps score rows per request; the tree is
+        # capped at L <= num_steps of them. The kernel reads scores/cand at
+        # stride num_steps so a request never reads another request's rows.
+        assert num_steps >= L, "score rows (drafter depth) must cover the depth cap"
         self.max_num_reqs = max_num_reqs
         self.L = L
         self.K = K
         self.B = B
+        self.num_steps = num_steps
+        # Paths are packed 4 bits per depth; a depth-16 path can set the int64
+        # sign bit, so the heap tie-break compares paths unsignedly.
+        self._umsb = -9223372036854775808  # 1 << 63 as int64
         two_b = 2 * B
         self._kp = triton.next_power_of_2(K)
         dev = torch.device(device)
@@ -392,9 +438,11 @@ class TreeBuilder:
             self._heap_prank,
             self._heap_pa,
             self._heap_path,
+            self._umsb,
             B=self.B,
             K=self.K,
             L=self.L,
+            S=self.num_steps,
             TWO_B=2 * self.B,
             KP=self._kp,
             num_warps=1,

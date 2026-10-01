@@ -41,7 +41,12 @@ class DF2TSpeculator(DFlash2Speculator):
         # to fail closed if a consumer ever asks for more rows than were built.
         self._last_built_rows = 0
         self.tree_builder = TreeBuilder(
-            self.max_num_reqs, self.max_depth, self.top_k, self.nodes_max, device
+            self.max_num_reqs,
+            self.max_depth,
+            self.top_k,
+            self.nodes_max,
+            device,
+            num_steps=self.num_speculative_steps,
         )
         # The draft-token carry (scheduler drain slots) is the static tree
         # width wide (``tree_decode_width - 1 == nodes_max``), so a tree wider
