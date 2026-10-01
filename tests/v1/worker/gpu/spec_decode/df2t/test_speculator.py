@@ -266,3 +266,43 @@ def test_get_latest_tree_drafts_fails_closed_on_over_read() -> None:
     assert spec._last_built_rows == 1
     with pytest.raises(RuntimeError, match="over-read"):
         spec.get_latest_tree_drafts(num_reqs)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_generate_draft_fails_closed_on_width_below_carry():
+    """A per-request verify width B_i below the full carry width must fail
+    loudly, not silently leave the previous step's branches stale in the
+    drained columns: the scheduler drains ``num_draft_rows_per_req ==
+    nodes_max`` slots unconditionally, so a partial overwrite would carry stale
+    tree nodes into the next verify (the seam the confidence-head per-request
+    width will hit first). The static path asserts width == the carry width."""
+    from vllm.v1.worker.gpu.spec_decode.df2t.speculator import DF2TSpeculator
+
+    torch.manual_seed(0)
+    spec = init_speculator(_fake_vllm_config(), torch.device("cuda"))
+    assert isinstance(spec, DF2TSpeculator)
+    num_reqs, steps = 2, spec.num_speculative_steps
+    K = spec.top_k
+    assert spec.draft_tokens.shape[1] == spec.nodes_max == 64
+
+    spec._run_model = lambda *_a, **_k: torch.randn(num_reqs * steps, 64, device="cuda")
+    spec.model = SimpleNamespace(
+        compute_candidates=lambda h: (
+            torch.randint(0, 512, (h.shape[0], K), device="cuda"),
+            torch.randn(h.shape[0], K, device="cuda"),
+        )
+    )
+    spec._score_candidates = lambda cand, unary, hidden: torch.randn(
+        cand.shape[0], cand.shape[1], K, K, device="cuda"
+    )
+    spec.sample_indices[: num_reqs * steps] = torch.arange(
+        num_reqs * steps, device="cuda"
+    )
+
+    # A narrower per-request width (e.g. a degraded/head budget) below the
+    # carry width must raise at the width guard, never write a partial row.
+    spec.budget = SimpleNamespace(
+        shape=lambda *_: (spec.max_depth, spec.nodes_max - 1)
+    )
+    with pytest.raises(AssertionError, match="carry width"):
+        spec._generate_draft(num_reqs, num_reqs * steps, None, None, None)

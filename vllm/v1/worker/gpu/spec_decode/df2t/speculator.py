@@ -153,12 +153,21 @@ class DF2TSpeculator(DFlash2Speculator):
         # tree's nodes_max-wide buffers so the degraded budget can never slice
         # out of bounds).
         width = self.budget.shape(None)[1]
+        # The scheduler drains num_draft_rows_per_req == nodes_max slots
+        # unconditionally, so a per-request width below the carry width would
+        # leave the previous step's branches stale in the un-overwritten
+        # columns — fail loudly now, before the confidence-head per-request
+        # width can hit it. The write below overwrites the whole carry row.
+        assert width == self.draft_tokens.shape[1], (
+            "df2t per-request verify width must fill the full draft-carry "
+            f"width (got {width} != {self.draft_tokens.shape[1]})"
+        )
         draft = tree.token_ids[:num_reqs, :width].clone()
         pad = torch.arange(width, dtype=torch.int64, device=self.device).unsqueeze(
             0
         ) >= tree.num_nodes[:num_reqs].to(torch.int64).unsqueeze(-1)
         draft.masked_fill_(pad, self.parallel_drafting_token_id)
-        self.draft_tokens[:num_reqs, :width] = draft
+        self.draft_tokens[:num_reqs] = draft
 
     def get_latest_tree_drafts(self, num_reqs: int) -> "list[TreeDraft | None] | None":
         """Per-request ``TreeDraft`` for the current batch, or None pre-first-step.
