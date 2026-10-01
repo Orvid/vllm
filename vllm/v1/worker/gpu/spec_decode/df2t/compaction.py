@@ -208,22 +208,21 @@ def _scatter_zero_all_kernel(
     in_plan = i < a
     do = tl.load(enter_ptr + idx, mask=in_plan, other=0)
     stale = tl.load(stale_ptr + idx, mask=in_plan, other=0)
-    base_dst = tl.load(layer_off_ptr + layer) + tl.load(
-        dst_ptr + idx, mask=in_plan, other=0
-    ) * el
-    base_src = tl.load(layer_off_ptr + layer) + tl.load(
-        src_ptr + idx, mask=in_plan, other=0
-    ) * el
+    base_dst = (
+        tl.load(layer_off_ptr + layer)
+        + tl.load(dst_ptr + idx, mask=in_plan, other=0) * el
+    )
+    base_src = (
+        tl.load(layer_off_ptr + layer)
+        + tl.load(src_ptr + idx, mask=in_plan, other=0) * el
+    )
     offs = tl.arange(0, BLOCK)
     for start in tl.range(0, el, BLOCK):
         inc = start + offs
         valid = (inc < el) & in_plan
-        val = tl.load(
-            scratch_ptr + (i * L + layer) * MAX_EL + inc, mask=valid, other=0
-        )
+        val = tl.load(scratch_ptr + (i * L + layer) * MAX_EL + inc, mask=valid, other=0)
         tl.store(kv_base + base_dst + inc, val, mask=valid & (do != 0))
         tl.store(kv_base + base_src + inc, 0, mask=valid & (stale != 0))
-
 
 
 def compact_accepted_chain(
@@ -415,8 +414,7 @@ class Df2tKVCompaction:
             bs = getattr(group.kv_cache_spec, "block_size", None)
             if bs is None:
                 raise ValueError(
-                    "df2t compaction needs a uniform block_size on every "
-                    "kv-cache group"
+                    "df2t compaction needs a uniform block_size on every kv-cache group"
                 )
             if not isinstance(bs, int):
                 # UniformTypeKVCacheSpecs resolves to an int block_size.
@@ -470,31 +468,21 @@ class Df2tKVCompaction:
             _, num_heads, _, content = layer.shape
             self._elems[idx] = num_heads * content
             self._layer_off[idx] = (
-                (layer.data_ptr() - base_layer.data_ptr()) // itemsize
-            )
+                layer.data_ptr() - base_layer.data_ptr()
+            ) // itemsize
         self._kv_base = base_layer
         self._base_ptr = base_layer.data_ptr()
         self._max_el = int(self._elems.max().item())
 
         # Persistent plan + scratch. Rows [G, max_a]; details via g_stride.
-        self._src = torch.zeros(
-            self._G, self._max_a, dtype=torch.int64, device=device
-        )
-        self._dst = torch.zeros(
-            self._G, self._max_a, dtype=torch.int64, device=device
-        )
-        self._enter = torch.zeros(
-            self._G, self._max_a, dtype=torch.int8, device=device
-        )
-        self._stale = torch.zeros(
-            self._G, self._max_a, dtype=torch.int8, device=device
-        )
+        self._src = torch.zeros(self._G, self._max_a, dtype=torch.int64, device=device)
+        self._dst = torch.zeros(self._G, self._max_a, dtype=torch.int64, device=device)
+        self._enter = torch.zeros(self._G, self._max_a, dtype=torch.int8, device=device)
+        self._stale = torch.zeros(self._G, self._max_a, dtype=torch.int8, device=device)
         self._tree_depth = torch.zeros(
             max_num_reqs, W, dtype=torch.int64, device=device
         )
-        self._has_tree = torch.zeros(
-            max_num_reqs, dtype=torch.bool, device=device
-        )
+        self._has_tree = torch.zeros(max_num_reqs, dtype=torch.bool, device=device)
         # Scratch rows are (entry, layer) slabs of MAX_EL elements; a slab
         # holds all layers of one contiguous run of entries so the batch is
         # covered in a small number of (slab, L)-grid launches.

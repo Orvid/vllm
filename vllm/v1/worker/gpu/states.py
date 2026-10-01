@@ -29,9 +29,7 @@ class RequestState:
         # the drafter block depth ``num_speculative_steps``; every other method
         # carries ``num_speculative_steps`` drafts.
         self.num_draft_tokens = (
-            num_draft_tokens
-            if num_draft_tokens is not None
-            else num_speculative_steps
+            num_draft_tokens if num_draft_tokens is not None else num_speculative_steps
         )
         self.req_id_to_index: dict[str, int] = {}
         self.index_to_req_id: dict[int, str] = {}

@@ -414,15 +414,12 @@ def _rand_chain_batch(R, W, num_blocks, seed):
     make "bit-identical to the reference" a racy, ill-defined assertion.
     """
     torch.manual_seed(seed)
-    num_sampled = torch.randint(
-        1, W + 1, (R,), dtype=torch.int32, device="cuda"
-    )
+    num_sampled = torch.randint(1, W + 1, (R,), dtype=torch.int32, device="cuda")
     accepted_arenas = torch.full((R, W + 1), -1, dtype=torch.long, device="cuda")
-    num_computed = torch.randint(0, num_blocks - 2, (R,), dtype=torch.int32,
-                                 device="cuda")
-    block_tables = torch.randint(
-        0, num_blocks, (R, 6), dtype=torch.long, device="cuda"
+    num_computed = torch.randint(
+        0, num_blocks - 2, (R,), dtype=torch.int32, device="cuda"
     )
+    block_tables = torch.randint(0, num_blocks, (R, 6), dtype=torch.long, device="cuda")
     trees = []
     for r in range(R):
         n = int(num_sampled[r].item()) - 1
@@ -437,8 +434,15 @@ def _rand_chain_batch(R, W, num_blocks, seed):
 
 
 def _old_compact_reference(
-    views_by_name, group_specs, block_size, num_sampled, accepted_arenas,
-    num_computed, block_tables, trees, R,
+    views_by_name,
+    group_specs,
+    block_size,
+    num_sampled,
+    accepted_arenas,
+    num_computed,
+    block_tables,
+    trees,
+    R,
 ):
     for r in range(R):
         n_sampled = int(num_sampled[r].item())
@@ -448,9 +452,7 @@ def _old_compact_reference(
         arenas = accepted_arenas[r, 1 : 1 + n_acc]
         depths = trees[r].depths[arenas.clamp(min=0)]
         c = int(num_computed[r].item())
-        max_delta = max(
-            int(1 + arenas.max().item()), int(depths.max().item())
-        )
+        max_delta = max(int(1 + arenas.max().item()), int(depths.max().item()))
         slots = c + torch.arange(max_delta + 1, device="cuda")
         for grp in group_specs:
             layer_views = [views_by_name[n] for n, _, _ in grp if n in views_by_name]
@@ -512,9 +514,7 @@ def test_batched_compaction_matches_reference_bit_identical():
         reference = buf.clone()
         buf.copy_(initial)
         torch.cuda.synchronize()
-        compactor = Df2tKVCompaction(
-            R, W, views, groups, torch.device("cuda")
-        )
+        compactor = Df2tKVCompaction(R, W, views, groups, torch.device("cuda"))
         compactor.compact(
             num_sampled,
             accepted_arenas,
@@ -664,8 +664,15 @@ def test_batched_compaction_multi_slab_aliasing_at_boundary():
     torch.cuda.synchronize()
     initial = buf.clone()
     _old_compact_reference(
-        views, group_specs, block_size, num_sampled, accepted_arenas,
-        num_computed, block_tables, trees, R,
+        views,
+        group_specs,
+        block_size,
+        num_sampled,
+        accepted_arenas,
+        num_computed,
+        block_tables,
+        trees,
+        R,
     )
     torch.cuda.synchronize()
     reference = buf.clone()
@@ -679,8 +686,12 @@ def test_batched_compaction_multi_slab_aliasing_at_boundary():
         assert compactor._slab < R * W  # the batch really spans slabs
         assert compactor._slab % W == 0  # and tiles at request boundaries
         compactor.compact(
-            num_sampled, accepted_arenas, trees, num_computed,
-            [block_tables] * len(groups), R,
+            num_sampled,
+            accepted_arenas,
+            trees,
+            num_computed,
+            [block_tables] * len(groups),
+            R,
         )
     torch.cuda.synchronize()
     assert torch.equal(buf, reference)
@@ -718,10 +729,8 @@ def test_batched_compaction_multi_slab_random_stress():
     for seed in range(4):
         torch.manual_seed(seed)
         num_computed = torch.arange(R, dtype=torch.int32, device="cuda") * 8
-        num_sampled = torch.randint(2, W + 1, (R,), dtype=torch.int32,
-                                    device="cuda")
-        accepted_arenas = torch.full((R, W + 1), -1, dtype=torch.long,
-                                     device="cuda")
+        num_sampled = torch.randint(2, W + 1, (R,), dtype=torch.int32, device="cuda")
+        accepted_arenas = torch.full((R, W + 1), -1, dtype=torch.long, device="cuda")
         trees = []
         for r in range(R):
             n = int(num_sampled[r].item()) - 1
@@ -734,14 +743,23 @@ def test_batched_compaction_multi_slab_random_stress():
                 depths[arena] = j
             trees.append(SimpleNamespace(depths=depths))
         _seed_kv(
-            views, group_specs, block_size,
+            views,
+            group_specs,
+            block_size,
             int(num_computed.max().item()) + W + 2,
         )
         torch.cuda.synchronize()
         initial = buf.clone()
         _old_compact_reference(
-            views, group_specs, block_size, num_sampled, accepted_arenas,
-            num_computed, block_tables, trees, R,
+            views,
+            group_specs,
+            block_size,
+            num_sampled,
+            accepted_arenas,
+            num_computed,
+            block_tables,
+            trees,
+            R,
         )
         torch.cuda.synchronize()
         reference = buf.clone()
@@ -750,14 +768,16 @@ def test_batched_compaction_multi_slab_random_stress():
         # L=2, max_el=4, itemsize=4 -> row_bytes=32; budget=17*32=544 ->
         # raw slab 17, W-aligned to 15 (multiple of 5) < a=200 (multi-slab).
         with _force_slab_budget(17 * 32):
-            compactor = Df2tKVCompaction(
-                R, W, views, groups, torch.device("cuda")
-            )
+            compactor = Df2tKVCompaction(R, W, views, groups, torch.device("cuda"))
             assert compactor._slab < R * W
             assert compactor._slab % W == 0
             compactor.compact(
-                num_sampled, accepted_arenas, trees, num_computed,
-                [block_tables] * len(groups), R,
+                num_sampled,
+                accepted_arenas,
+                trees,
+                num_computed,
+                [block_tables] * len(groups),
+                R,
             )
         torch.cuda.synchronize()
         assert torch.equal(buf, reference), f"seed {seed} diverged"

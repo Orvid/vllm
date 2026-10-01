@@ -160,9 +160,7 @@ class DF2TSpeculator(DFlash2Speculator):
         draft.masked_fill_(pad, self.parallel_drafting_token_id)
         self.draft_tokens[:num_reqs, :width] = draft
 
-    def get_latest_tree_drafts(
-        self, num_reqs: int
-    ) -> "list[TreeDraft | None] | None":
+    def get_latest_tree_drafts(self, num_reqs: int) -> "list[TreeDraft | None] | None":
         """Per-request ``TreeDraft`` for the current batch, or None pre-first-step.
 
         Reads the tree straight from the persistent ``TreeBuilder`` buffers,
@@ -223,10 +221,9 @@ class DF2TSpeculator(DFlash2Speculator):
         """
         b = self.tree_builder
         n = b.num_nodes[:num_reqs].clamp(0, self.nodes_max)
-        tail = (
-            torch.arange(self.nodes_max, device=self.device).unsqueeze(0)
-            >= n.unsqueeze(1)
-        )
+        tail = torch.arange(self.nodes_max, device=self.device).unsqueeze(
+            0
+        ) >= n.unsqueeze(1)
         b.token_ids[:num_reqs].masked_fill_(tail, self.parallel_drafting_token_id)
         b.depths[:num_reqs].masked_fill_(tail, 0)
         b.parents[:num_reqs].masked_fill_(tail, -2)

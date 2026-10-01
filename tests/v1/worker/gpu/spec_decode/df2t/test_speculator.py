@@ -190,9 +190,7 @@ def test_generate_draft_budget_below_num_spec_degrades_not_crashes() -> None:
     num_reqs, steps = 3, spec.num_speculative_steps
     K = spec.top_k
 
-    spec._run_model = lambda *_a, **_k: torch.randn(
-        num_reqs * steps, 64, device="cuda"
-    )
+    spec._run_model = lambda *_a, **_k: torch.randn(num_reqs * steps, 64, device="cuda")
     spec.model = SimpleNamespace(
         compute_candidates=lambda h: (
             torch.randint(0, 512, (h.shape[0], K), device="cuda"),
@@ -240,9 +238,7 @@ def test_get_latest_tree_drafts_fails_closed_on_over_read() -> None:
     num_reqs, steps = 2, spec.num_speculative_steps
     K = spec.top_k
 
-    spec._run_model = lambda *_a, **_k: torch.randn(
-        num_reqs * steps, 64, device="cuda"
-    )
+    spec._run_model = lambda *_a, **_k: torch.randn(num_reqs * steps, 64, device="cuda")
     spec.model = SimpleNamespace(
         compute_candidates=lambda h: (
             torch.randint(0, 512, (h.shape[0], K), device="cuda"),
