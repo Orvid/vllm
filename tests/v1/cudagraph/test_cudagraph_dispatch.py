@@ -50,6 +50,11 @@ def _create_vllm_config(
     mock_config.parallel_config = ParallelConfig()
     mock_config.speculative_config = None  # No speculative decoding
     mock_config.num_speculative_tokens = 0
+    # Mirror the real VllmConfig.uniform_decode_query_len derivation (no
+    # speculation: 1 + 0), since the dispatcher now reads the property.
+    mock_config.uniform_decode_query_len = (
+        VllmConfig.uniform_decode_query_len.fget(mock_config)
+    )
     if not lora_config:
         mock_config.lora_config = None
     else:

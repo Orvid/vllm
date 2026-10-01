@@ -33,7 +33,7 @@ class CudagraphDispatcher:
     def __init__(self, vllm_config: VllmConfig):
         self.vllm_config = vllm_config
         self.compilation_config = vllm_config.compilation_config
-        self.uniform_decode_query_len = 1 + self.vllm_config.num_speculative_tokens
+        self.uniform_decode_query_len = vllm_config.uniform_decode_query_len
 
         # Dict to store valid cudagraph dispatching keys.
         self.cudagraph_keys: dict[CUDAGraphMode, set[BatchDescriptor]] = {

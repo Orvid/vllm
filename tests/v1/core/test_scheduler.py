@@ -15,6 +15,8 @@ from vllm.config import (
     ECTransferConfig,
     KVTransferConfig,
     ModelConfig,
+    ObservabilityConfig,
+    ParallelConfig,
     SchedulerConfig,
     SpeculativeConfig,
     VllmConfig,
@@ -7350,3 +7352,117 @@ def test_diffusion_read_deferral_keeps_a_longer_pp_wait():
     # Deferring this step alone would ask for 6. The PP wait to 7 stands.
     assert "read" not in scheduler.schedule().num_scheduled_tokens
     assert read.next_decode_eligible_step == 7
+
+
+def _df2t_draft_model_config() -> SimpleNamespace:
+    """A lightweight df2t draft ``ModelConfig`` stand-in exposing the surface
+    ``SpeculativeConfig._validate_df2t`` reads (architecture, hf_config with
+    ``dflash_config.block_size``)."""
+    return SimpleNamespace(
+        architectures=["DFlash2DraftModel"],
+        hf_config=SimpleNamespace(
+            num_hidden_layers=2,
+            block_size=16,
+            dflash_config=SimpleNamespace(block_size=16),
+        ),
+        model="draft",
+        max_model_len=128,
+        verify_with_parallel_config=lambda *_: None,
+        compute_hash=lambda: "draft-hash",
+    )
+
+
+def _df2t_scheduler(tmp_path) -> Scheduler:
+    """A real :class:`Scheduler` over a df2t ``SpeculativeConfig`` with the tree
+    budget ceiling raised above the drafter block depth (num_spec = 15,
+    max_tree_budget = 64)."""
+    import json
+
+    root = tmp_path / "qwen3-0.6b"
+    root.mkdir()
+    (root / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3ForCausalLM"],
+                "model_type": "qwen3",
+                "hidden_size": 128,
+                "intermediate_size": 256,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 32,
+                "vocab_size": 512,
+                "max_position_embeddings": 2048,
+                "tie_word_embeddings": True,
+                "bos_token_id": 0,
+                "eos_token_id": 1,
+            }
+        )
+    )
+    model_config = ModelConfig(
+        model=str(root),
+        trust_remote_code=True,
+        skip_tokenizer_init=True,
+        max_model_len=2048,
+    )
+    scheduler_config = SchedulerConfig(
+        max_num_seqs=8,
+        max_num_active_seqs=8,
+        max_num_batched_tokens=8192,
+        max_model_len=2048,
+        enable_chunked_prefill=True,
+        async_scheduling=True,
+        is_encoder_decoder=False,
+        watermark=0.0,
+        policy="fcfs",
+    )
+    speculative_config = SpeculativeConfig(
+        method="df2t",
+        num_speculative_tokens=15,
+        draft_model_config=_df2t_draft_model_config(),
+    )
+    obs_config = ObservabilityConfig(per_request_spec_decode_metrics="none")
+    vllm_config = VllmConfig(
+        scheduler_config=scheduler_config,
+        model_config=model_config,
+        cache_config=CacheConfig(
+            block_size=16,
+            gpu_memory_utilization=0.9,
+            cache_dtype="auto",
+        ),
+        parallel_config=ParallelConfig(),
+        speculative_config=speculative_config,
+        observability_config=obs_config,
+        kv_transfer_config=None,
+        ec_transfer_config=None,
+    )
+    kv_cache_spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=10000,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["layer"], kv_cache_spec)],
+    )
+    vllm_config.cache_config.num_gpu_blocks = 10000
+    register_all_kvcache_specs(vllm_config)
+    return Scheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        block_size=16,
+        log_stats=True,
+        structured_output_manager=StructuredOutputManager(vllm_config),
+    )
+
+
+def test_df2t_scheduler_reserves_tree_budget_ceiling(tmp_path):
+    """The df2t scheduler's per-request draft-row count and KV lookahead come
+    from the TREE BUDGET ceiling (``max_tree_budget`` / ``1 + max_tree_budget``),
+    not from ``num_speculative_tokens`` — so a tree wider than the drafter
+    block depth (B > L) has reserved slots to verify into."""
+    scheduler = _df2t_scheduler(tmp_path)
+    spec = scheduler.vllm_config.speculative_config
+    assert scheduler.num_spec_tokens == spec.max_tree_budget
+    assert scheduler.num_lookahead_tokens == spec.tree_lookahead
+    assert scheduler.num_spec_tokens > spec.num_speculative_tokens
+
