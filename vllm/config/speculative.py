@@ -2001,10 +2001,14 @@ class SpeculativeConfig:
         """
         if not self.use_df2t():
             return 0
-        budget = self.tree_budget if self.tree_budget is not None else self.max_tree_budget
-        # Mirrors ``budget.resolve_nodes_max`` (only the scalar knobs, no head);
-        # the worker's BudgetPolicy is the source for the runtime width.
-        nodes_max = max(_DEFAULT_FLOOR, min(self.nodes_ceiling, round(self.tree_s * budget)))
+        budget = (
+            self.tree_budget if self.tree_budget is not None else self.max_tree_budget
+        )
+        # Mirrors ``budget.resolve_nodes_max`` (only the scalar knobs, no
+        # head); the worker's BudgetPolicy is the source for the runtime width.
+        nodes_max = max(
+            _DEFAULT_FLOOR, min(self.nodes_ceiling, round(self.tree_s * budget))
+        )
         return 1 + nodes_max
 
     @property
@@ -2090,7 +2094,9 @@ class SpeculativeConfig:
         # ``num_speculative_tokens`` is the drafter block depth (position
         # count); where its block-derived value appears, name it as such so its
         # role (a DRAFER depth, never a verify width) is unmistakeable.
-        drafter_block_depth = (int(block_size) - 1) if block_size else self.num_speculative_tokens
+        drafter_block_depth = (
+            (int(block_size) - 1) if block_size else self.num_speculative_tokens
+        )
         if self.max_tree_depth is None:
             self.max_tree_depth = min(self.num_speculative_tokens, drafter_block_depth)
         if self.max_tree_depth > self.num_speculative_tokens:

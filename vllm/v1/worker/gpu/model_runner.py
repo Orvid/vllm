@@ -2255,10 +2255,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # exhausted (or a narrower per-request width) leaves inert padding
             # in columns [num_nodes, b) that must never be matched.
             live = getattr(tree, "num_nodes", None)
-            if live is not None:
-                live = int(live.reshape(-1)[0])
-            else:
-                live = b
+            live = int(live.reshape(-1)[0]) if live is not None else b
             num_nodes[r] = max(0, min(live, b))
             target[r, : 1 + b] = processed[cu[r] : cu[r + 1]]
 

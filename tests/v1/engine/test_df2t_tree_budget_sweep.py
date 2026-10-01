@@ -28,7 +28,11 @@ if not current_platform.is_cuda():
 
 _TARGET = "/mnt/e/dev/Qwen3-0.6B"
 _DRAFT = "/mnt/e/dev/Qwen3-0.6B-DF2T-CATMIX-B16"
-_PROMPTS = ["The capital of France is", "The largest planet is", "Photosynthesis converts"]
+_PROMPTS = [
+    "The capital of France is",
+    "The largest planet is",
+    "Photosynthesis converts",
+]
 _MAX_TOKENS = 24
 _DEPTH = 12
 
@@ -75,7 +79,9 @@ def _run_engine(*, tree_budget: int) -> tuple[list[list[int]], list[dict]]:
         )
         ids = [list(o.outputs[0].token_ids) for o in out]
         metrics = [
-            o.outputs[0].spec_decode_metrics.to_dict() if o.outputs[0].spec_decode_metrics else {}
+            o.outputs[0].spec_decode_metrics.to_dict()
+            if o.outputs[0].spec_decode_metrics
+            else {}
             for o in out
         ]
         return ids, metrics

@@ -224,9 +224,8 @@ class DF2TSpeculator(DFlash2Speculator):
         b = self.tree_builder
         n = b.num_nodes[:num_reqs].clamp(0, self.nodes_max)
         tail = (
-            torch.arange(self.nodes_max, device=self.device).unsqueeze(0) >= n.unsqueeze(
-                1
-            )
+            torch.arange(self.nodes_max, device=self.device).unsqueeze(0)
+            >= n.unsqueeze(1)
         )
         b.token_ids[:num_reqs].masked_fill_(tail, self.parallel_drafting_token_id)
         b.depths[:num_reqs].masked_fill_(tail, 0)
