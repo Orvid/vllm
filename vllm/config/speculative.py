@@ -1926,19 +1926,27 @@ class SpeculativeConfig:
         EAGLE3               eagle3        No       0
         P-EAGLE              eagle3        Yes      K - 1
         DFlash               dflash        Yes      K
-        DF2T                 df2t          Yes      K
+        DF2T                 df2t          Yes      max_tree_budget
         DSpark               dspark        Yes      K - 1
         MTP                  mtp           No       0
         N-gram               ngram         No       0
         Draft model          draft_model   No       1
         PARD                 draft_model   Yes      K
         ==================== ============= ======== ================
+
+        DF2T reserves the TREE BUDGET ``max_tree_budget`` draft slots, NOT
+        ``num_speculative_tokens``: the tree can be wider than the drafter
+        block depth (B > L), and buffering to the ceiling is what makes that
+        expressible.
         """
         num_draft_tokens = self.num_speculative_tokens
 
-        if self.use_dflash() or self.use_df2t():
-            # DFlash (and df2t's DFlash drafter) uses one bonus query followed
-            # by K mask queries.
+        if self.use_df2t():
+            # DF2T verifies a tree of up to max_tree_budget nodes.
+            return self.max_tree_budget
+
+        if self.use_dflash():
+            # DFlash uses one bonus query followed by K mask queries.
             return num_draft_tokens
 
         if self.parallel_drafting:
@@ -1955,6 +1963,48 @@ class SpeculativeConfig:
             return 1
 
         return 0
+
+    @property
+    def tree_lookahead(self) -> int:
+        """DF2T scheduler reservation / KV-arena ceiling: ``1 + max_tree_budget``.
+
+        Every df2t request reserves this many KV slots past its scheduled tokens
+        (the ``num_lookahead_tokens`` the scheduler and warmup read), independent
+        of the drafter block depth and of the per-request verify width. Buffering
+        to the ceiling is what makes a tree wider than ``max_tree_depth``
+        (B > L) expressible. Non-df2t methods return 0 (the base property
+        derives their lookahead from ``num_speculative_tokens``).
+        """
+        if not self.use_df2t():
+            return 0
+        return 1 + self.max_tree_budget
+
+    @property
+    def tree_decode_width(self) -> int:
+        """DF2T uniform decode-graph width: ``1 + max_tree_budget``.
+
+        The target verify forward runs ``1 + B_i`` rows per tree request, padded
+        to this ceiling across the captured decode graphs. This is the only df2t
+        quantity that sizes the decode graph; it never derives from
+        ``num_speculative_tokens``. Non-df2t methods return 0 (the decode width
+        is ``1 + num_speculative_tokens`` in the base property).
+        """
+        if not self.use_df2t():
+            return 0
+        return 1 + self.max_tree_budget
+
+    @property
+    def num_draft_rows_per_req(self) -> int:
+        """Per-request draft rows the scheduler reserves/schedules each decode
+        step.
+
+        For df2t this is the tree budget ceiling ``max_tree_budget`` (a tree may
+        be wider than the drafter block depth); for every other speculative
+        method it is ``num_speculative_tokens``.
+        """
+        if self.use_df2t():
+            return self.max_tree_budget
+        return self.num_speculative_tokens
 
     def use_gemma4_mtp(self) -> bool:
         return (

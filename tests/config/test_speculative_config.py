@@ -112,6 +112,55 @@ def test_df2t_tree_knobs_change_hash():
     assert base.compute_hash() != modified.compute_hash()
 
 
+def test_df2t_tree_lookahead_is_budget_ceiling():
+    """The df2t scheduler reservation / KV-arena ceiling is ``1 +
+    max_tree_budget`` (the tree lookahead), never derived from
+    ``num_speculative_tokens``."""
+    cfg = _build()
+    cfg._validate_df2t()
+    assert cfg.max_tree_budget == 64
+    assert cfg.tree_lookahead == 1 + cfg.max_tree_budget
+    assert cfg.tree_decode_width == 1 + cfg.max_tree_budget
+    assert cfg.tree_lookahead == cfg.tree_decode_width
+    assert cfg.tree_lookahead != 1 + cfg.num_speculative_tokens
+
+
+def test_df2t_max_num_new_slots_for_drafting_is_tree_budget():
+    """df2t reserves the tree budget ``max_tree_budget`` draft slots per
+    request, so a tree wider than the drafter's block depth (B > L) is
+    expressible. The dflash path keeps reserving ``num_speculative_tokens``."""
+    cfg = _build()
+    cfg._validate_df2t()
+    assert cfg.max_num_new_slots_for_drafting == cfg.max_tree_budget
+    assert cfg.max_num_new_slots_for_drafting != cfg.num_speculative_tokens
+    cfg.method = "dflash"
+    assert cfg.max_num_new_slots_for_drafting == cfg.num_speculative_tokens
+
+
+def test_df2t_num_draft_rows_per_req_is_tree_budget():
+    """The scheduler's per-request draft-row count decouples from
+    ``num_speculative_tokens`` for df2t; other speculative methods keep their
+    own draft positions."""
+    cfg = _build()
+    cfg._validate_df2t()
+    assert cfg.num_draft_rows_per_req == cfg.max_tree_budget
+    cfg.method = "dflash"
+    assert cfg.num_draft_rows_per_req == cfg.num_speculative_tokens
+
+
+def test_df2t_accepts_tree_depth_sixteen():
+    """Stage-0 target L=16 must configure: the depth cap is validated only
+    against the drafter block depth, so a drafter with block_size >= 17 admits
+    max_tree_depth == 16 (the builder widens its packed path accordingly)."""
+    cfg = _build(num_speculative_tokens=16, max_tree_depth=16)
+    draft = _draft_cfg()
+    draft.hf_config.dflash_config.block_size = 17  # type: ignore[attr-defined]
+    cfg.draft_model_config = draft  # type: ignore[assignment]
+    cfg._validate_df2t()
+    assert cfg.max_tree_depth == 16
+    assert cfg.max_tree_depth <= cfg.num_speculative_tokens
+
+
 def test_df2t_hash_covers_aux_hidden_state_layers():
     """df2t drafting consumes aux hidden states (DFlash2 flow, like dflash/
     dspark); the compute-graph hash must reflect the draft's

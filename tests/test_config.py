@@ -1982,11 +1982,12 @@ def test_df2t_defaults_to_async_scheduling(tmp_path: Path):
     assert cfg.scheduler_config.async_scheduling is True
 
 
-def test_df2t_reserves_dflash_drafter_slots(tmp_path: Path):
-    """df2t drafts with the DFlash drafter (one bonus query + K mask queries
-    written past the target's query range), so it must reserve the same KV
-    lookahead and drafting slots as dflash. Without the lookahead the drafter
-    writes through unallocated block-table entries into other requests' KV."""
+def test_df2t_reserves_tree_budget_drafter_slots(tmp_path: Path):
+    """df2t drafts with the DFlash drafter, so the KL/lookahead reservation and
+    the draft-slot ceiling come from the TREE BUDGET (``1 + max_tree_budget``
+    / ``max_tree_budget``), never from ``num_speculative_tokens``. Buffering to
+    the ceiling is what lets a tree wider than the drafter block depth
+    (B > L) verify."""
     parallel_config = ParallelConfig(distributed_executor_backend="uni")
     speculative_config = _df2t_speculative_config(tmp_path, parallel_config)
     cfg = VllmConfig(
@@ -2001,9 +2002,13 @@ def test_df2t_reserves_dflash_drafter_slots(tmp_path: Path):
             mode=CompilationMode.NONE, cudagraph_mode=CUDAGraphMode.NONE
         ),
     )
+    mtb = speculative_config.max_tree_budget
     k = speculative_config.num_speculative_tokens
-    assert cfg.num_lookahead_tokens == k + 1
-    assert speculative_config.max_num_new_slots_for_drafting == k
+    assert cfg.num_lookahead_tokens == 1 + mtb
+    assert cfg.uniform_decode_query_len == 1 + mtb
+    assert speculative_config.max_num_new_slots_for_drafting == mtb
+    # The ceiling no longer tracks the drafter block depth.
+    assert mtb > k
 
 
 def test_df2t_cudagraphs_are_not_config_rejected(tmp_path: Path):
