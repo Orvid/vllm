@@ -167,6 +167,55 @@ def test_tree_verifier_matches_reference_greedy(device):
         assert sampled[r, : int(num_sampled[r].item())].tolist() == out_lists[r]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_builder_partial_tree_wide_buffer_verifies_losslessly():
+    """A tree that exhausts its prefix space emits fewer live nodes than its
+    buffer width; the STASHED 30-wide row must still verify losslessly because
+    the verifier delimits by the live ``num_nodes`` (the inert tail is never
+    matched). This is the per-request-width-below-ceiling decoupling: a
+    request whose B_i is below the step's graph width lays out fewer nodes and
+    the padding is inert."""
+    from vllm.v1.worker.gpu.spec_decode.df2t.tree_builder import TreeBuilder
+
+    torch.manual_seed(0)
+    R, L, K, B, vocab = 2, 2, 2, 30, 128
+    # K=2, L=2 -> 2 + 4 = 6 live prefixes, far below the B=30 buffer.
+    scores = torch.randn(R, L, K, K, device="cuda")
+    cand = torch.randint(0, vocab, (R, L, K), device="cuda")
+    tb = TreeBuilder(R, L, K, B)
+    tree = tb.build(scores, cand)
+    assert tree.num_nodes is not None
+    assert tree.token_ids.shape == (R, B)
+    for r in range(R):
+        assert int(tree.num_nodes[r].item()) <= 6 < B
+        # Sanitize exactly as get_latest_tree_drafts does (inert tail).
+        live = int(tree.num_nodes[r].item())
+        tree.token_ids[r, live:].fill_(0)
+        tree.depths[r, live:].zero_()
+        tree.parents[r, live:].fill_(-2)
+        tree.words[r, live:].zero_()
+
+        target_logits = torch.randn(1, 1 + B, vocab, device="cuda")
+        tv = TreeVerifier(1, B, vocab, torch.device("cuda"))
+        sampled, num_sampled = tv(
+            target_logits,
+            tree.token_ids[r : r + 1],
+            tree.parents[r : r + 1],
+            tree.num_nodes[r : r + 1],
+            greedy=True,
+        )
+        # Lossless: the reference on the live rows matches the tree verify.
+        out_ref, nacc_ref = tree_verify_reference(
+            target_logits[0],
+            tree.token_ids[r, :live].cpu(),
+            tree.parents[r, :live].cpu(),
+            greedy=True,
+        )
+        n = int(num_sampled[0].item())
+        assert n - 1 == nacc_ref
+        assert sampled[0, :n].tolist() == out_ref
+
+
 @pytest.mark.parametrize("device", _DEVICES)
 def test_tree_verifier_matches_reference_sampling(device):
     if device == "cuda" and not torch.cuda.is_available():

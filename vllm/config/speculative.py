@@ -21,6 +21,10 @@ from vllm.utils.hashing import safe_hash
 from vllm.utils.import_utils import LazyLoader, has_arctic_inference
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+# Minimum df2t node budget when no asset-driven bound is configured (matches
+# ``df2t.budget._DEFAULT_FLOOR`` so the config and the runtime agree).
+_DEFAULT_FLOOR = 1
+
 if TYPE_CHECKING:
     from transformers import PreTrainedConfig
 
@@ -1981,29 +1985,38 @@ class SpeculativeConfig:
 
     @property
     def tree_decode_width(self) -> int:
-        """DF2T uniform decode-graph width: ``1 + max_tree_budget``.
+        """DF2T uniform decode-graph width: ``1 + nodes_max``.
 
-        The target verify forward runs ``1 + B_i`` rows per tree request, padded
-        to this ceiling across the captured decode graphs. This is the only df2t
-        quantity that sizes the decode graph; it never derives from
-        ``num_speculative_tokens``. Non-df2t methods return 0 (the decode width
-        is ``1 + num_speculative_tokens`` in the base property).
+        The target verify forward runs ``1 + B_i`` rows per tree request; with
+        no confidence head every request verifies the static ``nodes_max``
+        budget, so the uniform graph is ``1 + nodes_max`` (`a static run with a
+        single B still produces the uniform 1+B graph`). ``nodes_max`` itself
+        is the ``s``-scaled ``tree_budget`` clamped to ``[floor, ceiling]`` —
+        this never derives from ``num_speculative_tokens``. The graph may be
+        captured up to ``tree_lookahead``; the ceiling reservation is the
+        separate quantity above.
+
+        Non-df2t methods return 0 (the decode width is ``1 +
+        num_speculative_tokens`` in the base property).
         """
         if not self.use_df2t():
             return 0
-        return 1 + self.max_tree_budget
+        budget = self.tree_budget if self.tree_budget is not None else self.max_tree_budget
+        # Mirrors ``budget.resolve_nodes_max`` (only the scalar knobs, no head);
+        # the worker's BudgetPolicy is the source for the runtime width.
+        nodes_max = max(_DEFAULT_FLOOR, min(self.nodes_ceiling, round(self.tree_s * budget)))
+        return 1 + nodes_max
 
     @property
     def num_draft_rows_per_req(self) -> int:
-        """Per-request draft rows the scheduler reserves/schedules each decode
-        step.
+        """Per-request draft rows the scheduler schedules/pads each decode step.
 
-        For df2t this is the tree budget ceiling ``max_tree_budget`` (a tree may
-        be wider than the drafter block depth); for every other speculative
+        For df2t this is the static tree width ``nodes_max`` (a tree wider than
+        the drafter block depth is expressible); for every other speculative
         method it is ``num_speculative_tokens``.
         """
         if self.use_df2t():
-            return self.max_tree_budget
+            return self.tree_decode_width - 1
         return self.num_speculative_tokens
 
     def use_gemma4_mtp(self) -> bool:

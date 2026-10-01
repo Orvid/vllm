@@ -7456,13 +7456,14 @@ def _df2t_scheduler(tmp_path) -> Scheduler:
 
 
 def test_df2t_scheduler_reserves_tree_budget_ceiling(tmp_path):
-    """The df2t scheduler's per-request draft-row count and KV lookahead come
-    from the TREE BUDGET ceiling (``max_tree_budget`` / ``1 + max_tree_budget``),
-    not from ``num_speculative_tokens`` — so a tree wider than the drafter
-    block depth (B > L) has reserved slots to verify into."""
+    """The df2t scheduler's per-request draft-row count is the static tree
+    width and its KV lookahead is the TREE BUDGET ceiling (``1 +
+    max_tree_budget``), both decoupled from ``num_speculative_tokens`` — so a
+    tree wider than the drafter block depth (B > L) has slots to verify into,
+    while the arena reservation buffers to the ceiling."""
     scheduler = _df2t_scheduler(tmp_path)
     spec = scheduler.vllm_config.speculative_config
-    assert scheduler.num_spec_tokens == spec.max_tree_budget
-    assert scheduler.num_lookahead_tokens == spec.tree_lookahead
+    assert scheduler.num_spec_tokens == spec.tree_decode_width - 1
     assert scheduler.num_spec_tokens > spec.num_speculative_tokens
+    assert scheduler.num_lookahead_tokens == spec.tree_lookahead
 

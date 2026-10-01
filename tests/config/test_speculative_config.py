@@ -120,9 +120,20 @@ def test_df2t_tree_lookahead_is_budget_ceiling():
     cfg._validate_df2t()
     assert cfg.max_tree_budget == 64
     assert cfg.tree_lookahead == 1 + cfg.max_tree_budget
-    assert cfg.tree_decode_width == 1 + cfg.max_tree_budget
-    assert cfg.tree_lookahead == cfg.tree_decode_width
     assert cfg.tree_lookahead != 1 + cfg.num_speculative_tokens
+
+
+def test_df2t_decode_width_is_static_budget_not_ceiling():
+    """The uniform decode-graph width is ``1 + nodes_max`` (the static per-
+    deployment budget), which equals ``1 + max_tree_budget`` only when the
+    budget fills the ceiling. With a smaller tree_budget the decode width stays
+    the budget, while the reservation/lookahead keeps the ceiling."""
+    cfg = _build(tree_budget=16, max_tree_budget=64)
+    cfg._validate_df2t()
+    assert cfg.tree_decode_width == 17
+    assert cfg.tree_lookahead == 65
+    assert cfg.num_draft_rows_per_req == 16
+    assert cfg.max_num_new_slots_for_drafting == 64
 
 
 def test_df2t_max_num_new_slots_for_drafting_is_tree_budget():
@@ -137,13 +148,14 @@ def test_df2t_max_num_new_slots_for_drafting_is_tree_budget():
     assert cfg.max_num_new_slots_for_drafting == cfg.num_speculative_tokens
 
 
-def test_df2t_num_draft_rows_per_req_is_tree_budget():
+def test_df2t_num_draft_rows_per_req_is_static_budget():
     """The scheduler's per-request draft-row count decouples from
-    ``num_speculative_tokens`` for df2t; other speculative methods keep their
-    own draft positions."""
+    ``num_speculative_tokens`` for df2t (it is the static tree width); other
+    speculative methods keep their own draft positions."""
     cfg = _build()
     cfg._validate_df2t()
-    assert cfg.num_draft_rows_per_req == cfg.max_tree_budget
+    assert cfg.num_draft_rows_per_req == cfg.tree_decode_width - 1
+    assert cfg.num_draft_rows_per_req == 64
     cfg.method = "dflash"
     assert cfg.num_draft_rows_per_req == cfg.num_speculative_tokens
 
