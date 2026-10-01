@@ -31,7 +31,7 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat
-from vllm.config import VllmConfig
+from vllm.config import SpeculativeConfig, VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
@@ -225,13 +225,18 @@ def _df2t_verify_rejects_logprobs(sampling_states, idx_mapping_np) -> None:
 
 
 def _resolve_decode_query_len(
-    speculative_config, num_speculative_steps: int, num_new_sampled_per_step: int
+    speculative_config: SpeculativeConfig | None,
+    num_speculative_steps: int,
+    num_new_sampled_per_step: int,
 ) -> int:
     """Resolve the per-request decode query width for the target forward.
 
-    For df2t the target verifies the tree budget ceiling
-    (``tree_decode_width = 1 + max_tree_budget``); every other speculative
-    method verifies ``num_speculative_steps + num_new_sampled_per_step``.
+    For df2t the target verifies the static tree width
+    (``tree_decode_width = 1 + nodes_max``, the uniform decode-graph width,
+    which can exceed the drafter block depth); the reservation ceiling ``1 +
+    max_tree_budget`` (``tree_lookahead``) is a separate buffer quantity and
+    never the query width. Every other speculative method verifies
+    ``num_speculative_steps + num_new_sampled_per_step``.
     """
     if speculative_config is not None and speculative_config.use_df2t():
         return speculative_config.tree_decode_width

@@ -701,9 +701,11 @@ class VllmConfig:
         from the other would under-size EAGLE by a full request width, which is
         the failure this property exists to prevent.
 
-        DF2T is the exception: its decode graph verifies the tree budget
-        ceiling ``1 + max_tree_budget`` (``tree_decode_width``) rows, never the
-        drafter block depth.
+        DF2T is the exception: its decode graph is the uniform STATIC tree
+        width ``1 + nodes_max`` (``tree_decode_width``), never the drafter
+        block depth. The graph may be captured up to the reservation ceiling
+        ``1 + max_tree_budget`` (``tree_lookahead``); that ceiling is a buffer,
+        not the query width.
         """
         speculative_config = self.speculative_config
         if (
