@@ -77,6 +77,33 @@ def test_triton_builder_clamps_when_fewer_prefixes():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_triton_builder_matches_naive_at_depth_sixteen():
+    """The Stage-0 L=16 depth cap packs: a 16-deep path can set the int64 sign
+    bit, so the heap tie-break must compare paths unsignedly; on real (rarely
+    tying) scores the emitted tree still matches the torch reference."""
+    R, L, K, B = 2, 16, 4, 12
+    scores, cand = _raw_inputs(R, L, K, B, seed=11)
+    tb = TreeBuilder(R, L, K, B)
+    out = tb.build(scores, cand)
+    _assert_matches(out, scores, cand, B, L)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_triton_builder_depth_sixteen_is_deterministic_across_builds():
+    """L=16 must not flip order between builds from sign-wrapped paths: the
+    same input always emits the same tree (the heap path comparison is
+    unsigned-consistent)."""
+    R, L, K, B = 2, 16, 5, 16
+    scores, cand = _raw_inputs(R, L, K, B, seed=13)
+    tb = TreeBuilder(R, L, K, B)
+    a = tb.build(scores, cand)
+    b = tb.build(scores, cand)
+    assert torch.equal(a.token_ids, b.token_ids)
+    assert torch.equal(a.num_nodes, b.num_nodes)
+    assert torch.equal(a.words, b.words)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_triton_builder_strides_by_drafter_steps():
     """The drafter emits ``num_speculative_steps`` score rows per request while
     the tree depth cap L can be smaller (default ``min(num_spec,
