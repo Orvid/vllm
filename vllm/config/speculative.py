@@ -2087,9 +2087,12 @@ class SpeculativeConfig:
         block_size = getattr(
             getattr(hf_config, "dflash_config", {}), "block_size", None
         )
-        trained = (int(block_size) - 1) if block_size else self.num_speculative_tokens
+        # ``num_speculative_tokens`` is the drafter block depth (position
+        # count); where its block-derived value appears, name it as such so its
+        # role (a DRAFER depth, never a verify width) is unmistakeable.
+        drafter_block_depth = (int(block_size) - 1) if block_size else self.num_speculative_tokens
         if self.max_tree_depth is None:
-            self.max_tree_depth = min(self.num_speculative_tokens, trained)
+            self.max_tree_depth = min(self.num_speculative_tokens, drafter_block_depth)
         if self.max_tree_depth > self.num_speculative_tokens:
             raise ValueError("max_tree_depth must be <= num_speculative_tokens")
 
