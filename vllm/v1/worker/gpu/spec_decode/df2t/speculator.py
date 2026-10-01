@@ -25,6 +25,13 @@ class DF2TSpeculator(DFlash2Speculator):
         self.max_depth = d.max_tree_depth
         self.tree_budget = d.tree_budget
         self.budget = BudgetPolicy.from_config(d)
+        # Naming scheme (WS-A): ``num_speculative_tokens`` is the drafter block
+        # depth (the number of POSITIONS the drafter emits per step); the tree
+        # budget quantities below are the ONLY drivers of the verify width /
+        # decode shape / reservation, never ``num_speculative_tokens``.
+        self.drafter_block_depth = self.num_speculative_steps
+        self.tree_decode_width = d.tree_decode_width
+        self.tree_lookahead = d.tree_lookahead
         # Static budget this cut: nodes_max == the s=1.0 policy value, so the
         # no-head path matches d.get_num_draft_tokens() exactly.
         self.nodes_max = self.budget.resolve_nodes_max()
@@ -35,6 +42,16 @@ class DF2TSpeculator(DFlash2Speculator):
         self._last_built_rows = 0
         self.tree_builder = TreeBuilder(
             self.max_num_reqs, self.max_depth, self.top_k, self.nodes_max, device
+        )
+        # The draft-token carry (scheduler drain slots) is the static tree
+        # width wide (``tree_decode_width - 1 == nodes_max``), so a tree wider
+        # than the drafter block depth (B > L) has slots to schedule; the base
+        # class sized it to the drafter depth.
+        self.draft_tokens = torch.zeros(
+            self.max_num_reqs,
+            self.tree_decode_width - 1,
+            dtype=torch.int64,
+            device=device,
         )
         # Arena -> accepted-chain depth table for the drafter's next-step
         # context (row ``r`` column ``arena`` = chain depth of the accepted
@@ -122,17 +139,21 @@ class DF2TSpeculator(DFlash2Speculator):
         self._last_tree = tree
         self._last_built_rows = num_reqs
 
-        # The scheduler reserves num_speculative_steps draft slots per request.
-        # Fill them with the highest-priority tree node token ids (emit order)
-        # and pad with the parallel-drafting mask token where a request's tree
-        # is shorter than the slot width.
-        width = self.num_speculative_steps
+        # The scheduler reserves tree_decode_width - 1 draft slots per request
+        # (the static tree width). Fill them with the highest-priority tree
+        # node token ids (emit order) and pad with the parallel-drafting mask
+        # token where a request's tree is shorter than its verify width. The
+        # per-request width B_i comes from the budget policy (no confidence
+        # head this cut: c_t = None -> B_i = nodes_max, clamped inside the
+        # tree's nodes_max-wide buffers so the degraded budget can never slice
+        # out of bounds).
+        width = self.budget.shape(None)[1]
         draft = tree.token_ids[:num_reqs, :width].clone()
         pad = torch.arange(width, dtype=torch.int64, device=self.device).unsqueeze(
             0
         ) >= tree.num_nodes[:num_reqs].to(torch.int64).unsqueeze(-1)
         draft.masked_fill_(pad, self.parallel_drafting_token_id)
-        self.draft_tokens[:num_reqs] = draft
+        self.draft_tokens[:num_reqs, :width] = draft
 
     def get_latest_tree_drafts(
         self, num_reqs: int
@@ -168,6 +189,7 @@ class DF2TSpeculator(DFlash2Speculator):
                 "were built. The static path builds exactly one tree per "
                 "batch; a mismatch means draft/tree timing diverged."
             )
+        self._sanitize_tree_tails(num_reqs)
         b = self.tree_builder
         return [
             TreeDraft(
@@ -180,6 +202,31 @@ class DF2TSpeculator(DFlash2Speculator):
             )
             for i in range(num_reqs)
         ]
+
+    def _sanitize_tree_tails(self, num_reqs: int) -> None:
+        """Overwrite each request's tree columns past its live node count with
+        inert values (mask-token ids, depth 0, parent -2, zero ancestor words).
+
+        The builder always writes ``nodes_max`` columns per row but only
+        ``num_nodes`` of them are live (a tree whose prefix space is exhausted,
+        or a future per-request width below the ceiling). Without this, columns
+        ``[num_nodes, nodes_max)`` carry stale values from an earlier, wider
+        build — a would-be spurious node the verify mask, the tree verify, or
+        the verify layout could consult. ``get_latest_tree_drafts`` sanitizes
+        before stashing so every consumer (eager or a replayed drafter graph)
+        sees a clean tail.
+        """
+        b = self.tree_builder
+        n = b.num_nodes[:num_reqs].clamp(0, self.nodes_max)
+        tail = (
+            torch.arange(self.nodes_max, device=self.device).unsqueeze(0) >= n.unsqueeze(
+                1
+            )
+        )
+        b.token_ids[:num_reqs].masked_fill_(tail, self.parallel_drafting_token_id)
+        b.depths[:num_reqs].masked_fill_(tail, 0)
+        b.parents[:num_reqs].masked_fill_(tail, -2)
+        b.words[:num_reqs].masked_fill_(tail, 0)
 
     def _mark_draft_graph_built(self, rows: int) -> None:
         """Record the row count a replayed drafter graph just wrote."""

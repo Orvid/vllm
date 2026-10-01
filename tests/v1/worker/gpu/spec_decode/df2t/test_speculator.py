@@ -39,13 +39,14 @@ def _fake_draft_model_config() -> SimpleNamespace:
     )
 
 
-def _fake_vllm_config() -> Any:
+def _fake_vllm_config(tree_budget: int | None = None, tree_s: float = 1.0) -> Any:
     """Minimal config that lets the DF2T speculator ``__init__`` run on CPU."""
     speculative_config = SpeculativeConfig(
         method="df2t",
         num_speculative_tokens=15,
         draft_model_config=_fake_draft_model_config(),
-        tree_budget=None,
+        tree_budget=tree_budget,
+        tree_s=tree_s,
     )
     model_config = SimpleNamespace(
         model="some/model",
@@ -77,6 +78,13 @@ def test_init_speculator_routes_df2t() -> None:
 
     assert isinstance(spec, DF2TSpeculator)
     assert spec.num_query_per_req == 1 + 15
+    # The drafter forward shape stays num_spec (the block depth)...
+    assert spec.drafter_block_depth == 15
+    # ...but the draft-carry width is the tree budget, so a tree wider than the
+    # drafter block depth is expressible.
+    assert spec.nodes_max == 64
+    assert spec.tree_decode_width == 65
+    assert spec.draft_tokens.shape[1] == 64
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -149,14 +157,69 @@ def test_generate_draft_builds_tree_and_draft_tokens() -> None:
         assert torch.equal(drafts[r].depths[:n].cpu(), ref.depths)
         assert torch.equal(drafts[r].parents[:n].cpu(), ref.parents)
 
-    # draft_tokens width == the scheduler's per-step width; each request's draft
-    # row is its tree's highest-priority node token ids (emit order). Padding
-    # only kicks in when the tree emits fewer nodes than the width (never here).
-    width = spec.num_speculative_steps
+    # draft_tokens width == the scheduler's per-request carry width (the tree
+    # budget nodes_max, NOT the drafter block depth); each request's draft row
+    # is its tree's highest-priority node token ids (emit order). Padding only
+    # kicks in when the tree emits fewer nodes than the width (never here).
+    width = spec.nodes_max
+    assert spec.draft_tokens.shape[1] == width
     for r in range(num_reqs):
         n = int(drafts[r].num_nodes.item())
         assert n >= width, "the tree must fill the per-step draft width"
         assert torch.equal(spec.draft_tokens[r], drafts[r].token_ids[:width])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_generate_draft_budget_below_num_spec_degrades_not_crashes() -> None:
+    """WS-A finding [7]: tree_budget x tree_s below num_speculative_tokens must
+    hit the v5 §3.4 degradation order (below L, shorten to a chain of
+    ``nodes_max``), not slice ``tree.token_ids`` past its ``nodes_max``-wide
+    buffer. With tree_budget=16, tree_s=0.5 -> nodes_max=8 < num_spec=15, the
+    build writes an 8-wide chain and the draft carry pads it to the tree-budget
+    width."""
+    from vllm.v1.worker.gpu.spec_decode.df2t.speculator import DF2TSpeculator
+
+    torch.manual_seed(0)
+    spec = init_speculator(
+        _fake_vllm_config(tree_budget=16, tree_s=0.5), torch.device("cuda")
+    )
+    assert isinstance(spec, DF2TSpeculator)
+    assert spec.nodes_max == 8
+    assert spec.num_speculative_steps == 15
+    assert spec.draft_tokens.shape[1] == spec.nodes_max
+    num_reqs, steps = 3, spec.num_speculative_steps
+    K = spec.top_k
+
+    spec._run_model = lambda *_a, **_k: torch.randn(
+        num_reqs * steps, 64, device="cuda"
+    )
+    spec.model = SimpleNamespace(
+        compute_candidates=lambda h: (
+            torch.randint(0, 512, (h.shape[0], K), device="cuda"),
+            torch.randn(h.shape[0], K, device="cuda"),
+        )
+    )
+    spec._score_candidates = lambda cand, unary, hidden: torch.randn(
+        cand.shape[0], cand.shape[1], K, K, device="cuda"
+    )
+    spec.sample_indices[: num_reqs * steps] = torch.arange(
+        num_reqs * steps, device="cuda"
+    )
+
+    spec._generate_draft(num_reqs, num_reqs * steps, None, None, None)
+
+    drafts = spec.latest_tree_drafts
+    assert drafts is not None and len(drafts) == num_reqs
+    # The degraded shape (L, B) = (nodes_max, nodes_max) caps the tree depth at
+    # the budget; each request emits exactly nodes_max nodes with depth <= B.
+    for r in range(num_reqs):
+        assert drafts[r].num_nodes is not None
+        n = int(drafts[r].num_nodes.item())
+        assert n == spec.nodes_max
+        depths = drafts[r].depths[:n].cpu().tolist()
+        assert max(depths) <= spec.nodes_max, "degraded tree is depth-capped at B"
+        # The carried draft row is the tree token ids, no out-of-bounds slice.
+        assert torch.equal(spec.draft_tokens[r][:n], drafts[r].token_ids[:n])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

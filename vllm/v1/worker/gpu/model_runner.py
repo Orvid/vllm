@@ -2235,7 +2235,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 continue
             token_ids[r, :b] = tree.token_ids
             parents[r, :b] = tree.parents
-            num_nodes[r] = b
+            # Delimit by the per-request LIVE node count (the builder's
+            # num_nodes), not the buffer width: a tree whose prefix space is
+            # exhausted (or a narrower per-request width) leaves inert padding
+            # in columns [num_nodes, b) that must never be matched.
+            live = getattr(tree, "num_nodes", None)
+            if live is not None:
+                live = int(live.reshape(-1)[0])
+            else:
+                live = b
+            num_nodes[r] = max(0, min(live, b))
             target[r, : 1 + b] = processed[cu[r] : cu[r + 1]]
 
         ss = self.sampler.sampling_states
