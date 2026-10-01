@@ -362,6 +362,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             vocab_size=self.vocab_size,
             device=self.device,
             num_prefill_lookahead=num_prefill_lookahead,
+            # df2t carries tree_decode_width - 1 drafts per request (the tree
+            # width, which can exceed the drafter block depth); other methods
+            # carry num_speculative_steps.
+            num_draft_tokens=self._draft_carry_width(),
         )
         self.adaptive_verification: AdaptiveVerificationManager | None = None
         # df2t flex tree verify: per-request mask inputs staged by
@@ -432,6 +436,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
         self.req_states.max_model_len = max_model_len
+
+    def _draft_carry_width(self) -> int:
+        """Per-request draft-carry width (the drain slots the scheduler reads).
+
+        df2t carries ``tree_decode_width - 1`` (the tree width, which can
+        exceed the drafter block depth); other speculative methods carry
+        ``num_speculative_steps``.
+        """
+        if self.speculative_config is not None and self.speculative_config.use_df2t():
+            return self.speculative_config.num_draft_rows_per_req
+        return self.num_speculative_steps
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         tasks: list[SupportedTask] = []

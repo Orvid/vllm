@@ -47,13 +47,19 @@ def _run_engine(
             "model": _DRAFT,
             "num_speculative_tokens": 15,
             "tree_attention_backend": "flex",
+            # Keep the batch budget small enough that two requests actually
+            # overlap in the async queue under the tree-budget reservation
+            # (each decode reserves tree_budget new slots per request).
+            "tree_budget": 32,
+            "max_tree_budget": 32,
+            "nodes_ceiling": 32,
         }
     llm = LLM(
         model=_TARGET,
         speculative_config=speculative_config,
         enforce_eager=True,
         async_scheduling=async_scheduling,
-        max_num_batched_tokens=16,
+        max_num_batched_tokens=192,
         max_model_len=192,
         dtype="float32",
         gpu_memory_utilization=0.45,

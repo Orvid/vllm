@@ -16,6 +16,7 @@ class RequestState:
         vocab_size: int,
         device: torch.device,
         num_prefill_lookahead: int = 1,
+        num_draft_tokens: int | None = None,
     ):
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
@@ -23,7 +24,15 @@ class RequestState:
         self.num_speculative_steps = num_speculative_steps
         self.vocab_size = vocab_size
         self.device = device
-
+        # The per-request draft-carry width. For df2t this is the tree width
+        # (``num_draft_rows_per_req = tree_decode_width - 1``), which can exceed
+        # the drafter block depth ``num_speculative_steps``; every other method
+        # carries ``num_speculative_steps`` drafts.
+        self.num_draft_tokens = (
+            num_draft_tokens
+            if num_draft_tokens is not None
+            else num_speculative_steps
+        )
         self.req_id_to_index: dict[str, int] = {}
         self.index_to_req_id: dict[int, str] = {}
         self.free_indices = list(range(max_num_reqs))
@@ -72,7 +81,7 @@ class RequestState:
         # Draft tokens.
         self.draft_tokens = torch.zeros(
             self.max_num_reqs,
-            self.num_speculative_steps,
+            self.num_draft_tokens,
             dtype=torch.int64,
             device=device,
         )
