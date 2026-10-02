@@ -190,6 +190,7 @@ def build_flex_tree_mask(
             # context/anchor/treeless rows and ``C + depth`` for tree nodes:
             # a pure slot-distance window would mis-window the depth-decoupled
             # node rows (siblings at mirrored depths).
+            assert depths is not None, "a windowed flex tree mask requires depths"
             is_treeless = words[r, 0] == 0
             q_pos = torch.where(
                 is_treeless,
