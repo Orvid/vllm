@@ -71,6 +71,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import (
     DraftTokenIds,
     ECConnectorOutput,
+    LogprobsTensors,
     ModelRunnerOutput,
     StashedTree,
 )
@@ -146,6 +147,7 @@ from vllm.v1.worker.gpu.sample.batch_shard import (
     gather_sampler_output,
 )
 from vllm.v1.worker.gpu.sample.logits_processor import build_custom_logits_processors
+from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
@@ -211,17 +213,95 @@ def _validate_df2t_async_tree_carry(
             )
 
 
-def _df2t_verify_rejects_logprobs(sampling_states, idx_mapping_np) -> None:
-    """Fail closed if a df2t request asked for logprobs (not yet supported).
+def _df2t_tree_logprobs(
+    processed: torch.Tensor,
+    sampled: torch.Tensor,
+    num_sampled: torch.Tensor,
+    accepted_arenas: torch.Tensor,
+    cu_np: np.ndarray,
+    state_idx_np: np.ndarray,
+    max_num_logprobs: int,
+    logprobs_mode: str,
+    logprob_token_ids_state=None,
+    max_per_req_token_ids: int = 0,
+) -> LogprobsTensors | None:
+    """Per-emitted-token logprobs for the df2t verify block.
 
-    The df2t tree-verify path does not emit logprobs; a request that asked for
-    them must not get silent empty logprobs back.
+    Each emitted token (accepted path + the terminal/resampled token) was drawn
+    from a specific verify row: the chain-depth-0 token from the anchor row
+    (row ``0``) and the chain-depth-``d`` token (``d >= 1``) from row
+    ``accepted_arenas[r, d] + 1`` — the last accepted node's target row, whose
+    distribution conditions on exactly the accepted-chain prefix of length
+    ``d``. Gathering the log-softmax of the processed rows at those draw rows
+    gives the target logprob of every emitted token, with the same per-request
+    ``num_logprobs + 1`` alternatives and rank semantics the plain sampler
+    reports per generated token.
+
+    Args:
+        processed: ``[total verify rows, vocab]`` fully processed logits.
+        sampled: ``[num_reqs, 1 + B]`` emitted tokens, per request.
+        num_sampled: ``[num_reqs]`` emitted-token count per request.
+        accepted_arenas: ``[num_reqs, 1 + B]`` accepted node arena per chain
+            depth (``-1`` for the anchor and unpadded depths).
+        cu_np: ``[num_reqs + 1]`` cumulative verify-row offset per request.
+        state_idx_np: ``[num_reqs]`` request-state slot per request.
+        max_num_logprobs: batch max of requested logprobs (``NO_LOGPROBS``
+            when none).
+        logprobs_mode: the sampler's ``logprobs_mode``.
+        logprob_token_ids_state: per-request custom ``logprob_token_ids``
+            state (optional).
+        max_per_req_token_ids: max custom logprob token ids per request.
+
+    Returns:
+        ``LogprobsTensors`` over the flattened emitted tokens with
+        ``cu_num_generated_tokens`` partitioning them per request in batch
+        order, or ``None`` when no request asked for logprobs.
+
     """
-    if sampling_states.max_num_logprobs(idx_mapping_np) > NO_LOGPROBS:
-        raise NotImplementedError(
-            "df2t tree verification does not yet emit logprobs; remove "
-            "`logprobs` from the sampling params or disable df2t."
-        )
+    if max_num_logprobs == NO_LOGPROBS:
+        return None
+    num_reqs = len(cu_np) - 1
+    flat_rows: list[int] = []
+    flat_tokens: list[int] = []
+    cu = [0]
+    for r in range(num_reqs):
+        ns = int(num_sampled[r].item())
+        base = int(cu_np[r])
+        acc_row = accepted_arenas[r].tolist()
+        for d in range(ns):
+            arena = acc_row[d]
+            flat_rows.append(base + (arena + 1 if arena >= 0 else 0))
+            flat_tokens.append(int(sampled[r, d].item()))
+        cu.append(cu[-1] + ns)
+    if not flat_rows:
+        return None
+
+    draw_dist = processed[
+        torch.tensor(flat_rows, dtype=torch.long, device=processed.device)
+    ]
+    flat_tokens_t = torch.tensor(
+        flat_tokens, dtype=torch.int64, device=processed.device
+    )
+    state_rows = [
+        int(state_idx_np[r])
+        for r in range(num_reqs)
+        for _ in range(int(num_sampled[r].item()))
+    ]
+    state_map = torch.tensor(
+        state_rows,
+        dtype=torch.int32,
+        device=processed.device,
+    )
+    return compute_topk_scores(
+        draw_dist,
+        max_num_logprobs,
+        flat_tokens_t,
+        cu,
+        logprob_token_ids_state=logprob_token_ids_state,
+        expanded_idx_mapping=state_map,
+        max_per_req_token_ids=max_per_req_token_ids,
+        logits_mode=logprobs_mode in ("raw_logits", "processed_logits"),
+    )
 
 
 def _df2t_chain_context(
@@ -2363,7 +2443,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             target[r, : 1 + b] = processed[cu[r] : cu[r + 1]]
 
         ss = self.sampler.sampling_states
-        _df2t_verify_rejects_logprobs(ss, input_batch.idx_mapping_np)
         idx = input_batch.idx_mapping
         # Only explicitly-seeded requests get a generator; each seeded request
         # keys its generator on the raw seed mixed with its anchor position so
@@ -2398,6 +2477,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.idx_mapping,
             self.sampler.req_states.prefill_len.gpu,
         )
+        # Real per-emitted-token logprobs: each token's target logprob is the
+        # log-softmax of the processed distribution at the row it was drawn
+        # from (the accepted chain context), so a df2t ``logprobs`` request
+        # returns the same per-token logprobs the plain target would.
+        idx_np = input_batch.idx_mapping_np
+        max_logprobs = ss.max_num_logprobs(idx_np)
+        logprobs_tensors = None
+        if max_logprobs > NO_LOGPROBS:
+            assert self.tree_verifier is not None
+            logprobs_tensors = _df2t_tree_logprobs(
+                processed,
+                sampled,
+                num_sampled,
+                self.tree_verifier.accepted_arenas,
+                cu,
+                idx_np,
+                max_logprobs,
+                self.sampler.logprobs_mode,
+                self.sampler.logprob_token_ids_state,
+                self.sampler.logprob_token_ids_state.max_num_token_ids(idx_np),
+            )
         # Accepted-tree KV lives at scattered C+1+arena slots; move it to the
         # canonical C+depth slots so the next step's position-addressed attention
         # reads the accepted chain (not garbage).
@@ -2405,7 +2505,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
         return SamplerOutput(
             sampled_token_ids=sampled,
-            logprobs_tensors=None,
+            logprobs_tensors=logprobs_tensors,
             num_nans=num_nans,
             num_sampled=num_sampled,
             num_rejected=num_rejected,

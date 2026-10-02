@@ -72,20 +72,65 @@ def _compute_tree_depths(parents: torch.Tensor) -> torch.Tensor:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_df2t_verify_rejects_logprobs_requests():
-    """A df2t request that asks for logprobs must fail closed, never silently
-    return empty logprobs (the tree-verify path does not emit them yet)."""
+def test_df2t_verify_supports_logprobs():
+    """The df2t verify path no longer rejects ``logprobs`` requests.
+
+    The old fail-closed raise (``_df2t_verify_rejects_logprobs``) is gone: a
+    df2t request that asks for logprobs gets real per-token logprobs and one
+    that does not asks for none. The draw-row mapping, logprob values and
+    per-request CSR layout are pinned in ``test_df2t_tree_logprobs.py``.
+    """
     import numpy as np
 
-    from vllm.v1.worker.gpu.model_runner import _df2t_verify_rejects_logprobs
-    from vllm.v1.worker.gpu.sample.states import SamplingStates
+    from vllm.v1.worker.gpu.model_runner import _df2t_tree_logprobs
+    from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 
-    ss = SamplingStates(4, 128)
-    # No request asks for logprobs -> allowed.
-    _df2t_verify_rejects_logprobs(ss, np.arange(4))
-    ss.num_logprobs[1] = 1
-    with pytest.raises(NotImplementedError, match="df2t"):
-        _df2t_verify_rejects_logprobs(ss, np.arange(4))
+    device = torch.device("cuda")
+    R, B, V = 2, 4, 16
+    target = torch.randn(R, 1 + B, V, device=device)
+    token_ids, parents, num_nodes = _random_trees(R, B, V, seed=1)
+    token_ids, parents, num_nodes = (
+        token_ids.to(device),
+        parents.to(device),
+        num_nodes.to(device),
+    )
+    tv = TreeVerifier(R, B, V, device)
+    sampled, ns = tv(target, token_ids, parents, num_nodes, greedy=True)
+    processed = target.reshape(-1, V)
+    cu_np = np.cumsum([0] + [1 + B] * R)
+    state_np = np.zeros(R, dtype=np.intp)
+    # Unrequested -> None (never empty, never a crash).
+    assert (
+        _df2t_tree_logprobs(
+            processed,
+            sampled,
+            ns,
+            tv.accepted_arenas,
+            cu_np,
+            state_np,
+            NO_LOGPROBS,
+            "raw_logprobs",
+            None,
+            0,
+        )
+        is None
+    )
+    # Requested -> a real, non-empty per-token LogprobsTensors.
+    lp = _df2t_tree_logprobs(
+        processed,
+        sampled,
+        ns,
+        tv.accepted_arenas,
+        cu_np,
+        state_np,
+        3,
+        "raw_logprobs",
+        None,
+        0,
+    )
+    assert lp is not None
+    assert lp.logprobs.shape[0] == int(ns.sum().item())
+    assert lp.logprobs.numel() > 0
 
 
 def _random_trees(
