@@ -116,7 +116,7 @@ class DraftTokensHandler:
         token_ids, depths, parents, arena, words, num_nodes = tree_arrays
         R = token_ids.shape[0]
         W = token_ids.shape[1]
-        if R != len(self.req_ids):
+        if len(self.req_ids) != R:
             raise ValueError(
                 f"tree_arrays rows ({R}) do not match req_ids ({len(self.req_ids)}); "
                 "batched trees must be parallel to the batch requests."

@@ -238,9 +238,7 @@ class DF2TSpeculator(DFlash2Speculator):
             for i in range(num_reqs)
         ]
 
-    def _latest_tree_buffers(
-        self, num_reqs: int
-    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None":
+    def _latest_tree_buffers(self, num_reqs: int):
         """Guarded, tail-sanitized builder views for the last ``num_reqs`` rows.
 
         Shared by :meth:`get_latest_tree_drafts` (per-request ``TreeDraft``)

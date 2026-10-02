@@ -96,7 +96,7 @@ class TreeDraft:
             nn[r] = int(s.num_nodes) if has_nn[r] else n
         arr_t = torch.from_numpy(arr).to(device)
         nn_t = torch.from_numpy(nn).to(device)
-        out: "list[TreeDraft | None]" = []
+        out: list[TreeDraft | None] = []
         for r in range(R):
             n = widths[r]
             if n == 0:

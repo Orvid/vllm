@@ -149,8 +149,6 @@ def test_from_lists_batched_variable_widths():
     """Per-request widths survive the batched rebuild (a scheduler-trimmed
     tree keeps its truncated width and num_nodes, so downstream shape checks
     like tree.token_ids.shape[0] == scheduled count still hold)."""
-    from vllm.v1.outputs import StashedTree
-
     s0 = _tree(4).to_lists()
     s2 = _tree(6).to_lists()
     s2.num_nodes = 6
