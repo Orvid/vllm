@@ -9,7 +9,8 @@ otherwise emit it and stop. The SAME rule emits the bonus token at a leaf after
 a fully accepted path — there is no separate greedy or bonus rule and no second
 draw at any depth, and the drafter's probability buffers are never read.
 
-Conventions mirror ``reference_verifier.tree_verify_reference`` exactly:
+Conventions mirror the test-tree oracle ``tests/.../reference_verifier.py``
+(``tree_verify_reference``, kept as TEST material per v5 SS9) exactly:
 
 * ``target_logits`` is ``[num_reqs, 1 + B, vocab]`` in verify-layout order: row
   0 is the anchor, row ``1 + arena`` is tree node ``arena``.
@@ -93,7 +94,8 @@ class TreeVerifier:
         top_p: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Full-vocab processed distribution over ``[.., V]`` rows, matching
-        ``reference_verifier._processed`` per row (see module docstring)."""
+        ``reference_verifier._processed`` (the test oracle) per row (see
+        module docstring)."""
         n_e = torch.tensor(_NEG_INF, dtype=logits.dtype, device=logits.device)
         if temperature is not None:
             mask = (temperature > 0) & (temperature != 1.0)

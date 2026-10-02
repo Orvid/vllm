@@ -10,12 +10,26 @@ over-proposed-unexpanded sampling regime the v4 residual rule got wrong, the
 leaf bonus path, and determinism.
 """
 
+import importlib.util
+
 import torch
 
-from vllm.v1.worker.gpu.spec_decode.df2t.reference_verifier import (
+from tests.v1.worker.gpu.spec_decode.df2t.reference_verifier import (
     tree_verify_reference,
 )
 from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import build_tree_naive
+
+
+def test_reference_verifier_not_in_runtime_package():
+    """The brute-force oracle stays TEST material (v5 SS9): no runtime module
+    named ``vllm...df2t.reference_verifier`` ships, and the test-tree import
+    above is what resolves it."""
+    assert (
+        importlib.util.find_spec(
+            "vllm.v1.worker.gpu.spec_decode.df2t.reference_verifier"
+        )
+        is None
+    )
 
 
 def _row_logits(argmax_token: int, vocab: int) -> torch.Tensor:

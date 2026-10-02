@@ -28,7 +28,7 @@ from vllm.v1.worker.gpu.sample.thinking_budget import (
     ThinkingBudgetState,
     apply_thinking_budget,
 )
-from vllm.v1.worker.gpu.spec_decode.df2t.reference_verifier import (
+from tests.v1.worker.gpu.spec_decode.df2t.reference_verifier import (
     tree_verify_reference,
 )
 from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import TreeVerifier

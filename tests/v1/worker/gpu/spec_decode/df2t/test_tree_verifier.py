@@ -15,10 +15,10 @@ import numpy as np
 import pytest
 import torch
 
-from vllm.v1.worker.gpu.spec_decode.df2t.reference_verifier import (
+from tests.v1.worker.gpu.spec_decode.df2t.reference_verifier import (
     _processed as _ref_processed,
 )
-from vllm.v1.worker.gpu.spec_decode.df2t.reference_verifier import (
+from tests.v1.worker.gpu.spec_decode.df2t.reference_verifier import (
     tree_verify_reference,
 )
 from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import (

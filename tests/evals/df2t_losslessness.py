@@ -38,7 +38,7 @@ import numpy as np
 import pytest
 import torch
 
-from vllm.v1.worker.gpu.spec_decode.df2t.reference_verifier import _processed
+from tests.v1.worker.gpu.spec_decode.df2t.reference_verifier import _processed
 from vllm.v1.worker.gpu.spec_decode.df2t.tree_builder import TreeBuilder
 from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import TreeVerifier
 
