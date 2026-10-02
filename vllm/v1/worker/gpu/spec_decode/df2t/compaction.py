@@ -82,7 +82,7 @@ def _plan_group_kernel(
     num_sampled_ptr,  # [R] int32 per-request emitted-token count
     has_tree_ptr,  # [R] int8 1 when the request carries a tree
     arenas_ptr,  # [R, 1 + W] int64 accepted arena per chain depth (-1 = none)
-    depth_ptr,  # [R, W] int64 per-arena tree node depth (0 = padding)
+    depth_ptr,  # [R, ARENA_W] int64 per-arena tree node depth (0 = padding)
     c_ptr,  # [R] int64 anchor block-slot C per request
     bt_ptr,  # [R, nb] int64 per-group block table
     out_src,  # [G, max_a] int64 source phys slot per entry
@@ -91,6 +91,7 @@ def _plan_group_kernel(
     out_stale,  # [G, max_a] int8 1 when the source is stale and must be zeroed
     a,  # R * W live entry count
     W,  # accepted-chain width (plan columns per request)
+    ARENA_W,  # arena-space stride of the per-arena depth table
     nb,  # blocks per request row
     bs,  # tokens per block
     g,  # this kernel's kv-cache group index
@@ -105,7 +106,7 @@ def _plan_group_kernel(
     valid = (j < n_acc) & (ht != 0)
     arena = tl.load(arenas_ptr + r * astride + 1 + j)
     ar = tl.maximum(arena, 0)
-    depth = tl.load(depth_ptr + r * W + ar)
+    depth = tl.load(depth_ptr + r * ARENA_W + ar)
     c = tl.load(c_ptr + r)
     s_block = c + 1 + arena
     d_block = c + depth
@@ -434,14 +435,19 @@ class Df2tKVCompaction:
         kv_cache_groups: Sequence[Any],
         device: torch.device,
         storage: Tensor | None = None,
+        arena_span: int | None = None,
     ):
         """Persist the layer metadata and plan/scratch buffers.
 
         Args:
             max_num_reqs: Upper bound on requests in a step; sizes the runtime
                 plan rows (``max_num_reqs * W``).
-            W: Accepted-chain width (``TreeVerifier.accepted_arenas`` has
-                ``1 + W`` columns); one plan column per chain depth.
+            W: Accepted-chain width (the max accepted chain length; one plan
+                column per chain depth). Sized to the REAL chain width
+                ``min(nodes_max, max_tree_depth)``, not the 64-node ceiling —
+                a chain can never be longer than the tree depth. ``None``-able
+                entries and padding columns beyond a request's accepted count
+                are masked out in the kernels, so nothing reads past it.
             views_by_name: The runner's per-layer KV cache views
                 (``_kv_cache_views_by_name``), ``[B, H, N, C]`` in the LBNHC
                 layout.
@@ -456,9 +462,15 @@ class Df2tKVCompaction:
                 GPU reservation instead of being lazily allocated after the KV
                 cache filled the budget (a post-profile OOM). When ``None`` the
                 buffers are allocated fresh (unit tests).
+            arena_span: Arena-space width of the per-arena depth table (the
+                node arena index space, ``nodes_max``). Distinct from ``W``:
+                the depth table is indexed by arena (up to ``nodes_max``), the
+                plan columns by chain depth. Defaults to ``W`` when the two
+                coincide (unit tests).
 
         """
         self._W = W
+        self._arena_w = W if arena_span is None else arena_span
         self._max_a = max_num_reqs * W
         self._device = device
         self.block_sizes: list[int] = []
@@ -546,7 +558,7 @@ class Df2tKVCompaction:
             G=self._G,
             max_num_reqs=max_num_reqs,
             max_a=max_a,
-            W=W,
+            W=self._arena_w,
             L=self._L,
             max_el=self._max_el,
             itemsize=itemsize,
@@ -594,7 +606,9 @@ class Df2tKVCompaction:
         self._dst = carve("dst", (self._G, max_a), torch.int64)
         self._enter = carve("enter", (self._G, max_a), torch.int8)
         self._stale = carve("stale", (self._G, max_a), torch.int8)
-        self._tree_depth = carve("tree_depth", (max_num_reqs, W), torch.int64)
+        self._tree_depth = carve(
+            "tree_depth", (max_num_reqs, self._arena_w), torch.int64
+        )
         self._has_tree = carve("has_tree", (max_num_reqs,), torch.bool)
         self._scratch = carve(
             "scratch",
@@ -636,6 +650,7 @@ class Df2tKVCompaction:
         max_num_reqs: int,
         nodes_max: int,
         kv_cache_groups: Sequence[Any],
+        chain_w: int | None = None,
         scratch_budget_bytes: int | None = None,
     ) -> int:
         """Precise GPU bytes the compactor will hold, from KV cache group specs.
@@ -651,12 +666,14 @@ class Df2tKVCompaction:
 
         Args:
             max_num_reqs: Upper bound on requests in a step.
-            nodes_max: The tree node budget ``W`` (one plan column per accepted
-                chain depth; the TreeVerifier's ``B``).
+            nodes_max: The tree node budget (arena-space width of the per-arena
+                depth table; the TreeVerifier's ``B``).
             kv_cache_groups: The engine's ``kv_cache_groups``
                 (``KVCacheGroupSpec`` list); each ``group.layer_names`` counts
                 toward ``L`` and ``group.kv_cache_spec`` provides the per-layer
                 element count and dtype.
+            chain_w: Accepted-chain width driving the plan rows (one column per
+                chain depth); defaults to ``nodes_max`` when the two coincide.
             scratch_budget_bytes: Upper cap on the scratch; defaults to
                 :attr:`_ScratchBudgetBytes`.
 
@@ -685,14 +702,15 @@ class Df2tKVCompaction:
             itemsize = get_dtype_size(dtype)
         if L == 0:
             return 0
-        max_a = max_num_reqs * nodes_max
+        cw = nodes_max if chain_w is None else chain_w
+        max_a = max_num_reqs * cw
         row_bytes = L * max_el * itemsize
         slab = max_a
         if max_a * row_bytes > budget:
             raw_slab = max(1, budget // row_bytes)
-            slab = min((raw_slab // nodes_max) * nodes_max, max_a)
-            if slab < nodes_max:
-                slab = nodes_max
+            slab = min((raw_slab // cw) * cw, max_a)
+            if slab < cw:
+                slab = cw
         return cls._buffer_layout_bytes(
             G=len(kv_cache_groups),
             max_num_reqs=max_num_reqs,
@@ -710,7 +728,7 @@ class Df2tKVCompaction:
             if tree is None:
                 continue
             d = tree.depths
-            n = min(d.numel(), self._W)
+            n = min(d.numel(), self._arena_w)
             if n:
                 td[r, :n].copy_(d[:n])
         return td
@@ -774,6 +792,7 @@ class Df2tKVCompaction:
                 self._stale,
                 a,
                 W,
+                self._arena_w,
                 bt.shape[1],
                 self.block_sizes[g],
                 g,

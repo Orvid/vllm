@@ -978,3 +978,78 @@ def test_compaction_storage_carving_bit_identical():
             torch.device("cuda"),
             storage=storage[: max(1, storage.numel() // 2)],
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_batched_compaction_chain_width_vs_arena_span():
+    """The plan is sized to the real accepted-chain width while the per-arena
+    depth table keeps the full arena span.
+
+    A plan built with W (chain width) < arena_span (node arena space)
+    must still relocate accepted nodes at deep arenas (>= W) — the depth lookup
+    goes through arena_span — bit-identically to the per-request reference,
+    and the plan columns past W never read anything."""
+    from vllm.v1.worker.gpu.spec_decode.df2t.compaction import (
+        Df2tKVCompaction,
+    )
+
+    R, W, arena_span = 3, 2, 8
+    block_size, num_blocks = 16, 64
+    group_specs = [[("l.0", 2, 3), ("l.1", 1, 4)], [("l.2", 4, 2)]]
+    views, buf = _make_batched_cache(group_specs, block_size, num_blocks)
+    groups = [
+        SimpleNamespace(
+            layer_names=[n for n, _, _ in grp],
+            kv_cache_spec=SimpleNamespace(block_size=block_size),
+        )
+        for grp in group_specs
+    ]
+    num_sampled = torch.tensor([1, 2, 3], dtype=torch.int32, device="cuda")
+    accepted_arenas = torch.full((R, W + 1), -1, dtype=torch.long, device="cuda")
+    accepted_arenas[1, 1] = arena_span - 1  # deep arena, past the chain width
+    accepted_arenas[2, 1] = 5
+    accepted_arenas[2, 2] = 3
+    num_computed = torch.tensor([1, 40, 70], dtype=torch.int32, device="cuda")
+    block_tables = torch.randint(0, num_blocks, (R, 6), dtype=torch.long, device="cuda")
+    trees = []
+    for r in range(R):
+        depths = torch.zeros(arena_span, dtype=torch.long, device="cuda")
+        for j in range(1, int(num_sampled[r].item())):
+            a = int(accepted_arenas[r, j].item())
+            depths[a] = j
+        trees.append(SimpleNamespace(depths=depths))
+    num_slots = int(num_computed.max().item()) + arena_span + 2
+    _seed_kv(views, group_specs, block_size, num_slots)
+    torch.cuda.synchronize()
+    initial = buf.clone()
+    _old_compact_reference(
+        views, group_specs, block_size, num_sampled, accepted_arenas,
+        num_computed, block_tables, trees, R,
+    )
+    torch.cuda.synchronize()
+    reference = buf.clone()
+    buf.copy_(initial)
+    torch.cuda.synchronize()
+
+    compactor = Df2tKVCompaction(
+        R, W, views, groups, torch.device("cuda"), arena_span=arena_span
+    )
+    assert compactor._tree_depth.shape == (R, arena_span)
+    assert compactor._src.shape == (len(groups), R * W)
+    compactor.compact(
+        num_sampled,
+        accepted_arenas,
+        trees,
+        num_computed,
+        [block_tables] * len(groups),
+        R,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(buf, reference), "deep-arena accepted nodes diverged"
+    # The reservation must agree with the split sizing.
+    assert Df2tKVCompaction.reserved_bytes(
+        max_num_reqs=R,
+        nodes_max=arena_span,
+        chain_w=W,
+        kv_cache_groups=_spec_groups(group_specs, block_size),
+    ) == compactor._reserved_bytes

@@ -2492,6 +2492,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert sampler_output is not None
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
 
+    def _df2t_chain_width(self) -> int:
+        """Real accepted-chain width: ``min(nodes_max, max_tree_depth)``.
+
+        An accepted chain follows tree depth, so it can never be longer than
+        the tree depth cap, and never wider than the node budget itself (a
+        degraded budget below the depth is a chain of that many nodes). This
+        sizes the compaction plan rows (and the verifier's round count) instead
+        of the 64-node ceiling: the plan columns beyond it are always masked
+        out in the kernels.
+        """
+        spec = getattr(self, "speculative_config", None)
+        if spec is None:
+            # Wiring unit tests drive the compactor through a bare namespace.
+            verifier = getattr(self, "tree_verifier", None)
+            if verifier is not None:
+                return verifier.accepted_arenas.shape[1] - 1
+            return 1
+        nodes_max = BudgetPolicy.from_config(spec).resolve_nodes_max()
+        return min(nodes_max, spec.max_tree_depth)
+
     def _reserve_df2t_compaction(self) -> None:
         """Reserve the df2t compaction buffers inside the memory-profiling pass.
 
@@ -2522,6 +2542,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         nbytes = Df2tKVCompaction.reserved_bytes(
             max_num_reqs=self.max_num_reqs,
             nodes_max=nodes_max,
+            chain_w=self._df2t_chain_width(),
             kv_cache_groups=kv_cache_groups,
         )
         self._df2t_compaction_storage = torch.empty(
@@ -2553,11 +2574,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         self._df2t_compaction = Df2tKVCompaction(
             self.max_num_reqs,
-            BudgetPolicy.from_config(spec).resolve_nodes_max(),
+            self._df2t_chain_width(),
             self._kv_cache_views_by_name,
             self.kv_cache_config.kv_cache_groups,
             self.device,
             storage=storage,
+            arena_span=BudgetPolicy.from_config(spec).resolve_nodes_max(),
         )
 
     def _compact_df2t_accepted_kv(self, input_batch: InputBatch) -> None:
@@ -2576,9 +2598,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         verifier = self.tree_verifier
         if verifier is None or getattr(self, "_kv_cache_views_by_name", None) is None:
             return
+        # No host gate: the aggregate ``(num_sampled > 1).any().item()`` check
+        # that used to guard this step was a device->host round-trip on the
+        # per-step path. The compactor is device-side and fully masked, so a
+        # step with no accepted chain is an exact no-op (its plan kernel sets
+        # every enter/stale flag 0 and the gather/scatter kernels write
+        # nothing), keeping the semantics identical without reading any scalar
+        # back to the host.
         num_sampled = verifier.num_sampled[: input_batch.num_reqs]
-        if not bool((num_sampled > 1).any().item()):
-            return
         trees = input_batch.trees
         if not trees:
             return
@@ -2588,16 +2615,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # ``initialize_kv_cache`` from the profiling-phase reservation. If
             # a code path reached compaction without it, that is the exact OOM
             # the reservation prevents.
+            chain_width = getattr(self, "_df2t_chain_width", None)
+            chain_w = (
+                chain_width()
+                if chain_width is not None
+                else verifier.accepted_arenas.shape[1] - 1
+            )
             compaction = Df2tKVCompaction(
                 max(
                     getattr(self, "max_num_reqs", input_batch.num_reqs),
                     input_batch.num_reqs,
                 ),
-                verifier.accepted_arenas.shape[1] - 1,
+                chain_w,
                 self._kv_cache_views_by_name,
                 self.kv_cache_config.kv_cache_groups,
                 self.device,
                 storage=getattr(self, "_df2t_compaction_storage", None),
+                arena_span=verifier.accepted_arenas.shape[1] - 1,
             )
             self._df2t_compaction = compaction
         num_computed = self.req_states.num_computed_tokens.gpu[input_batch.idx_mapping]
