@@ -70,6 +70,21 @@ def test_df2t_rejects_tree_budget_over_ceiling():
         _build(tree_budget=128)
 
 
+def test_df2t_rejects_max_tree_budget_over_64():
+    """The ancestor word is a single int64 per node (one bit per arena), so a
+    ``max_tree_budget`` above 64 cannot be represented without multi-word
+    ancestor words; it is rejected at validation with the exact bound in the
+    error, instead of overflowing the word at runtime."""
+    with pytest.raises(ValueError, match="max_tree_budget"):
+        _build(max_tree_budget=65)
+    with pytest.raises(ValueError, match="<= 64"):
+        _build(max_tree_budget=128)
+    # The ceiling itself (default 64) is fine.
+    cfg = _build()
+    cfg._validate_df2t()
+    assert cfg.max_tree_budget == 64
+
+
 def test_df2t_rejects_max_tree_depth_over_tokens():
     with pytest.raises(ValueError, match="max_tree_depth"):
         _build(max_tree_depth=20)

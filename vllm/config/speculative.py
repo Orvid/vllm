@@ -565,7 +565,13 @@ class SpeculativeConfig:
     tree_budget: int | None = Field(default=None, ge=1)
     """Policy node count B at s=1.0; also the static decode shape 1+B."""
     max_tree_budget: int = Field(default=64, ge=1)
-    """Allocation ceiling: buffers, KV arena, ancestor-mask words."""
+    """Allocation ceiling: buffers, KV arena, ancestor-mask words.
+
+    Bounded by 64: the ancestor word is a single int64 bitmask per tree node
+    (one bit per node arena, ``1 << arena`` in the TreeBuilder), so a budget
+    above 64 needs a multi-word ancestor representation that this cut does not
+    implement. ``_validate_df2t`` rejects ``max_tree_budget > 64`` with a clear
+    error rather than overflowing the word at runtime."""
     max_tree_depth: int | None = Field(default=None, ge=1)
     """Tree depth cap; default min(num_speculative_tokens, block_size-1)."""
     tree_s: float = Field(default=1.0, ge=0.25, le=4.0)
@@ -2077,6 +2083,15 @@ class SpeculativeConfig:
             self.tree_budget = self.max_tree_budget
         if self.tree_budget > self.max_tree_budget:
             raise ValueError("tree_budget exceeds max_tree_budget")
+        if self.max_tree_budget > 64:
+            raise ValueError(
+                "df2t max_tree_budget must be <= 64: the ancestor word is a "
+                "single int64 per node (one bit per node arena, a tree wider "
+                f"than 64 needs multi-word ancestor words); got "
+                f"max_tree_budget={self.max_tree_budget}. Lower "
+                "max_tree_budget to <= 64 or implement multi-word ancestor "
+                "words."
+            )
         if self.nodes_ceiling > self.max_tree_budget:
             raise ValueError(
                 "nodes_ceiling must not exceed max_tree_budget: "
