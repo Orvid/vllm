@@ -1262,6 +1262,47 @@ def test_fa4_tree_mask_gates_attention(qwen3_config_path):
     assert err < 2e-2, f"FA4 impl tree mask diverged from manual reference: {err}"
 
 
+def test_df2t_mask_composition_guard_rswa_mm_prefix_fail_closed():
+    """The df2t tree mask must never be silently dropped by the FA4 commit
+    kernel's ``rswa_mask_mod_fn or mm_mask_mod or df2t_tree_mask_mod`` dispatch:
+    a tree metadata carrying R-SWA or mm-prefix state fails closed with a clear
+    error, while a plain tree metadata passes."""
+    from vllm.v1.attention.backends.flash_attn import (
+        _df2t_tree_mask_composition_guard,
+    )
+
+    mask_mod, aux = build_fa4_tree_mask(
+        1,
+        torch.tensor([4], dtype=torch.int32),
+        torch.tensor(
+            [[0b1, 0b11, 0b101]], dtype=torch.int64, device=torch.device("cpu")
+        ),
+        3,
+    )
+
+    plain = _fake_fa4_metadata()
+    plain.df2t_tree_mask_mod = mask_mod
+    plain.df2t_tree_aux_tensors = aux
+    _df2t_tree_mask_composition_guard(plain)  # no conflict
+
+    rswa = _fake_fa4_metadata()
+    rswa.df2t_tree_mask_mod = mask_mod
+    rswa.df2t_tree_aux_tensors = aux
+    rswa.rswa_prefix_lens = torch.tensor([4], dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="R-SWA"):
+        _df2t_tree_mask_composition_guard(rswa)
+
+    mm = _fake_fa4_metadata()
+    mm.df2t_tree_mask_mod = mask_mod
+    mm.df2t_tree_aux_tensors = aux
+    mm.mm_prefix_query_range_tensor = torch.tensor([[0, 10]], dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="mm-prefix"):
+        _df2t_tree_mask_composition_guard(mm)
+
+    bare = _fake_fa4_metadata()
+    _df2t_tree_mask_composition_guard(bare)  # no tree mask, untouched
+
+
 def _fake_fa4_metadata():
     from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 

@@ -581,6 +581,36 @@ class FlashAttentionMetadata:
     df2t_tree_aux_tensors: list[torch.Tensor] | None = None
 
 
+def _df2t_tree_mask_composition_guard(attn_metadata: FlashAttentionMetadata) -> None:
+    """Fail closed when the FA4 commit kernel would drop the df2t tree mask.
+
+    The commit kernel dispatches ``mask_mod = rswa_mask_mod_fn or mm_mask_mod
+    or df2t_tree_mask_mod``, so on an R-SWA or mm-prefix (prefix-LM) layer the
+    tree mask comes *last* and would be silently dropped while causal is
+    already False -- tree siblings would attend each other. df2t does not
+    support composing the tree mask with the R-SWA or mm-prefix mask, so raise
+    loudly instead of running a verify forward without the tree mask. This is a
+    fail-closed backstop to the config-time rejection (``_validate_df2t_
+    attention``).
+    """
+    if getattr(attn_metadata, "df2t_tree_mask_mod", None) is None:
+        return
+    if getattr(attn_metadata, "rswa_prefix_lens", None) is not None:
+        raise RuntimeError(
+            "df2t tree verify is not supported on an R-SWA layer: the FA4 "
+            "kernel dispatches the R-SWA mask before the tree mask, so the "
+            "tree mask would be silently dropped while causal is already "
+            "False. Disable R-SWA (rswa_window) for the df2t target."
+        )
+    if getattr(attn_metadata, "mm_prefix_query_range_tensor", None) is not None:
+        raise RuntimeError(
+            "df2t tree verify is not supported on an mm-prefix (prefix-LM) "
+            "layer: the FA4 kernel dispatches the mm-prefix mask before the "
+            "tree mask, so the tree mask would be silently dropped. Disable "
+            "mm-prefix attention for the df2t target."
+        )
+
+
 def _get_sliding_window_configs(
     vllm_config: VllmConfig,
 ) -> set[tuple[int, int] | None]:
@@ -1463,10 +1493,16 @@ class FlashAttentionImpl(AttentionImpl):
 
                 # df2t tree verify (FA4): the CuTE-DSL mask_mod encodes the
                 # ancestor-or-self tree mask (context + anchor + reachable
-                # nodes), which supersedes FA's causal and window handling.
+                # nodes) plus the positional sliding-window term for windowed
+                # targets, which supersedes FA's causal and window handling.
                 df2t_tree_mask_mod = attn_metadata.df2t_tree_mask_mod
                 df2t_tree_aux = attn_metadata.df2t_tree_aux_tensors
                 if df2t_tree_mask_mod is not None:
+                    # Fail closed (backstop to the config-time validation):
+                    # the commit kernel puts the tree mask LAST, so an R-SWA or
+                    # mm-prefix layer would silently drop it while causal is
+                    # already False.
+                    _df2t_tree_mask_composition_guard(attn_metadata)
                     causal = False
                     sliding_window_size = None
 

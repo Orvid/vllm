@@ -228,6 +228,58 @@ def test_df2t_forced_fa2_override_raises(qwen3_config_path):
     with set_current_vllm_config(cfg), pytest.raises(RuntimeError, match="df2t"):
         get_flash_attn_version(head_size=HEAD_DIM, kv_cache_block_size=BLOCK_SIZE)
 
+
+def _minimal_df2t_validate_config(*, rswa_window=None, is_mm_prefix_lm=False):
+    """A lightweight VllmConfig exercising ``_validate_df2t_attention`` alone.
+
+    ``_validate_df2t_attention`` only reads the speculative config's
+    ``use_df2t()`` (confirmed df2t) plus the attention/model surface relevant
+    to the df2t mask vehicles. This avoids rebuilding a full model just to
+    reject an R-SWA or prefix-LM target.
+    """
+    from types import SimpleNamespace
+
+    from vllm.config import VllmConfig
+
+    cfg = object.__new__(VllmConfig)
+    cfg.speculative_config = _fake_spec_config(df2t=True)
+    cfg.attention_config = SimpleNamespace(
+        flash_attn_version=None, backend=None, backend_per_kind={}
+    )
+    cfg.model_config = SimpleNamespace(
+        rswa_window=rswa_window, is_mm_prefix_lm=is_mm_prefix_lm
+    )
+    return cfg
+
+
+@requires_sm120_fa4
+def test_df2t_validate_rejects_rswa_target(qwen3_config_path):
+    """df2t + an R-SWA target must fail closed at config time: the FA4 commit
+    kernel dispatches ``rswa_mask_mod_fn or mm_mask_mod or df2t_tree_mask_mod``,
+    so an R-SWA target (causal already False on R-SWA layers) would silently
+    drop the tree mask and let tree siblings attend each other."""
+    cfg = _minimal_df2t_validate_config(rswa_window=128)
+    with pytest.raises(ValueError, match="R-SWA"):
+        cfg._validate_df2t_attention()
+
+
+@requires_sm120_fa4
+def test_df2t_validate_rejects_mm_prefix_target(qwen3_config_path):
+    """df2t + a prefix-LM (mm-prefix) target must fail closed at config time:
+    the mm-prefix ``mask_mod`` precedes the tree mask in the commit kernel
+    dispatch, so an mm-prefix target would silently drop the tree mask."""
+    cfg = _minimal_df2t_validate_config(is_mm_prefix_lm=True)
+    with pytest.raises(ValueError, match="mm-prefix"):
+        cfg._validate_df2t_attention()
+
+
+@requires_sm120_fa4
+def test_df2t_validate_accepts_plain_target(qwen3_config_path):
+    """A plain (non-R-SWA, non-mm-prefix) df2t target passes the df2t attention
+    validation unchanged."""
+    cfg = _minimal_df2t_validate_config()
+    cfg._validate_df2t_attention()  # no raise
+
     # FA4 is accepted by both seams.
     _real_df2t_vllm_config(qwen3_config_path, flash_attn_version=4)
     cfg = _make_cfg(qwen3_config_path, df2t=True, flash_attn_version=4)

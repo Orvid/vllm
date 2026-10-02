@@ -3188,6 +3188,32 @@ class VllmConfig:
                 f"{bad_kinds} are outside {{fa4, flex}}."
             )
 
+        # Fail closed on targets whose mask the FA4 commit kernel would drop
+        # before the tree mask: the kernel dispatches ``mask_mod = rswa_mask_mod
+        # _fn or mm_mask_mod or df2t_tree_mask_mod``, so an R-SWA or mm-prefix
+        # (prefix-LM) target would silently run the verify WITHOUT the tree
+        # mask while causal is already False (tree siblings attend each other).
+        model_config = self.model_config
+        if (
+            model_config is not None
+            and getattr(model_config, "rswa_window", None) is not None
+        ):
+            raise ValueError(
+                "df2t speculative decoding is not supported on an R-SWA "
+                "attention target (rswa_window is set): the FA4 commit kernel "
+                "dispatches the R-SWA mask before the df2t tree mask, so the "
+                "tree mask would be silently dropped while causal is already "
+                "False. Disable R-SWA for the df2t target."
+            )
+        if model_config is not None and getattr(model_config, "is_mm_prefix_lm", False):
+            raise ValueError(
+                "df2t speculative decoding is not supported on an mm-prefix "
+                "(prefix-LM) multimodal target: the FA4 commit kernel "
+                "dispatches the mm-prefix mask before the df2t tree mask, so "
+                "the tree mask would be silently dropped. Disable mm-prefix "
+                "attention for the df2t target."
+            )
+
     def _validate_adaptive_verification(self) -> None:
         spec_config = self.speculative_config
         if not spec_config or not spec_config.enable_adaptive_verification:
