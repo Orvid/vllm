@@ -906,6 +906,8 @@ def test_model_runner_df2t_compaction_wiring_moves_per_group():
     storages["l.20"][0, canon1] = _fill(9, 1, 5)
 
     fake_self = SimpleNamespace(
+        max_num_reqs=num_reqs,
+        _df2t_compaction_storage=None,
         tree_verifier=SimpleNamespace(
             num_sampled=num_sampled, accepted_arenas=accepted_arenas
         ),
@@ -972,6 +974,8 @@ def test_model_runner_df2t_compaction_wiring_noop_cases():
 
     def _run(verifier, trees):
         fake_self = SimpleNamespace(
+            max_num_reqs=num_reqs,
+            _df2t_compaction_storage=None,
             tree_verifier=verifier,
             _kv_cache_views_by_name={"layer.0": view},
             kv_cache_config=SimpleNamespace(

@@ -2578,12 +2578,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # a code path reached compaction without it, that is the exact OOM
             # the reservation prevents.
             compaction = Df2tKVCompaction(
-                self.max_num_reqs,
+                max(
+                    getattr(self, "max_num_reqs", input_batch.num_reqs),
+                    input_batch.num_reqs,
+                ),
                 verifier.accepted_arenas.shape[1] - 1,
                 self._kv_cache_views_by_name,
                 self.kv_cache_config.kv_cache_groups,
                 self.device,
-                storage=self._df2t_compaction_storage,
+                storage=getattr(self, "_df2t_compaction_storage", None),
             )
             self._df2t_compaction = compaction
         num_computed = self.req_states.num_computed_tokens.gpu[input_batch.idx_mapping]
