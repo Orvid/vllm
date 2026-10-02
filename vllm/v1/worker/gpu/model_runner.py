@@ -628,6 +628,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # DF2T tree-traversal verifier (used only when method=="df2t"); a
         # sibling of RejectionSampler with the same output contract.
         self.tree_verifier: TreeVerifier | None = None
+        # df2t accepted-KV compactor and its memory-profiling reservation (see
+        # ``_reserve_df2t_compaction`` / ``_init_df2t_compaction``). The
+        # reservation is allocated during the profiling phase so the compactor
+        # buffers are inside the GPU reservation; the compactor itself reuses
+        # that storage once the real KV caches exist.
+        self._df2t_compaction: Df2tKVCompaction | None = None
+        self._df2t_compaction_storage: torch.Tensor | None = None
         self.batch_sharder: BatchSharder | None = None
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
@@ -1094,6 +1101,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             for name, cache in kv_caches_dict.items()
             if cache.device == self.device
         }
+        if (
+            not is_profiling
+            and self.speculative_config is not None
+            and self.speculative_config.use_df2t_tree()
+        ):
+            self._init_df2t_compaction()
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
@@ -1281,6 +1294,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def profile_run(self) -> None:
+        self._reserve_df2t_compaction()
         if self.supports_mm_inputs and self.is_first_pp_rank:
             mm_config = self.model_config.multimodal_config
             if mm_config is not None and not mm_config.skip_mm_profiling:
@@ -2466,6 +2480,74 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert sampler_output is not None
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
 
+    def _reserve_df2t_compaction(self) -> None:
+        """Reserve the df2t compaction buffers inside the memory-profiling pass.
+
+        ``Df2tKVCompaction`` holds a persistent plan + scratch whose size is
+        bounded only by the tree budget and ``max_num_reqs``; created lazily on
+        the first accepted step it would OOM a high-utilization deployment
+        (memory profiling never saw it). This allocates exactly
+        :meth:`Df2tKVCompaction.reserved_bytes` right inside ``profile_run``
+        (which runs inside ``memory_profiling``), so the reservation becomes
+        part of the profiled non-KV memory and the KV cache is shrunk
+        accordingly. The real compactor reuses this storage (see
+        ``_init_df2t_compaction``), so no post-profile allocation ever happens.
+        Sizing comes from the KV cache group specs (no KV tensors exist yet),
+        mirrored exactly by :meth:`Df2tKVCompaction.__init__`'s view-derived
+        layout.
+        """
+        if self._df2t_compaction_storage is not None:
+            return
+        spec = self.speculative_config
+        if spec is None or not spec.use_df2t_tree():
+            return
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+
+        kv_cache_groups = get_kv_cache_groups(
+            self.vllm_config, self.get_kv_cache_spec()
+        )
+        nodes_max = BudgetPolicy.from_config(spec).resolve_nodes_max()
+        nbytes = Df2tKVCompaction.reserved_bytes(
+            max_num_reqs=self.max_num_reqs,
+            nodes_max=nodes_max,
+            kv_cache_groups=kv_cache_groups,
+        )
+        self._df2t_compaction_storage = torch.empty(
+            nbytes, dtype=torch.uint8, device=self.device
+        )
+        logger.info(
+            "df2t compaction reserved %.2f MiB for the per-step plan+scratch "
+            "(precise, inside the GPU reservation)",
+            nbytes / (1 << 20),
+        )
+
+    def _init_df2t_compaction(self) -> None:
+        """Build the accepted-KV compactor once the real KV caches exist.
+
+        Runs at the end of ``initialize_kv_cache`` (the real KV cache, not the
+        minimal profiling one), carving the persistent buffers out of the
+        profiling-phase reservation (``_df2t_compaction_storage``) so the
+        compactor's GPU footprint is exactly the reserved bytes and serving
+        start performs no post-profile allocation.
+        """
+        storage = self._df2t_compaction_storage
+        spec = self.speculative_config
+        assert spec is not None and spec.use_df2t_tree()
+        assert self._kv_cache_views_by_name is not None
+        if storage is None:
+            raise RuntimeError(
+                "df2t compaction has no profiling-phase reservation: the "
+                "memory-profiling pass must run before the KV cache is built"
+            )
+        self._df2t_compaction = Df2tKVCompaction(
+            self.max_num_reqs,
+            BudgetPolicy.from_config(spec).resolve_nodes_max(),
+            self._kv_cache_views_by_name,
+            self.kv_cache_config.kv_cache_groups,
+            self.device,
+            storage=storage,
+        )
+
     def _compact_df2t_accepted_kv(self, input_batch: InputBatch) -> None:
         """Relocate accepted-tree KV to canonical slots (df2t KV compaction).
 
@@ -2490,16 +2572,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return
         compaction = getattr(self, "_df2t_compaction", None)
         if compaction is None:
-            max_num_reqs = max(
-                getattr(self, "max_num_reqs", input_batch.num_reqs),
-                input_batch.num_reqs,
-            )
+            # Defensive only: the real compactor is built inside
+            # ``initialize_kv_cache`` from the profiling-phase reservation. If
+            # a code path reached compaction without it, that is the exact OOM
+            # the reservation prevents.
             compaction = Df2tKVCompaction(
-                max_num_reqs,
+                self.max_num_reqs,
                 verifier.accepted_arenas.shape[1] - 1,
                 self._kv_cache_views_by_name,
                 self.kv_cache_config.kv_cache_groups,
                 self.device,
+                storage=self._df2t_compaction_storage,
             )
             self._df2t_compaction = compaction
         num_computed = self.req_states.num_computed_tokens.gpu[input_batch.idx_mapping]

@@ -781,3 +781,200 @@ def test_batched_compaction_multi_slab_random_stress():
             )
         torch.cuda.synchronize()
         assert torch.equal(buf, reference), f"seed {seed} diverged"
+
+
+def _spec_groups(group_specs: list[list[tuple[str, int, int]]], block_size: int):
+    """``kv_cache_groups`` stand-ins carrying the spec surface
+    ``Df2tKVCompaction.reserved_bytes`` reads, mirroring the fake views the
+    tests build (per-group uniform ``num_heads``/``content``, float32)."""
+    groups = []
+    for grp in group_specs:
+        heads, content = grp[0][1], grp[0][2]
+        groups.append(
+            SimpleNamespace(
+                layer_names=[n for n, _, _ in grp],
+                kv_cache_spec=SimpleNamespace(
+                    block_size=block_size,
+                    num_heads=heads,
+                    state_content_size_bytes=content * 4,
+                    dtype=torch.float32,
+                ),
+            )
+        )
+    return groups
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compaction_scratch_sized_precisely_one_shot():
+    """The scratch is sized precisely from the model's real per-slot bytes and
+    the ``max_num_reqs``-scaled plan, not the blanket 256 MB budget: on a
+    typical batch the scratch covers the WHOLE max batch in one slab (``_slab
+    == max_a``, a single ``(slab, L)`` gather -> scatter pair), and its element
+    count equals ``slab * L * max_el``."""
+    from vllm.v1.worker.gpu.spec_decode.df2t.compaction import (
+        Df2tKVCompaction,
+    )
+
+    R, W = 8, 4
+    block_size, num_blocks = 16, 64
+    # L=3, max_el=6 (2*3), itemsize=4 -> row_bytes=72; max_a=32 -> one-shot
+    # scratch of 32*72 = 2304 bytes, far below the 256 MB budget.
+    group_specs = [
+        [("l.0", 2, 3), ("l.1", 2, 3)],
+        [("l.2", 1, 4)],
+    ]
+    views, _ = _make_batched_cache(group_specs, block_size, num_blocks)
+    groups = [
+        SimpleNamespace(
+            layer_names=[n for n, _, _ in grp],
+            kv_cache_spec=SimpleNamespace(block_size=block_size),
+        )
+        for grp in group_specs
+    ]
+    compactor = Df2tKVCompaction(R, W, views, groups, torch.device("cuda"))
+    max_a = R * W
+    assert compactor._slab == max_a
+    assert compactor._scratch.numel() == max_a * compactor._L * compactor._max_el
+    assert compactor._scratch.numel() * compactor._scratch.element_size() == (
+        max_a * 3 * 6 * 4
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compaction_reserved_bytes_matches_actual():
+    """The profiling reservation (:meth:`Df2tKVCompaction.reserved_bytes`,
+    computed from KV cache group specs BEFORE any KV tensor exists) must equal
+    exactly what :meth:`__init__` carves/allocs for the equivalent views — the
+    memory-profiling pass and the runtime compactor can never disagree."""
+    from vllm.v1.worker.gpu.spec_decode.df2t.compaction import (
+        Df2tKVCompaction,
+    )
+
+    R, W = 16, 5
+    block_size, num_blocks = 16, 64
+    # max_el = max(2*3, 1*4, 4*2) = 8; L = 2+1+2 = 5; itemsize 4.
+    group_specs = [
+        [("l.0", 2, 3), ("l.1", 2, 3)],
+        [("l.2", 1, 4)],
+        [("l.3", 4, 2), ("l.4", 4, 2)],
+    ]
+    views, _ = _make_batched_cache(group_specs, block_size, num_blocks)
+    groups = [
+        SimpleNamespace(
+            layer_names=[n for n, _, _ in grp],
+            kv_cache_spec=SimpleNamespace(block_size=block_size),
+        )
+        for grp in group_specs
+    ]
+    compactor = Df2tKVCompaction(R, W, views, groups, torch.device("cuda"))
+    # The spec-derived reservation (the "before the KV cache exists" number).
+    spec_reserved = Df2tKVCompaction.reserved_bytes(
+        max_num_reqs=R,
+        nodes_max=W,
+        kv_cache_groups=_spec_groups(group_specs, block_size),
+    )
+    assert spec_reserved == compactor._reserved_bytes
+    # The one-shot slab (R*W entries) fits in the default budget here.
+    assert compactor._slab == R * W
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compaction_storage_carving_bit_identical():
+    """The compactor built by carving its persistent buffers out of the
+    profiling-phase storage (the serving path) is byte-for-byte identical to
+    the per-(request, group, layer) reference, and every carved tensor lives
+    inside that storage (zero net GPU memory beyond the reservation)."""
+    from vllm.v1.worker.gpu.spec_decode.df2t.compaction import (
+        Df2tKVCompaction,
+    )
+
+    R, W = 5, 7
+    block_size, num_blocks = 16, 64
+    group_specs = [
+        [("l.2", 2, 3), ("l.8", 2, 3), ("l.14", 2, 3)],
+        [("l.4", 1, 5), ("l.10", 1, 5)],
+        [("l.1", 4, 4)],
+    ]
+    views, buf = _make_batched_cache(group_specs, block_size, num_blocks)
+    groups = [
+        SimpleNamespace(
+            layer_names=[n for n, _, _ in grp],
+            kv_cache_spec=SimpleNamespace(block_size=block_size),
+        )
+        for grp in group_specs
+    ]
+    seed = 3
+    num_sampled, accepted_arenas, num_computed, block_tables, trees = _rand_chain_batch(
+        R, W, num_blocks, seed
+    )
+    num_slots = int(num_computed.max().item()) + W + 2
+    _seed_kv(views, group_specs, block_size, num_slots)
+    torch.cuda.synchronize()
+    initial = buf.clone()
+    _old_compact_reference(
+        views,
+        group_specs,
+        block_size,
+        num_sampled,
+        accepted_arenas,
+        num_computed,
+        block_tables,
+        trees,
+        R,
+    )
+    torch.cuda.synchronize()
+    reference = buf.clone()
+    buf.copy_(initial)
+    torch.cuda.synchronize()
+
+    storage = torch.empty(
+        Df2tKVCompaction.reserved_bytes(
+            max_num_reqs=R,
+            nodes_max=W,
+            kv_cache_groups=_spec_groups(group_specs, block_size),
+        ),
+        dtype=torch.uint8,
+        device=torch.device("cuda"),
+    )
+    compactor = Df2tKVCompaction(
+        R, W, views, groups, torch.device("cuda"), storage=storage
+    )
+    # Every persistent buffer is a view into the reservation, at its layout
+    # byte offset (data_ptr is the unambiguous byte-address check).
+    base = storage.data_ptr()
+    for name in (
+        "src",
+        "dst",
+        "enter",
+        "stale",
+        "tree_depth",
+        "has_tree",
+        "scratch",
+        "group_of",
+        "elems",
+        "layer_off",
+    ):
+        t = getattr(compactor, f"_{name}")
+        off = compactor._layout[name][0]
+        assert base + off <= t.data_ptr() < base + storage.numel(), name
+        assert t.data_ptr() - base == off, name
+        assert t.untyped_storage().data_ptr() == base, name
+    compactor.compact(
+        num_sampled,
+        accepted_arenas,
+        trees,
+        num_computed,
+        [block_tables] * len(groups),
+        R,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(buf, reference), "carved compactor diverged from reference"
+    with pytest.raises(ValueError, match="reservation is too small"):
+        Df2tKVCompaction(
+            R,
+            W,
+            views,
+            groups,
+            torch.device("cuda"),
+            storage=storage[: max(1, storage.numel() // 2)],
+        )

@@ -16,6 +16,7 @@ import torch
 from torch import Tensor
 
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import get_dtype_size
 
 _CopyBlock = 256
 
@@ -337,6 +338,50 @@ def compact_accepted_chain(
 _ScratchBudgetBytes = 256 * 1024 * 1024
 
 
+def _align8(nbytes: int) -> int:
+    return (nbytes + 7) & ~7
+
+
+def _buffer_layout(
+    *,
+    G: int,
+    max_num_reqs: int,
+    max_a: int,
+    W: int,
+    L: int,
+    max_el: int,
+    itemsize: int,
+    slab: int,
+) -> tuple[dict[str, tuple[int, int]], int]:
+    """Byte offsets/sizes of every persistent compactor buffer, 8-byte aligned.
+
+    Returns a ``{name: (byte_offset, byte_size)}`` map and the total byte size.
+    The layout is the single source of truth shared by the profiling-phase
+    reservation (:meth:`Df2tKVCompaction.reserved_bytes`), the fresh
+    allocations, and the carved-into-storage construction, so the reserved
+    size and the runtime buffers can never disagree.
+    """
+    layout: dict[str, tuple[int, int]] = {}
+    off = 0
+    for name, numel, size in (
+        ("group_of", L, 4),
+        ("elems", L, 4),
+        ("layer_off", L, 8),
+        ("src", G * max_a, 8),
+        ("dst", G * max_a, 8),
+        ("enter", G * max_a, 1),
+        ("stale", G * max_a, 1),
+        ("tree_depth", max_num_reqs * W, 8),
+        ("has_tree", max_num_reqs, 1),
+        ("scratch", slab * L * max_el, itemsize),
+    ):
+        off = _align8(off)
+        nbytes = numel * size
+        layout[name] = (off, nbytes)
+        off += nbytes
+    return layout, off
+
+
 class Df2tKVCompaction:
     """Batched, host-sync-free compaction of one step's accepted chains.
 
@@ -388,6 +433,7 @@ class Df2tKVCompaction:
         views_by_name: dict[str, Tensor],
         kv_cache_groups: Sequence[Any],
         device: torch.device,
+        storage: Tensor | None = None,
     ):
         """Persist the layer metadata and plan/scratch buffers.
 
@@ -403,6 +449,13 @@ class Df2tKVCompaction:
                 ``group.layer_names`` lists the group's layers and
                 ``group.kv_cache_spec.block_size`` its block size.
             device: The device the views live on.
+            storage: Optional flat ``uint8`` GPU buffer to carve every
+                persistent plan/scratch/metadata tensor out of. The memory
+                profiling phase allocates exactly :meth:`reserved_bytes` and
+                hands it over here, so the compactor's buffers are part of the
+                GPU reservation instead of being lazily allocated after the KV
+                cache filled the budget (a post-profile OOM). When ``None`` the
+                buffers are allocated fresh (unit tests).
 
         """
         self._W = W
@@ -458,50 +511,198 @@ class Df2tKVCompaction:
                 f"got {dtype} and mixed dtypes"
             )
 
-        self._group_of = torch.empty(self._L, dtype=torch.int32, device=device)
-        self._elems = torch.empty(self._L, dtype=torch.int32, device=device)
-        self._layer_off = torch.empty(self._L, dtype=torch.int64, device=device)
         base_layer = min(layers, key=lambda gl: gl[1].data_ptr())[1]
         itemsize = base_layer.element_size()
+        layer_info = []
         for idx, (g, layer) in enumerate(layers):
-            self._group_of[idx] = g
             _, num_heads, _, content = layer.shape
-            self._elems[idx] = num_heads * content
-            self._layer_off[idx] = (
-                layer.data_ptr() - base_layer.data_ptr()
-            ) // itemsize
+            layer_info.append((g, num_heads, content, layer))
+        self._max_el = max(
+            num_heads * content for _, num_heads, content, _ in layer_info
+        )
         self._kv_base = base_layer
         self._base_ptr = base_layer.data_ptr()
-        self._max_el = int(self._elems.max().item())
 
         # Persistent plan + scratch. Rows [G, max_a]; details via g_stride.
-        self._src = torch.zeros(self._G, self._max_a, dtype=torch.int64, device=device)
-        self._dst = torch.zeros(self._G, self._max_a, dtype=torch.int64, device=device)
-        self._enter = torch.zeros(self._G, self._max_a, dtype=torch.int8, device=device)
-        self._stale = torch.zeros(self._G, self._max_a, dtype=torch.int8, device=device)
-        self._tree_depth = torch.zeros(
-            max_num_reqs, W, dtype=torch.int64, device=device
-        )
-        self._has_tree = torch.zeros(max_num_reqs, dtype=torch.bool, device=device)
-        # Scratch rows are (entry, layer) slabs of MAX_EL elements; a slab
-        # holds all layers of one contiguous run of entries so the batch is
-        # covered in a small number of (slab, L)-grid launches.
+        max_a = self._max_a
         row_bytes = self._L * self._max_el * itemsize
-        raw_slab = max(1, self._ScratchBudgetBytes // row_bytes)
-        # Slabs must tile at whole-request boundaries: a request's aliased
-        # src/dst pairs must stay inside one gather->scatter slab, otherwise a
-        # later slab could gather a source already overwritten by an earlier
-        # slab's scatter. max_a is a multiple of W, so snap the slab down to
-        # the largest W-multiple at or below the budget (minimum one request).
-        self._slab = min((raw_slab // W) * W, self._max_a)
-        if self._slab < W:
-            self._slab = W
-        self._scratch = torch.zeros(
-            self._slab * self._L * self._max_el,
-            dtype=base_layer.dtype,
-            device=device,
+        # Precise scratch sizing: by default the scratch covers the whole
+        # ``max_num_reqs`` batch in ONE slab (a single ``(slab, L)``-grid
+        # gather -> scatter pair per step), sized from the model's real
+        # ``L * MAX_EL * itemsize`` per-slot bytes and the ``max_num_reqs``-
+        # scaled plan -- never a blanket constant. ``_ScratchBudgetBytes`` only
+        # caps the scratch on unusually large (rows x per-slot bytes) models;
+        # the capped slab still tiles at whole-request boundaries (a
+        # W-multiple) so a request's aliased src/dst pairs never straddle two
+        # gather->scatter slabs.
+        scratch_slots = max_a
+        if max_a * row_bytes > self._ScratchBudgetBytes:
+            raw_slab = max(1, self._ScratchBudgetBytes // row_bytes)
+            scratch_slots = min((raw_slab // W) * W, max_a)
+            if scratch_slots < W:
+                scratch_slots = W
+        self._slab = scratch_slots
+        self._layout, self._reserved_bytes = _buffer_layout(
+            G=self._G,
+            max_num_reqs=max_num_reqs,
+            max_a=max_a,
+            W=W,
+            L=self._L,
+            max_el=self._max_el,
+            itemsize=itemsize,
+            slab=scratch_slots,
         )
-        self._g_stride = self._max_a
+        self._storage: Tensor | None
+        if storage is not None:
+            if storage.numel() < self._reserved_bytes:
+                raise ValueError(
+                    "df2t compaction storage reservation is too small: "
+                    f"{storage.numel()} bytes available, "
+                    f"{self._reserved_bytes} required. Rebuild the memory-"
+                    "profiling reservation from the real KV cache layout."
+                )
+            if storage.device.type != device.type or (
+                device.index is not None and storage.device.index != device.index
+            ):
+                raise ValueError(
+                    "df2t compaction storage must live on the compactor's "
+                    f"device {device}, got {storage.device}"
+                )
+            self._storage = storage
+        else:
+            self._storage = None
+
+        def carve(name: str, shape: tuple[int, ...], buf_dtype: torch.dtype) -> Tensor:
+            off, nbytes = self._layout[name]
+            if self._storage is None:
+                return torch.zeros(shape, dtype=buf_dtype, device=device)
+            raw = self._storage[off : off + nbytes].view(buf_dtype)
+            return raw.view(shape).zero_()
+
+        # carves mirror torch.zeros exactly (fully initialized persistent
+        # buffers), so carved storage is bit-identical to fresh allocations.
+        self._group_of = carve("group_of", (self._L,), torch.int32)
+        self._elems = carve("elems", (self._L,), torch.int32)
+        self._layer_off = carve("layer_off", (self._L,), torch.int64)
+        for idx, (g, num_heads, content, _) in enumerate(layer_info):
+            self._group_of[idx] = g
+            self._elems[idx] = num_heads * content
+            self._layer_off[idx] = (
+                layer_info[idx][3].data_ptr() - base_layer.data_ptr()
+            ) // itemsize
+        self._src = carve("src", (self._G, max_a), torch.int64)
+        self._dst = carve("dst", (self._G, max_a), torch.int64)
+        self._enter = carve("enter", (self._G, max_a), torch.int8)
+        self._stale = carve("stale", (self._G, max_a), torch.int8)
+        self._tree_depth = carve("tree_depth", (max_num_reqs, W), torch.int64)
+        self._has_tree = carve("has_tree", (max_num_reqs,), torch.bool)
+        self._scratch = carve(
+            "scratch",
+            (scratch_slots * self._L * self._max_el,),
+            base_layer.dtype,
+        )
+        self._g_stride = max_a
+
+    @staticmethod
+    def _buffer_layout_bytes(
+        *,
+        G: int,
+        max_num_reqs: int,
+        max_a: int,
+        W: int,
+        L: int,
+        max_el: int,
+        itemsize: int,
+        slab: int,
+    ) -> int:
+        """Total bytes of every persistent compactor buffer, in ``_layout``
+        order. Shared by the profiling reservation (via :meth:`reserved_bytes`)
+        and :meth:`__init__`, so the two can never disagree."""
+        return _buffer_layout(
+            G=G,
+            max_num_reqs=max_num_reqs,
+            max_a=max_a,
+            W=W,
+            L=L,
+            max_el=max_el,
+            itemsize=itemsize,
+            slab=slab,
+        )[1]
+
+    @classmethod
+    def reserved_bytes(
+        cls,
+        *,
+        max_num_reqs: int,
+        nodes_max: int,
+        kv_cache_groups: Sequence[Any],
+        scratch_budget_bytes: int | None = None,
+    ) -> int:
+        """Precise GPU bytes the compactor will hold, from KV cache group specs.
+
+        Mirrors :meth:`__init__`'s sizing from the model's real per-slot bytes
+        (``num_heads * content`` per layer, the itemsize, and the layer count)
+        and the ``max_num_reqs``-scaled plan, with no KV cache tensors needed,
+        so the memory-profiling phase can reserve the exact amount before the
+        KV cache is allocated. Attention-like layers contribute their real
+        ``elems = num_heads * state_content_bytes // itemsize``; layers without
+        a derivable layout contribute zero, and :meth:`__init__` fails closed
+        if a real view would need more than the reservation.
+
+        Args:
+            max_num_reqs: Upper bound on requests in a step.
+            nodes_max: The tree node budget ``W`` (one plan column per accepted
+                chain depth; the TreeVerifier's ``B``).
+            kv_cache_groups: The engine's ``kv_cache_groups``
+                (``KVCacheGroupSpec`` list); each ``group.layer_names`` counts
+                toward ``L`` and ``group.kv_cache_spec`` provides the per-layer
+                element count and dtype.
+            scratch_budget_bytes: Upper cap on the scratch; defaults to
+                :attr:`_ScratchBudgetBytes`.
+
+        """
+        budget = (
+            scratch_budget_bytes
+            if scratch_budget_bytes is not None
+            else cls._ScratchBudgetBytes
+        )
+        L = 0
+        max_el = 0
+        itemsize = 0
+        for group in kv_cache_groups:
+            spec = group.kv_cache_spec
+            num_heads = getattr(spec, "num_heads", None)
+            content_bytes = getattr(spec, "state_content_size_bytes", None)
+            dtype = getattr(spec, "dtype", None)
+            if num_heads is None or content_bytes is None or dtype is None:
+                # Not an attention-like layer the compactor can relocate.
+                continue
+            el = num_heads * (content_bytes // get_dtype_size(dtype))
+            if el <= 0:
+                continue
+            L += len(group.layer_names)
+            max_el = max(max_el, el)
+            itemsize = get_dtype_size(dtype)
+        if L == 0:
+            return 0
+        max_a = max_num_reqs * nodes_max
+        row_bytes = L * max_el * itemsize
+        slab = max_a
+        if max_a * row_bytes > budget:
+            raw_slab = max(1, budget // row_bytes)
+            slab = min((raw_slab // nodes_max) * nodes_max, max_a)
+            if slab < nodes_max:
+                slab = nodes_max
+        return cls._buffer_layout_bytes(
+            G=len(kv_cache_groups),
+            max_num_reqs=max_num_reqs,
+            max_a=max_a,
+            W=nodes_max,
+            L=L,
+            max_el=max_el,
+            itemsize=itemsize,
+            slab=slab,
+        )
 
     def _build_tree_depths(self, trees: Sequence[Any], R: int) -> Tensor:
         td = self._tree_depth[:R].zero_()

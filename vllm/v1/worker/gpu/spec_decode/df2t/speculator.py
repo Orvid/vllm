@@ -164,6 +164,7 @@ class DF2TSpeculator(DFlash2Speculator):
         )
         unary_logits = unary_logits.view_as(candidate_ids)
         scores = self._score_candidates(candidate_ids, unary_logits, hidden_states)
+        assert self.tree_builder is not None
         tree = self.tree_builder.build(scores, candidate_ids)
         assert tree.num_nodes is not None
         self._last_tree = tree
@@ -221,6 +222,7 @@ class DF2TSpeculator(DFlash2Speculator):
         """
         if not self._tree_enabled or self._last_tree is None:
             return None
+        assert self.tree_builder is not None
         if num_reqs > self._last_built_rows:
             raise RuntimeError(
                 "df2t tree read would over-read the last tree build: "
@@ -255,6 +257,7 @@ class DF2TSpeculator(DFlash2Speculator):
         before stashing so every consumer (eager or a replayed drafter graph)
         sees a clean tail.
         """
+        assert self.tree_builder is not None
         b = self.tree_builder
         n = b.num_nodes[:num_reqs].clamp(0, self.nodes_max)
         tail = torch.arange(self.nodes_max, device=self.device).unsqueeze(
