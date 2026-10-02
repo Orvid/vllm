@@ -231,9 +231,14 @@ def warmup_kernels(
     if adaptive_sampling:
         assert rejection_sampler is not None
         rejection_sampler.enable_adaptive_verification = False
+    # Mark the mock prefill/decode steps so df2t guards that only make sense on
+    # real scheduled steps (e.g. "drafts must always carry a stashed tree") do
+    # not fire: the warmup schedules draft tokens without any tree.
+    model_runner._kernel_warmup = True
     try:
         _warmup_kernels(model_runner, worker_execute_model, worker_sample_tokens)
     finally:
+        model_runner._kernel_warmup = False
         model_runner.adaptive_verification = adaptive_verification
         if adaptive_sampling:
             assert rejection_sampler is not None

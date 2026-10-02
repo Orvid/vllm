@@ -218,21 +218,26 @@ def _df2t_ensure_trees_staged(
     use_df2t: bool,
     num_draft_tokens: int,
     trees_staged: bool,
+    in_kernel_warmup: bool = False,
 ) -> None:
     """Fail closed when a df2t decode batch schedules drafts without trees.
 
     The sampler dispatch branches on ``input_batch.trees``: a df2t batch whose
     drafts arrived without any stashed tree (``use_df2t_trees`` False) would
     otherwise fall through to the chain ``RejectionSampler``. DF2T never
-    populates ``draft_logits``, so at T>0 a chain rejection is against a
-    meaningless ``q``. A df2t decode batch must always carry its trees; a batch
-    that legitimately has none this step is the treeless/prefill path, which
-    schedules no drafts (``num_draft_tokens == 0``) and takes the sampler path
-    before this guard. The header guard only fires under ``use_df2t()``, so
-    chain methods (eagle/dflash) that reject with real draft_logits are
-    untouched.
+    populates ``draft_logits`` on the real tree path, so at T>0 a chain
+    rejection is against a meaningless ``q``. A df2t decode batch must always
+    carry its trees; a batch that legitimately has none this step is the
+    treeless/prefill path, which schedules no drafts (``num_draft_tokens ==
+    0``) and takes the sampler path before this guard. The header guard only
+    fires under ``use_df2t()``, so chain methods (eagle/dflash) that reject
+    with real draft_logits are untouched.
+
+    ``in_kernel_warmup`` suppresses the guard during the mock prefill/decode
+    kernel-warmup steps (gpu/warmup.py), which intentionally schedule draft
+    tokens without a stashed tree and whose sampled output is discarded.
     """
-    if use_df2t and num_draft_tokens > 0 and not trees_staged:
+    if use_df2t and num_draft_tokens > 0 and not trees_staged and not in_kernel_warmup:
         raise RuntimeError(
             "df2t decode batch scheduled draft tokens but carried no stashed "
             "tree (the tree was dropped), so the tree-verify mask/rows have no "
@@ -598,6 +603,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._df2t_tree_mask_words: torch.Tensor | None = None
         self._df2t_tree_mask_c: torch.Tensor | None = None
         self._df2t_tree_mask_depths: torch.Tensor | None = None
+        # Set by the kernel-warmup path (gpu/warmup.py) for the duration of its
+        # mock prefill/decode steps: those schedule draft tokens without any
+        # stashed df2t tree, so df2t guards that would otherwise fire on a real
+        # dropped-tree batch must stay silent there.
+        self._kernel_warmup = False
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -2413,6 +2423,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 use_df2t=self.speculative_config.use_df2t(),
                 num_draft_tokens=input_batch.num_draft_tokens,
                 trees_staged=input_batch.trees is not None,
+                in_kernel_warmup=getattr(self, "_kernel_warmup", False),
             )
             assert self.rejection_sampler is not None
             assert self.speculator is not None

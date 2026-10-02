@@ -81,3 +81,18 @@ def test_df2t_dispatch_guard_only_fires_for_df2t():
     # Chain methods (eagle/dflash) reject without draft_logits by design; the
     # df2t-only guard must not constrain them.
     _df2t_ensure_trees_staged(use_df2t=False, num_draft_tokens=4, trees_staged=False)
+
+
+def test_df2t_dispatch_guard_silent_during_kernel_warmup():
+    """The kernel-warmup mock decode steps schedule draft tokens without any
+    stashed tree, so the guard must stay silent while ``in_kernel_warmup`` is
+    set (their sampled output is discarded, and the tree was never expected)."""
+    from vllm.v1.worker.gpu.model_runner import _df2t_ensure_trees_staged
+
+    _df2t_ensure_trees_staged(
+        use_df2t=True, num_draft_tokens=4, trees_staged=False, in_kernel_warmup=True
+    )
+    with pytest.raises(RuntimeError, match="stashed tree"):
+        _df2t_ensure_trees_staged(
+            use_df2t=True, num_draft_tokens=4, trees_staged=False
+        )
