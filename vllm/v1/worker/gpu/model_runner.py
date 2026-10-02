@@ -831,6 +831,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # from the tree buffers. A tree-off df2t (enable_tree=False)
                     # keeps ``tree_verifier`` None and reproduces the DFlash2
                     # chain rejection path.
+                    # Fixed-round bound sized to the real chain width (the
+                    # node budget and the max tree depth), not the 64-node
+                    # ceiling: an accepted chain can never be longer than
+                    # ``min(nodes_max, max_tree_depth)``, plus the terminal
+                    # draw. Keeps the host-sync-free device verify loop from
+                    # iterating past any tree's depth.
                     self.tree_verifier = TreeVerifier(
                         self.max_num_reqs,
                         BudgetPolicy.from_config(
@@ -838,6 +844,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         ).resolve_nodes_max(),
                         self.vocab_size,
                         self.device,
+                        num_rounds=min(
+                            BudgetPolicy.from_config(
+                                self.speculative_config
+                            ).resolve_nodes_max()
+                            + 1,
+                            self.speculative_config.max_tree_depth + 1,
+                        ),
                     )
                     # The df2t drafter conditions its next step on the
                     # accepted chain; give it the verifier it reads that from.
@@ -2625,7 +2638,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert self.tree_verifier is not None
         assert self.sampler is not None
         num_reqs = input_batch.num_reqs
-        cu = input_batch.cu_num_logits.tolist()
+        # Host cumulative-logits offsets: the worker already keeps the numpy
+        # mirror (no ``.tolist()`` device round-trip; the runner unit tests fill
+        # it too, and the cpu-side reference keeps ``cu`` indexable).
+        cu = input_batch.cu_num_logits_np
+        if cu is None:
+            cu = input_batch.cu_num_logits.tolist()
         b_vals = [t.token_ids.shape[0] if t is not None else 0 for t in trees]
         b_max = max(b_vals)
 
@@ -2681,10 +2699,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Delimit by the per-request LIVE node count (the builder's
             # num_nodes), not the buffer width: a tree whose prefix space is
             # exhausted (or a narrower per-request width) leaves inert padding
-            # in columns [num_nodes, b) that must never be matched.
+            # in columns [num_nodes, b) that must never be matched. Clamped on
+            # device, so no per-request scalar round-trip.
             live = getattr(tree, "num_nodes", None)
-            live = int(live.reshape(-1)[0]) if live is not None else b
-            num_nodes[r] = max(0, min(live, b))
+            num_nodes[r] = live.clamp(min=0, max=b) if live is not None else b
             target[r, : 1 + b] = processed[cu[r] : cu[r + 1]]
 
         ss = self.sampler.sampling_states

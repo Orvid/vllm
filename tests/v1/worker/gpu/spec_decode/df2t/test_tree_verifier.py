@@ -496,6 +496,7 @@ def test_model_runner_df2t_tree_verify_output_contract():
     batches = InputBuffers(num_reqs, logits.shape[0], device)
     ib = InputBatch.make_dummy(num_reqs, logits.shape[0], batches, is_padding=True)
     ib.cu_num_logits = cu
+    ib.cu_num_logits_np = cu_np
     ib.seq_lens = torch.ones(num_reqs, dtype=torch.int32, device=device) * 50
     ib.trees = [
         SimpleNamespace(
@@ -614,6 +615,7 @@ def test_model_runner_df2t_tree_verify_mixed_batch():
     batches = InputBuffers(num_reqs, logits.shape[0], device)
     ib = InputBatch.make_dummy(num_reqs, logits.shape[0], batches, is_padding=True)
     ib.cu_num_logits = cu
+    ib.cu_num_logits_np = cu_np
     ib.seq_lens = torch.ones(num_reqs, dtype=torch.int32, device=device) * 50
     ib.trees = [
         SimpleNamespace(
