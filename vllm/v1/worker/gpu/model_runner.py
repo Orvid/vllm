@@ -367,33 +367,68 @@ def _df2t_chain_context(
 
     """
     num_logits = int(cu_np[-1])
-    chain_len_np = np.zeros(num_logits, dtype=np.int32)
-    chain_np = np.zeros((num_logits, b_max), dtype=np.int32)
+    chain_len_t = torch.zeros(num_logits, dtype=torch.int32, device=device)
+    chain_t = torch.zeros(num_logits, b_max, dtype=torch.int32, device=device)
+    if num_logits == 0:
+        return chain_len_t, chain_t
+    num_reqs = len(cu_np) - 1
+    widths = [t.token_ids.shape[0] if t is not None else 0 for t in trees]
+    W = max(widths) if widths else 0
+    if W == 0:
+        return chain_len_t, chain_t
+
+    # Pack the per-request tree rows into one [num_reqs, W] batch and track the
+    # per-request live node counts on device, so the per-request ``.tolist()``/
+    # ``.item()`` round-trips of the old numpy walk never gate the per-step path.
+    token_ids = torch.zeros(num_reqs, W, dtype=torch.long, device=device)
+    parents = torch.full((num_reqs, W), -2, dtype=torch.long, device=device)
+    num_nodes = torch.zeros(num_reqs, dtype=torch.long, device=device)
     for r, tree in enumerate(trees):
         if tree is None:
             continue
-        tokens = tree.token_ids.tolist()
-        parents = tree.parents.tolist()
+        n = widths[r]
+        token_ids[r, :n] = tree.token_ids
+        parents[r, :n] = tree.parents
         live = getattr(tree, "num_nodes", None)
-        n = int(live.reshape(-1)[0].item()) if live is not None else len(tokens)
-        n = max(0, min(n, len(tokens)))
-        base = int(cu_np[r])
-        for a in range(n):
-            path: list[int] = []
-            p = parents[a]
-            while p >= 0:
-                path.append(p)
-                p = parents[p]
-            path.reverse()
-            arena = path + [a]
-            k = len(arena)
-            row = base + 1 + a
-            chain_len_np[row] = k
-            chain_np[row, :k] = [tokens[x] for x in arena]
-    return (
-        torch.from_numpy(chain_len_np).to(device),
-        torch.from_numpy(chain_np).to(device),
+        num_nodes[r] = live.clamp(max=W) if live is not None else n
+
+    arange_r = torch.arange(num_reqs, device=device)
+    arange_w = torch.arange(W, device=device)
+    live_mask = arange_w[None, :] < num_nodes[:, None]
+    rows = (
+        torch.tensor(
+            [int(cu_np[r]) for r in range(num_reqs)], dtype=torch.long, device=device
+        )[:, None]
+        + 1
+        + arange_w[None, :]
     )
+
+    # Per-arena tree depth (arena-order parents guarantee parent < child, so one
+    # ascending pass finalizes every row): anchor children have depth 1.
+    depth = torch.zeros(num_reqs, W, dtype=torch.long, device=device)
+    depth = torch.where(
+        (parents == -1) & live_mask, torch.ones_like(depth), depth
+    )
+    for a in range(1, W):
+        safe = parents[:, a].clamp(min=0)
+        parent_depth = torch.gather(depth, 1, safe[:, None]).squeeze(-1)
+        depth[:, a] = torch.where(
+            (parents[:, a] >= 0) & live_mask[:, a],
+            parent_depth + 1,
+            depth[:, a],
+        )
+    chain_len_t[rows[live_mask]] = depth[live_mask].to(torch.int32)
+
+    # Scatter each node's depth-order accepted tokens: after ``step`` parent
+    # follows, the current node sits at chain position ``depth - 1 - step``.
+    u = arange_w[None, :].expand(num_reqs, W)
+    for step in range(W):
+        col = depth - 1 - step
+        valid = (col >= 0) & live_mask
+        vals = token_ids[arange_r[:, None], u][valid].to(torch.int32)
+        chain_t.index_put_((rows[valid], col[valid]), vals)
+        u = parents[arange_r[:, None], u].clamp(min=0)
+    return chain_len_t, chain_t
 
 
 def _df2t_step_seed(seed: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
