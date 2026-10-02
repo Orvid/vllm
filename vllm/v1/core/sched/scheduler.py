@@ -1986,6 +1986,7 @@ class Scheduler(SchedulerInterface):
             self.requests,
             structured_output_request_ids,
             scheduler_output.scheduled_spec_decode_tokens,
+            scheduler_output.spec_tree_draft,
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 

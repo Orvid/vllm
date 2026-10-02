@@ -25,12 +25,47 @@ if TYPE_CHECKING:
     import torch
 
     from vllm.reasoning import ReasoningParser
+    from vllm.v1.outputs import StashedTree
     from vllm.v1.request import Request
 else:
     torch = LazyLoader("torch", globals(), "torch")
 
 
 logger = init_logger(__name__)
+
+
+def _tree_node_chains(tree: "StashedTree | None") -> list[list[int]]:
+    """Per-node accepted-chain token paths (anchor-relative, depth order).
+
+    For request ``r``'s tree, ``chains[a]`` is the depth-order token list from
+    the anchor to node ``a`` (its ancestors plus itself): exactly the prefix a
+    chain decoder would have emitted for a draw at node ``a``'s target row —
+    and the grammar state that draw must be masked against. ``chains[a]`` is a
+    single token for a direct anchor child; a treeless request yields ``[]``.
+
+    Args:
+        tree: the stashed per-request tree (or ``None``).
+
+    Returns:
+        One list of node-token paths per node, or ``[]`` when ``tree`` is
+        ``None``.
+
+    """
+    if tree is None:
+        return []
+    token_ids = tree.token_ids
+    parents = tree.parents
+    n = min(len(token_ids), len(parents))
+    chains: list[list[int]] = []
+    for a in range(n):
+        path: list[int] = []
+        p = parents[a]
+        while p >= 0:
+            path.append(p)
+            p = parents[p]
+        path.reverse()
+        chains.append([token_ids[x] for x in path + [a]])
+    return chains
 
 
 class StructuredOutputManager:
@@ -291,12 +326,29 @@ class StructuredOutputManager:
                 return i + 1
         return 1
 
+    def _is_df2t(self) -> bool:
+        """Whether the operative speculative config drafts df2t trees.
+
+        df2t drafts are arena-ordered tree tokens, so the linear-chain grammar
+        checks below must not treat them as a sequence.
+        """
+        spec_config = getattr(self.vllm_config, "speculative_config", None)
+        return spec_config is not None and spec_config.use_df2t()
+
     def validate_tokens(self, request: "Request", spec_tokens: list[int]) -> list[int]:
         """Return the longest unconstrained or grammar-valid prefix of `spec_tokens`."""
         if not request.use_structured_output:
             return spec_tokens
 
         spec_tokens = strip_speculative_padding(spec_tokens)
+        # df2t drafts are arena-ordered tree tokens, not a chain: advancing the
+        # grammar through arena order validates siblings as a sequence and can
+        # drop valid on-chain tokens past a branch. The tree-aware bitmask
+        # enforces the grammar per accepted-chain position, so the chain check
+        # is skipped entirely for df2t (see `grammar_bitmask`).
+        if self._is_df2t():
+            return spec_tokens
+
         constraint_start = self._get_constraint_start(request, spec_tokens)
         if constraint_start >= len(spec_tokens):
             return spec_tokens
@@ -316,6 +368,7 @@ class StructuredOutputManager:
         requests: dict[str, "Request"],
         structured_output_request_ids: list[str],
         scheduled_spec_decode_tokens: dict[str, list[int]],
+        scheduled_spec_tree_draft: "dict[str, StashedTree] | None" = None,
     ) -> "npt.NDArray[np.int32] | None":
         # Prepare the structured output bitmask for this batch.
         if not structured_output_request_ids:
@@ -387,6 +440,49 @@ class StructuredOutputManager:
                 constraint_start = self._get_constraint_start(
                     request, strip_speculative_padding(req_tokens)
                 )
+                tree = (
+                    scheduled_spec_tree_draft.get(req_id)
+                    if scheduled_spec_tree_draft is not None
+                    else None
+                )
+                if tree is not None:
+                    # df2t tree: mask each verify row against the grammar
+                    # advanced through that node's ACCEPTED CHAIN. Row 0 is the
+                    # anchor (the current grammar); row ``1 + a`` is node
+                    # ``a``'s target row, drawn after the accepted chain of its
+                    # ancestors plus itself (not the arena-order siblings).
+                    chains = _tree_node_chains(tree)
+                    constrained = constraint_start == 0
+                    for i in range(len(req_tokens) + 1):
+                        if i == 0:
+                            self._fill_bitmasks(
+                                ((grammar, cumulative_index, constrained),)
+                            )
+                        else:
+                            a = i - 1
+                            path = chains[a] if a < len(chains) else []
+                            if constrained and path:
+                                # Temporarily advance the grammar along the
+                                # node's chain; roll back only the tokens the
+                                # FSM actually accepted.
+                                advanced = 0
+                                for t in path:
+                                    if grammar.is_terminated() or not (
+                                        grammar.accept_tokens(req_id, [t])
+                                    ):
+                                        break
+                                    advanced += 1
+                                self._fill_bitmasks(
+                                    ((grammar, cumulative_index, True),)
+                                )
+                                grammar.rollback(advanced)
+                            else:
+                                self._fill_bitmasks(
+                                    ((grammar, cumulative_index, False),)
+                                )
+                        cumulative_index += 1
+                    continue
+
                 state_advancements = 0
                 seen_padding = False
                 # Row filled from the last valid grammar state before a draft
