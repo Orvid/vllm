@@ -222,6 +222,31 @@ class DF2TSpeculator(DFlash2Speculator):
         """
         if not self._tree_enabled or self._last_tree is None:
             return None
+        buffers = self._latest_tree_buffers(num_reqs)
+        if buffers is None:
+            return None
+        token_ids, depths, parents, arena, words, num_nodes = buffers
+        return [
+            TreeDraft(
+                token_ids=token_ids[i],
+                depths=depths[i],
+                parents=parents[i],
+                arena=arena[i],
+                words=words[i],
+                num_nodes=num_nodes[i : i + 1],
+            )
+            for i in range(num_reqs)
+        ]
+
+    def _latest_tree_buffers(
+        self, num_reqs: int
+    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None":
+        """Guarded, tail-sanitized builder views for the last ``num_reqs`` rows.
+
+        Shared by :meth:`get_latest_tree_drafts` (per-request ``TreeDraft``)
+        and :meth:`get_latest_tree_tensors` (raw batched views), so both see the
+        same fail-closed over-read guard and the same inert-tail sanitization.
+        """
         assert self.tree_builder is not None
         if num_reqs > self._last_built_rows:
             raise RuntimeError(
@@ -232,17 +257,28 @@ class DF2TSpeculator(DFlash2Speculator):
             )
         self._sanitize_tree_tails(num_reqs)
         b = self.tree_builder
-        return [
-            TreeDraft(
-                token_ids=b.token_ids[i],
-                depths=b.depths[i],
-                parents=b.parents[i],
-                arena=b.arena[i],
-                words=b.words[i],
-                num_nodes=b.num_nodes[i : i + 1],
-            )
-            for i in range(num_reqs)
-        ]
+        return (
+            b.token_ids[:num_reqs],
+            b.depths[:num_reqs],
+            b.parents[:num_reqs],
+            b.arena[:num_reqs],
+            b.words[:num_reqs],
+            b.num_nodes[:num_reqs],
+        )
+
+    def get_latest_tree_tensors(self, num_reqs: int):
+        """Batched device-side tree view for the scheduler carry.
+
+        The same guarded, sanitized builder buffers as
+        :meth:`get_latest_tree_drafts`, exposed as the raw ``[num_reqs, B]``
+        (and ``[R]`` for ``num_nodes``) device views so the draft-token handler
+        can convert the whole batch with one batched (async) host copy instead
+        of per-request ``.tolist()``/``.item()`` round-trips on the per-step
+        path. ``None`` (pre-first-build or tree-off) keeps the plain-token path.
+        """
+        if not self._tree_enabled or self._last_tree is None:
+            return None
+        return self._latest_tree_buffers(num_reqs)
 
     def _sanitize_tree_tails(self, num_reqs: int) -> None:
         """Overwrite each request's tree columns past its live node count with

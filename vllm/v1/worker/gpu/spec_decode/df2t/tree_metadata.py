@@ -3,8 +3,10 @@
 """TreeDraft: per-request tree node SoA plus a torch reference builder."""
 
 import heapq
+from collections.abc import Sequence
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 from vllm.v1.outputs import StashedTree
@@ -51,6 +53,66 @@ class TreeDraft:
             words=torch.tensor(stashed.words, dtype=torch.long, device=device),
             num_nodes=num_nodes,
         )
+
+    @classmethod
+    def from_lists_batched(
+        cls,
+        stashed: "Sequence[StashedTree | None]",
+        device: str | torch.device,
+    ) -> "list[TreeDraft | None]":
+        """Rebuild a batch of stashed trees with one batched host->device copy.
+
+        Replaces a loop of per-request :meth:`from_lists` (which lands ``R * 6``
+        tiny ``torch.tensor(list, device=device)`` H2D copies) with a single
+        ``[R, W, 5]`` int64 transfer plus one ``[R]`` int32 ``num_nodes``
+        transfer, then per-request strided views sliced to each tree's own live
+        width. The rebuilt tensors are bit-identical to the per-request loop
+        (same values, dtypes, and per-request ``token_ids.shape[0]`` == the
+        stashed width); requests without a tree stay ``None``, as do ``None``
+        ``num_nodes`` values.
+
+        Args:
+            stashed: ``[R]`` per-request ``StashedTree`` in batch order.
+            device: Target device of the batched copy.
+
+        """
+        R = len(stashed)
+        widths = [len(s.token_ids) if s is not None else 0 for s in stashed]
+        W = max(widths) if widths else 0
+        if W == 0:
+            return [None] * R
+        has_nn = [bool(s is not None and s.num_nodes is not None) for s in stashed]
+        nn = np.zeros(R, dtype=np.int32)
+        arr = np.zeros((R, W, 5), dtype=np.int64)
+        for r, s in enumerate(stashed):
+            if s is None:
+                continue
+            n = widths[r]
+            arr[r, :n, 0] = s.token_ids
+            arr[r, :n, 1] = s.depths
+            arr[r, :n, 2] = s.parents
+            arr[r, :n, 3] = s.arena
+            arr[r, :n, 4] = s.words
+            nn[r] = int(s.num_nodes) if has_nn[r] else n
+        arr_t = torch.from_numpy(arr).to(device)
+        nn_t = torch.from_numpy(nn).to(device)
+        out: "list[TreeDraft | None]" = []
+        for r in range(R):
+            n = widths[r]
+            if n == 0:
+                out.append(None)
+                continue
+            out.append(
+                cls(
+                    token_ids=arr_t[r, :n, 0],
+                    depths=arr_t[r, :n, 1],
+                    parents=arr_t[r, :n, 2],
+                    arena=arr_t[r, :n, 3],
+                    words=arr_t[r, :n, 4],
+                    num_nodes=nn_t[r : r + 1] if has_nn[r] else None,
+                )
+            )
+        return out
 
 
 def pack_ancestor_words(

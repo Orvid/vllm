@@ -1790,14 +1790,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             np.cumsum(num_logits, out=cu_num_logits_np[1:])
             cu_num_logits = async_tensor_h2d(cu_num_logits_np, device=self.device)
             if use_df2t_trees:
-                trees = [
-                    TreeDraft.from_lists(
-                        scheduler_output.spec_tree_draft[req], self.device
-                    )
-                    if req in scheduler_output.spec_tree_draft
-                    else None
-                    for req in req_ids
+                # One batched host->device rebuild (single [R, W, 5] transfer)
+                # instead of per-request ``from_lists`` H2D copies.
+                stashed = [
+                    scheduler_output.spec_tree_draft.get(req) for req in req_ids
                 ]
+                trees = TreeDraft.from_lists_batched(stashed, self.device)
                 for req_idx, tree in enumerate(trees):
                     if tree is not None:
                         assert (
@@ -3346,14 +3344,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # fresh from the (possibly graph-replayed) TreeBuilder buffers for
             # exactly this batch; other speculators expose None and keep the
             # plain-token path.
-            _tree_getter = getattr(self.speculator, "get_latest_tree_drafts", None)
-            trees = (
-                _tree_getter(input_batch.num_reqs) if _tree_getter is not None else None
+            _tensor_getter = getattr(self.speculator, "get_latest_tree_tensors", None)
+            tree_arrays = (
+                _tensor_getter(input_batch.num_reqs)
+                if _tensor_getter is not None
+                else None
             )
+            trees = None
+            if tree_arrays is None:
+                _tree_getter = getattr(
+                    self.speculator, "get_latest_tree_drafts", None
+                )
+                trees = (
+                    _tree_getter(input_batch.num_reqs)
+                    if _tree_getter is not None
+                    else None
+                )
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
                 self.req_states.draft_tokens[input_batch.idx_mapping],
                 trees=trees,
+                tree_arrays=tree_arrays,
             )
             if self.pp_handler is not None:
                 self.pp_handler.broadcast_drafts(
