@@ -213,7 +213,7 @@ class TreeVerifier:
         else:
             greedy_mask = greedy.to(torch.bool).to(device)[:R]
 
-        gens = None
+        gens: list[torch.Generator | None] | None = None
         if seeds is not None:
             seeds = seeds.to(torch.long).to(device)
             gens = []
