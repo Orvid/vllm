@@ -2307,10 +2307,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Tree-correct accepted-chain context for the additive logits
         # processors: each verify row carries its own accepted-prefix chain
         # (ancestors + itself in depth order) so repetition/bad-words/budget
-        # and custom processors never count arena-order siblings.
-        chain_prefix_len, chain_prefix = _df2t_chain_context(
-            trees, cu, b_max, self.device
-        )
+        # and custom processors never count arena-order siblings. Skipped when
+        # no request needs logits processing (apply_sampling_params then
+        # returns the logits untouched).
+        chain_prefix_len = chain_prefix = None
+        if np.any(
+            self.sampler.needs_logits_processing[input_batch.idx_mapping_np]
+        ):
+            chain_prefix_len, chain_prefix = _df2t_chain_context(
+                trees, cu, b_max, self.device
+            )
 
         # The full ordinary-decode logits pipeline (penalties, custom
         # processors, min_p, temperature, top-k/top-p). A df2t request must
