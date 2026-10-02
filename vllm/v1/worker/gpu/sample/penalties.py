@@ -97,6 +97,8 @@ class PenaltiesState(LogitsProcessor):
             self.presence_penalty.gpu,
             self.prompt_bin_mask,
             self.output_bin_counts,
+            chain_prefix_len=ctx.chain_prefix_len,
+            chain_prefix=ctx.chain_prefix,
         )
         return logits
 
@@ -116,6 +118,10 @@ def _penalties_kernel(
     output_bin_counts_ptr,
     output_bin_counts_stride,
     vocab_size,
+    chain_prefix_len_ptr,
+    chain_prefix_ptr,
+    chain_prefix_stride,
+    IS_TREE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
@@ -144,16 +150,29 @@ def _penalties_kernel(
         other=0,
     )
 
-    # Accumulate draft token counts from previous positions directly into
-    # output_bin_counts (preserves its native tensor layout, avoiding an
-    # expensive shared-memory layout conversion after the loop).
-    pos = tl.load(expanded_local_pos_ptr + token_idx)
-    start_idx = token_idx - pos
+    # Accumulate the already-emitted draft tokens from previous positions
+    # directly into output_bin_counts (preserves its native tensor layout,
+    # avoiding an expensive shared-memory layout conversion after the loop).
+    # Under a df2t tree (IS_TREE) the emitted prefix is the row's accepted
+    # chain (ancestors + itself in depth order) read from the per-row chain
+    # table; otherwise it is the linear draft prefix in the request's block
+    # (arena/local order), which is correct for a chain.
     output_bin_counts = base_output_counts
-    for prev_pos in tl.range(pos):
-        prev_token = tl.load(token_ids_ptr + start_idx + prev_pos + 1)
-        token_match = block == prev_token
-        output_bin_counts = output_bin_counts + token_match.to(tl.int32)
+    if IS_TREE:
+        pos = tl.load(chain_prefix_len_ptr + token_idx)
+        for prev_pos in tl.range(pos):
+            prev_token = tl.load(
+                chain_prefix_ptr + token_idx * chain_prefix_stride + prev_pos
+            )
+            token_match = block == prev_token
+            output_bin_counts = output_bin_counts + token_match.to(tl.int32)
+    else:
+        pos = tl.load(expanded_local_pos_ptr + token_idx)
+        start_idx = token_idx - pos
+        for prev_pos in tl.range(pos):
+            prev_token = tl.load(token_ids_ptr + start_idx + prev_pos + 1)
+            token_match = block == prev_token
+            output_bin_counts = output_bin_counts + token_match.to(tl.int32)
     output_bin_mask = output_bin_counts > 0
 
     # Apply repetition penalties.
@@ -191,10 +210,13 @@ def apply_penalties(
     presence_penalty: torch.Tensor,
     prompt_bin_mask: torch.Tensor,
     output_bin_counts: torch.Tensor,
+    chain_prefix_len: torch.Tensor | None = None,
+    chain_prefix: torch.Tensor | None = None,
 ) -> None:
     num_tokens, vocab_size = logits.shape
     BLOCK_SIZE = 8192
     num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
+    is_tree = chain_prefix is not None
     _penalties_kernel[(num_tokens, num_blocks)](
         logits,
         logits.stride(0),
@@ -209,6 +231,10 @@ def apply_penalties(
         output_bin_counts,
         output_bin_counts.stride(0),
         vocab_size,
+        chain_prefix_len,
+        chain_prefix,
+        chain_prefix.stride(0) if chain_prefix is not None else 0,
+        IS_TREE=is_tree,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 

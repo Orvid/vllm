@@ -224,6 +224,64 @@ def _df2t_verify_rejects_logprobs(sampling_states, idx_mapping_np) -> None:
         )
 
 
+def _df2t_chain_context(
+    trees: "list[TreeDraft | None]",
+    cu_np: list[int],
+    b_max: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Tree-correct accepted-chain context for the df2t verify block.
+
+    The additive logits processors (penalties, bad words, thinking budget and
+    custom processors) assume a linear draft chain: a row's "already emitted"
+    prefix is the contiguous arena-order rows before it. Under a tree that is
+    wrong — siblings and other branches sit in arena order, and are not on the
+    accepted chain — so every verify row gets an explicit accepted-prefix table
+    instead.
+
+    For request r's block rows ``[cu[r], cu[r+1])`` (row 0 = anchor, row
+    ``1 + a`` = node ``a``), the chain context of a node at tree depth d is the
+    d accepted draft tokens on the path from the anchor to the node (its
+    ancestors plus itself, in depth order) — exactly the context a chain
+    decoder would have accumulated for that draw. The anchor row (and any
+    padding row of a partial tree) has an empty chain.
+
+    Returns:
+        ``(chain_prefix_len, chain_prefix)``: ``chain_prefix_len`` is ``[total
+        logits]`` int32, ``chain_prefix`` ``[total logits, b_max]`` int32 with
+        the node's depth-order accepted tokens at ``[row, :len]``.
+
+    """
+    num_logits = int(cu_np[-1])
+    chain_len_np = np.zeros(num_logits, dtype=np.int32)
+    chain_np = np.zeros((num_logits, b_max), dtype=np.int32)
+    for r, tree in enumerate(trees):
+        if tree is None:
+            continue
+        tokens = tree.token_ids.tolist()
+        parents = tree.parents.tolist()
+        live = getattr(tree, "num_nodes", None)
+        n = int(live.reshape(-1)[0].item()) if live is not None else len(tokens)
+        n = max(0, min(n, len(tokens)))
+        base = int(cu_np[r])
+        for a in range(n):
+            path: list[int] = []
+            p = parents[a]
+            while p >= 0:
+                path.append(p)
+                p = parents[p]
+            path.reverse()
+            arena = path + [a]
+            k = len(arena)
+            row = base + 1 + a
+            chain_len_np[row] = k
+            chain_np[row, :k] = [tokens[x] for x in arena]
+    return (
+        torch.from_numpy(chain_len_np).to(device),
+        torch.from_numpy(chain_np).to(device),
+    )
+
+
 def _resolve_decode_query_len(
     speculative_config: SpeculativeConfig | None,
     num_speculative_steps: int,
@@ -2223,6 +2281,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         b_vals = [t.token_ids.shape[0] if t is not None else 0 for t in trees]
         b_max = max(b_vals)
 
+        # Tree-correct accepted-chain context for the additive logits
+        # processors: each verify row carries its own accepted-prefix chain
+        # (ancestors + itself in depth order) so repetition/bad-words/budget
+        # and custom processors never count arena-order siblings.
+        chain_prefix_len, chain_prefix = _df2t_chain_context(
+            trees, cu, b_max, self.device
+        )
+
         # The full ordinary-decode logits pipeline (penalties, custom
         # processors, min_p, temperature, top-k/top-p). A df2t request must
         # never silently drop its active sampling/processing configuration.
@@ -2235,6 +2301,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.input_ids[input_batch.logits_indices],
             input_batch.expanded_local_pos,
             input_batch.seq_lens_cpu_upper_bound.numpy(),
+            chain_prefix_len=chain_prefix_len,
+            chain_prefix=chain_prefix,
         )
         token_ids = torch.zeros(num_reqs, b_max, dtype=torch.long, device=self.device)
         parents = torch.full(
@@ -2267,6 +2335,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ss = self.sampler.sampling_states
         _df2t_verify_rejects_logprobs(ss, input_batch.idx_mapping_np)
         idx = input_batch.idx_mapping
+        # Only explicitly-seeded requests get a generator; each seeded request
+        # keys its generator on the raw seed mixed with its anchor position so
+        # successive steps draw independent streams (the ordinary sampler's
+        # seed + position discipline). Other requests always use the global
+        # RNG, so an unseeded request in a mixed batch is never dragged onto a
+        # fixed per-step stream, and the verifier sentinel -1 means "no
+        # generator".
         seeds = None
         if ss.any_explicit_seed(input_batch.idx_mapping_np):
             seeds = ss.seeds.gpu[idx]

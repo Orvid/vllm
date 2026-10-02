@@ -94,6 +94,8 @@ class BadWordsState(LogitsProcessor):
             ctx.input_ids,
             ctx.expanded_local_pos,
             max_num_bad_words,
+            chain_prefix_len=ctx.chain_prefix_len,
+            chain_prefix=ctx.chain_prefix,
         )
         return logits
 
@@ -114,6 +116,10 @@ def _bad_words_kernel(
     total_len_ptr,
     input_ids_ptr,
     expanded_local_pos_ptr,
+    chain_prefix_len_ptr,
+    chain_prefix_ptr,
+    chain_prefix_stride,
+    IS_TREE: tl.constexpr,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     bw_idx = tl.program_id(1)
@@ -125,6 +131,8 @@ def _bad_words_kernel(
         return
 
     pos = tl.load(expanded_local_pos_ptr + token_idx)
+    if IS_TREE:
+        pos = tl.load(chain_prefix_len_ptr + token_idx)
     cur_req_first_pos = token_idx - pos
 
     prompt_len = tl.load(prompt_len_ptr + req_state_idx)
@@ -152,10 +160,17 @@ def _bad_words_kernel(
 
         from_spec_input = actual_pos >= output_len
         if from_spec_input:
-            # input_ids at local position 0 is the last committed token;
-            # draft tokens start at local position 1.
+            # The token is a within-step draft. Under a df2t tree (IS_TREE)
+            # the emitted prefix is the row's accepted chain read from the
+            # per-row chain table; otherwise the draft token at local
+            # position 1 is the first draft after the committed anchor.
             spec_offset = actual_pos - output_len
-            actual = tl.load(input_ids_ptr + cur_req_first_pos + spec_offset + 1)
+            if IS_TREE:
+                actual = tl.load(
+                    chain_prefix_ptr + token_idx * chain_prefix_stride + spec_offset
+                )
+            else:
+                actual = tl.load(input_ids_ptr + cur_req_first_pos + spec_offset + 1)
         else:
             actual = tl.load(output_base + actual_pos)
 
@@ -177,8 +192,11 @@ def apply_bad_words(
     input_ids: torch.Tensor,
     expanded_local_pos: torch.Tensor,
     max_num_bad_words: int,
+    chain_prefix_len: torch.Tensor | None = None,
+    chain_prefix: torch.Tensor | None = None,
 ) -> None:
     num_tokens = logits.shape[0]
+    is_tree = chain_prefix is not None
     _bad_words_kernel[(num_tokens, max_num_bad_words)](
         logits,
         logits.stride(0),
@@ -194,4 +212,8 @@ def apply_bad_words(
         total_len,
         input_ids,
         expanded_local_pos,
+        chain_prefix_len,
+        chain_prefix,
+        chain_prefix.stride(0) if chain_prefix is not None else 0,
+        IS_TREE=is_tree,
     )

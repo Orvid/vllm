@@ -130,6 +130,8 @@ class ThinkingBudgetState:
             self.reasoning_start_token_ids,
             self.natural_reasoning_end_token_ids,
             self.reasoning_end_token_ids,
+            chain_prefix_len=ctx.chain_prefix_len,
+            chain_prefix=ctx.chain_prefix,
         )
 
 
@@ -142,12 +144,21 @@ def _load_effective_token(
     req_state_idx,
     total_len,
     pos,
+    token_idx,
+    chain_prefix_ptr,
+    chain_prefix_stride,
+    IS_TREE: tl.constexpr,
 ):
     if pos < total_len:
         return tl.load(all_token_ids_ptr + req_state_idx * all_token_ids_stride + pos)
     # In decode/spec-decode, input_ids at local position 0 is the already
     # committed last sampled token. Effective draft-prefix positions start at
-    # local position 1.
+    # local position 1. Under a df2t tree (IS_TREE) the draft prefix is the
+    # row's accepted chain read from the per-row chain table.
+    if IS_TREE:
+        return tl.load(
+            chain_prefix_ptr + token_idx * chain_prefix_stride + (pos - total_len)
+        )
     input_pos = cur_req_first_pos + pos - total_len + 1
     return tl.load(input_ids_ptr + input_pos)
 
@@ -266,6 +277,10 @@ def _thinking_budget_kernel(
     reasoning_start_token_ids_ptr,
     natural_reasoning_end_token_ids_ptr,
     reasoning_end_token_ids_ptr,
+    chain_prefix_len_ptr,
+    chain_prefix_ptr,
+    chain_prefix_stride,
+    IS_TREE: tl.constexpr,
     START_LEN: tl.constexpr,
     NATURAL_END_LEN: tl.constexpr,
     END_LEN: tl.constexpr,
@@ -277,6 +292,8 @@ def _thinking_budget_kernel(
         return
 
     local_pos = tl.load(expanded_local_pos_ptr + token_idx)
+    if IS_TREE:
+        local_pos = tl.load(chain_prefix_len_ptr + token_idx)
     cur_req_first_pos = token_idx - local_pos
     total_len = tl.load(total_len_ptr + req_state_idx)
     effective_len = total_len + local_pos
@@ -299,6 +316,10 @@ def _thinking_budget_kernel(
                 req_state_idx,
                 total_len,
                 i + j,
+                token_idx,
+                chain_prefix_ptr,
+                chain_prefix_stride,
+                IS_TREE,
             )
             start_match = start_match & (actual == expected)
         if start_match:
@@ -319,6 +340,10 @@ def _thinking_budget_kernel(
                 req_state_idx,
                 total_len,
                 i + j,
+                token_idx,
+                chain_prefix_ptr,
+                chain_prefix_stride,
+                IS_TREE,
             )
             end_match = end_match & (actual == expected)
         if end_match:
@@ -356,6 +381,10 @@ def _thinking_budget_kernel(
                         req_state_idx,
                         total_len,
                         suffix_start + j,
+                        token_idx,
+                        chain_prefix_ptr,
+                        chain_prefix_stride,
+                        IS_TREE,
                     )
                     prefix_match = prefix_match & (actual == expected)
             if prefix_match:
@@ -380,6 +409,8 @@ def apply_thinking_budget(
     reasoning_start_token_ids: torch.Tensor,
     natural_reasoning_end_token_ids: torch.Tensor,
     reasoning_end_token_ids: torch.Tensor,
+    chain_prefix_len: torch.Tensor | None = None,
+    chain_prefix: torch.Tensor | None = None,
 ) -> None:
     num_tokens = logits.shape[0]
     start_len = reasoning_start_token_ids.shape[0]
@@ -418,6 +449,10 @@ def apply_thinking_budget(
         reasoning_start_token_ids,
         natural_reasoning_end_token_ids,
         reasoning_end_token_ids,
+        chain_prefix_len,
+        chain_prefix,
+        chain_prefix.stride(0) if chain_prefix is not None else 0,
+        IS_TREE=chain_prefix is not None,
         START_LEN=start_len,
         NATURAL_END_LEN=natural_end_len,
         END_LEN=end_len,

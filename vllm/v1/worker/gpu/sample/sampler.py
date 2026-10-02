@@ -231,6 +231,8 @@ class Sampler:
         expanded_local_pos: torch.Tensor,
         seq_lens_upper_bound_np: np.ndarray,
         skip_top_k_top_p: bool = False,
+        chain_prefix_len: torch.Tensor | None = None,
+        chain_prefix: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if not np.any(self.needs_logits_processing[idx_mapping_np]):
             return logits
@@ -246,6 +248,8 @@ class Sampler:
             input_ids=input_ids,
             pos=pos,
             seq_lens_upper_bound_np=seq_lens_upper_bound_np,
+            chain_prefix_len=chain_prefix_len,
+            chain_prefix=chain_prefix,
         )
 
         # Apply logits processors (native + any custom).

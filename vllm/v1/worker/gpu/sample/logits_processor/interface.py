@@ -87,6 +87,19 @@ class LogitsContext:
     # being sampled this step, on the host. Exact when spec decoding isn't in use.
     # Exact per-row lengths on device are `pos + 1`.
     seq_lens_upper_bound_np: np.ndarray
+    # [num_logits_rows] length of the row's tree-correct accepted-chain
+    # context, or None for chain layouts. Set only under df2t tree verify: it
+    # is the number of already-emitted draft tokens on the row's accepted
+    # chain (``chain_prefix_len`` tokens), which may be fewer or differently
+    # ordered than ``expanded_local_pos`` (arena order includes siblings).
+    chain_prefix_len: torch.Tensor | None = None
+    # [num_logits_rows, max_chain] the row's accepted-chain tokens in depth
+    # order (the anchor is excluded: it is already committed and counted in
+    # the request state), or None. A node at tree depth d has d tokens (its
+    # ancestors plus itself); the anchor row has 0. Processors MUST prefer
+    # this over ``input_ids`` + ``expanded_local_pos`` when it is set, so the
+    # raw tree block's arena-order sibling positions never contribute.
+    chain_prefix: torch.Tensor | None = None
 
 
 class LogitsProcessor(ABC):
