@@ -138,8 +138,100 @@ def _flex_matrix(
     return mask_mod(b, h, q, k)
 
 
+def _build_flex_windowed_reference(specs, query_start_loc, max_b, window):
+    """The ``build_flex_tree_mask`` closure (windowed) over the full batch."""
+    num_reqs = len(specs)
+    request_lookup = torch.zeros(query_start_loc[-1], dtype=torch.int32)
+    for r, (lo, hi) in enumerate(zip(query_start_loc, query_start_loc[1:])):
+        request_lookup[lo:hi] = r
+    c_per_req = torch.tensor([c for c, _, _, _ in specs], dtype=torch.long)
+    words = torch.zeros(num_reqs, max_b, dtype=torch.long)
+    for r, (_, w, _, _) in enumerate(specs):
+        words[r, : len(w)] = torch.tensor(w, dtype=torch.long)
+    depths = torch.zeros(num_reqs, max_b, dtype=torch.long)
+    for r, (_, _, dpt, _) in enumerate(specs):
+        depths[r, : len(dpt)] = torch.tensor(dpt, dtype=torch.long)
+    mask_mod, _ = build_flex_tree_mask(
+        num_reqs, c_per_req, words, max_b, request_lookup, window=window, depths=depths
+    )
+    return mask_mod, request_lookup, c_per_req, words, depths
+
+
+def _flex_window_matrix(
+    mask_mod, request_lookup, c_per_req, words, depths, max_b, query_start_loc, r
+) -> torch.Tensor:
+    """Evaluate the prebuilt windowed flex closure on request ``r``'s grid."""
+    C = c_per_req[r].item()
+    B_r = (query_start_loc[r + 1] - query_start_loc[r]) - 1
+    n = C + 1 + B_r
+    start = query_start_loc[r]
+    b_for_q = torch.full((n,), start, dtype=torch.long)
+    b_for_q[C + 1 :] = start + 1 + torch.arange(B_r, dtype=torch.long)
+    q = torch.arange(n, dtype=torch.long)[:, None].expand(n, n)
+    k = torch.arange(n, dtype=torch.long)[None, :].expand(n, n)
+    h = torch.zeros(1, dtype=torch.long)
+    b = b_for_q[:, None].expand(n, n)
+    return mask_mod(b, h, q, k)
+
+
+def _windowed_specs() -> list[tuple[int, list[int], list[int], int]]:
+    return [
+        (4, [0b1, 0b11, 0b101], [0, 1, 2], 3),
+        (2, [0b1, 0b11], [0, 1], 2),
+    ]
+
+
 def _tree_specs() -> list[tuple[int, list[int], int]]:
     return [(4, [0b1, 0b11, 0b101], 3), (2, [0b1, 0b11], 2)]
+
+
+def _manual_window_matrix(
+    C: int, words: list[int], depths: list[int], B: int, window: int
+) -> torch.Tensor:
+    """Manual ``[C + 1 + B, C + 1 + B]`` matrix for a windowed tree verify.
+
+    Key ``(q, k)`` is allowed iff the ancestor-or-self tree mask allows it AND
+    the key's *position* is within ``window`` of the query's *position*.
+    Positions: context keys ``k < C`` sit at position ``k``, the anchor at
+    ``C``, and tree node ``j`` at ``C + depths[j]`` (arena-decoupled from the
+    block slot ``C + 1 + j``). ``window < 0`` disables the window term.
+    """
+    n = C + 1 + B
+    matrix = torch.zeros(n, n, dtype=torch.bool)
+    words_t = torch.tensor(words, dtype=torch.long)
+    depths_t = torch.tensor(depths, dtype=torch.long)
+
+    def kpos(k: int) -> int:
+        if k < C:
+            return k
+        if k == C:
+            return C
+        j = k - (C + 1)
+        if 0 <= j < B:
+            return C + int(depths_t[j].item())
+        return k
+
+    def in_window(qpos: int, kpos_v: int) -> bool:
+        if window is None or window < 0:
+            return True
+        return (qpos - kpos_v) < window
+
+    for arena in range(B):
+        q = C + 1 + arena
+        qpos = C + int(depths_t[arena].item())
+        for k in range(C):
+            if in_window(qpos, kpos(k)):
+                matrix[q, k] = True
+        if in_window(qpos, C):
+            matrix[q, C] = True
+        for j in range(B):
+            k = C + 1 + j
+            if bool((words_t[arena] >> j) & 1) and in_window(qpos, kpos(k)):
+                matrix[q, k] = True
+    for k in range(C + 1):
+        if in_window(C, kpos(k)):
+            matrix[C, k] = True
+    return matrix
 
 
 def _df2t_spec_config():
@@ -188,6 +280,283 @@ def test_build_fa4_tree_mask_shapes_and_cache():
         B,
     )
     assert aux_packed[0].shape == (num_reqs, B)
+
+
+def test_build_fa4_tree_mask_window_aux_and_cache():
+    """A windowed build_fa4_tree_mask returns the cached closure keyed by the
+    window (same W reuses the object; different W or None is a new closure) and
+    a 3-aux list whose third element is the depths tensor; the non-windowed
+    build is unchanged (2-aux, same closure as before)."""
+    device = torch.device("cpu")
+    num_reqs, B, window = 2, 3, 4
+    c_per_req = torch.tensor([4, 2], dtype=torch.int32, device=device)
+    words = torch.tensor(
+        [[0b1, 0b11, 0b101], [0b1, 0b11, 0]], dtype=torch.int64, device=device
+    )
+    depths = torch.tensor([[0, 1, 2], [0, 1, 0]], dtype=torch.int32, device=device)
+
+    mm_plain, aux_plain = build_fa4_tree_mask(num_reqs, c_per_req, words, B)
+    mm_w1, aux_w1 = build_fa4_tree_mask(
+        num_reqs, c_per_req, words, B, window=window, depths=depths
+    )
+    mm_w2, aux_w2 = build_fa4_tree_mask(
+        num_reqs, c_per_req, words, B, window=window, depths=depths
+    )
+    mm_w3, _ = build_fa4_tree_mask(
+        num_reqs, c_per_req, words, B, window=window + 1, depths=depths
+    )
+    assert mm_w1 is mm_w2  # same (B, window) -> same cached closure
+    assert mm_w1 is not mm_plain
+    assert mm_w3 is not mm_w1
+    assert len(aux_plain) == 2
+    assert len(aux_w1) == 3
+    assert aux_w1[0] is words and aux_w1[1] is c_per_req and aux_w1[2] is depths
+    assert callable(mm_w1)
+    with pytest.raises(AssertionError, match="depths"):
+        build_fa4_tree_mask(num_reqs, c_per_req, words, B, window=window, depths=None)
+
+
+@requires_sm120_fa4
+def test_fa4_tree_mask_window_matches_manual_and_flex_reference():
+    """Windowed df2t tree verify: FA4 paged varlen with the window-composed
+    tree mask_mod reproduces the manual positional-window matrix AND the Flex
+    closure's windowed matrix exactly (within fp tolerance). The node rows'
+    positions are depth-decoupled from their block slots, so a plain index
+    window on slots would NOT reproduce this reference."""
+    window = 3
+    specs = [
+        (4, [0b1, 0b11, 0b101], [0, 1, 2], 3),
+        (2, [0b1, 0b11], [0, 1], 2),
+    ]
+    num_reqs = len(specs)
+    query_lens = [b + 1 for _, _, _, b in specs]
+    seq_lens = [c + 1 + b for c, _, _, b in specs]
+    block_size = 16
+    max_b = max(b for _, _, _, b in specs)
+    max_seqlen = max(seq_lens)
+
+    torch.manual_seed(0)
+    cu = torch.zeros(num_reqs + 1, dtype=torch.int32, device=DEVICE)
+    cu[1:] = torch.tensor(query_lens, dtype=torch.int32, device=DEVICE).cumsum(0)
+    seqused_k = torch.tensor(seq_lens, dtype=torch.int32, device=DEVICE)
+    max_blocks = (max_seqlen + block_size - 1) // block_size
+    physical = torch.arange(
+        num_reqs * max_blocks, dtype=torch.int32, device=DEVICE
+    ).view(num_reqs, max_blocks)
+
+    Hq, Hkv = 16, 8
+    num_tokens = sum(query_lens)
+    q = torch.randn(num_tokens, Hq, 128, dtype=DTYPE, device=DEVICE)
+    k_cache = torch.randn(
+        num_reqs * max_blocks, block_size, Hkv, 128, dtype=DTYPE, device=DEVICE
+    )
+    v_cache = torch.randn_like(k_cache)
+    kfulls, vfulls = [], []
+    for r, (c, _, _, b_nodes) in enumerate(specs):
+        seq_len = seq_lens[r]
+        kf = torch.randn(seq_len, Hkv, 128, dtype=DTYPE, device=DEVICE)
+        vf = torch.randn_like(kf)
+        kfulls.append(kf)
+        vfulls.append(vf)
+        for i in range(seq_len):
+            k_cache[physical[r, i // block_size], i % block_size] = kf[i]
+            v_cache[physical[r, i // block_size], i % block_size] = vf[i]
+
+    words = torch.zeros(num_reqs, max_b, dtype=torch.int64, device=DEVICE)
+    depths = torch.zeros(num_reqs, max_b, dtype=torch.int32, device=DEVICE)
+    for r, (_, w, dpt, _) in enumerate(specs):
+        words[r, : len(w)] = torch.tensor(w, dtype=torch.int64, device=DEVICE)
+        depths[r, : len(dpt)] = torch.tensor(dpt, dtype=torch.int32, device=DEVICE)
+    c_per_req = torch.tensor(
+        [c for c, _, _, _ in specs], dtype=torch.int32, device=DEVICE
+    )
+    scale = 128**-0.5
+
+    mask_mod, aux = build_fa4_tree_mask(
+        num_reqs, c_per_req, words, max_b, window=window, depths=depths
+    )
+    out = flash_attn_varlen_func(
+        q,
+        k_cache,
+        v_cache,
+        max_seqlen_q=max(query_lens),
+        cu_seqlens_q=cu,
+        max_seqlen_k=max_seqlen,
+        cu_seqlens_k=None,
+        seqused_k=seqused_k,
+        block_table=physical,
+        softmax_scale=scale,
+        fa_version=4,
+        num_splits=1,
+        causal=False,
+        window_size=(-1, -1),
+        mask_mod=mask_mod,
+        aux_tensors=aux,
+    )
+
+    query_start_loc = [0]
+    for r, (c, w, dpt, b_nodes) in enumerate(specs):
+        query_start_loc.append(query_start_loc[-1] + b_nodes + 1)
+    flex_mod, flex_lookup, flex_c, flex_words, flex_depths = (
+        _build_flex_windowed_reference(specs, query_start_loc, max_b, window)
+    )
+    manual_out = torch.zeros_like(q, dtype=torch.float32)
+    flex_out = torch.zeros_like(q, dtype=torch.float32)
+    st = 0
+    for r, (c, w, dpt, b_nodes) in enumerate(specs):
+        qr = q[st : st + b_nodes + 1].float()
+        kk = kfulls[r].transpose(0, 1)[None].float().repeat_interleave(Hq // Hkv, dim=1)
+        vv = vfulls[r].transpose(0, 1)[None].float().repeat_interleave(Hq // Hkv, dim=1)
+        m_manual = (
+            _manual_window_matrix(c, w, dpt, b_nodes, window)[c:]
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .to(DEVICE)
+        )
+        m_flex = (
+            _flex_window_matrix(
+                flex_mod,
+                flex_lookup,
+                flex_c,
+                flex_words,
+                flex_depths,
+                max_b,
+                query_start_loc,
+                r,
+            )[c:]
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .to(DEVICE)
+        )
+        manual_out[st : st + b_nodes + 1] = (
+            torch.nn.functional.scaled_dot_product_attention(
+                qr.unsqueeze(0).transpose(1, 2), kk, vv, attn_mask=m_manual, scale=scale
+            )
+            .transpose(1, 2)
+            .squeeze(0)
+        )
+        flex_out[st : st + b_nodes + 1] = (
+            torch.nn.functional.scaled_dot_product_attention(
+                qr.unsqueeze(0).transpose(1, 2), kk, vv, attn_mask=m_flex, scale=scale
+            )
+            .transpose(1, 2)
+            .squeeze(0)
+        )
+        st += b_nodes + 1
+
+    # The manual and flex matrices agree exactly on this tree (both encode the
+    # positional window), and the FA4 kernel reproduces them within tolerance.
+    assert torch.equal(
+        _manual_window_matrix(4, [0b1, 0b11, 0b101], [0, 1, 2], 3, window)[4:],
+        _flex_window_matrix(
+            flex_mod,
+            flex_lookup,
+            flex_c,
+            flex_words,
+            flex_depths,
+            max_b,
+            query_start_loc,
+            0,
+        )[4:],
+    )
+    err_manual = (out.float() - manual_out).abs().max().item()
+    err_flex = (out.float() - flex_out).abs().max().item()
+    assert err_manual < TOL, (
+        f"windowed FA4 tree mask diverged from manual reference: {err_manual}"
+    )
+    assert err_flex < TOL, (
+        f"windowed FA4 tree mask diverged from flex reference: {err_flex}"
+    )
+
+
+@requires_sm120_fa4
+def test_fa4_tree_mask_window_treeless_is_windowed_causal():
+    """A treeless request (a prefill chunk co-scheduled with a windowed tree
+    decode) attends positionally windowed causal attention over its context and
+    its own rows: key ``k`` is kept iff ``k <= q`` AND ``q - k < window`` (the
+    non-spec windowed target's own term), while the co-batched tree request
+    keeps its windowed ancestor-or-self mask."""
+    window = 5
+    tree_c, tree_words, tree_depths, tree_b = 4, [0b1, 0b11, 0b101], [0, 1, 2], 3
+    chunk_c, chunk_rows = 20, 5
+    query_lens = [tree_b + 1, chunk_rows]
+    seq_lens = [tree_c + 1 + tree_b, chunk_c + chunk_rows]
+    block_size = 16
+    max_b = tree_b
+    max_blocks = (max(seq_lens) + block_size - 1) // block_size
+    physical = torch.arange(2 * max_blocks, dtype=torch.int32, device=DEVICE).view(
+        2, max_blocks
+    )
+
+    torch.manual_seed(5)
+    Hq, Hkv = 16, 8
+    q = torch.randn(sum(query_lens), Hq, 128, dtype=DTYPE, device=DEVICE)
+    k_cache = torch.randn(
+        2 * max_blocks, block_size, Hkv, 128, dtype=DTYPE, device=DEVICE
+    )
+    v_cache = torch.randn_like(k_cache)
+    kfulls, vfulls = [], []
+    for r, seq_len in enumerate(seq_lens):
+        kf = torch.randn(seq_len, Hkv, 128, dtype=DTYPE, device=DEVICE)
+        vf = torch.randn_like(kf)
+        for i in range(seq_len):
+            k_cache[physical[r, i // block_size], i % block_size] = kf[i]
+            v_cache[physical[r, i // block_size], i % block_size] = vf[i]
+        kfulls.append(kf)
+        vfulls.append(vf)
+
+    words = torch.zeros(2, max_b, dtype=torch.int64, device=DEVICE)
+    depths = torch.zeros(2, max_b, dtype=torch.int32, device=DEVICE)
+    words[0] = torch.tensor(tree_words, dtype=torch.int64, device=DEVICE)
+    depths[0, : len(tree_depths)] = torch.tensor(
+        tree_depths, dtype=torch.int32, device=DEVICE
+    )
+    c_per_req = torch.tensor([tree_c, chunk_c], dtype=torch.int32, device=DEVICE)
+    cu = torch.tensor(
+        [0, query_lens[0], sum(query_lens)], dtype=torch.int32, device=DEVICE
+    )
+    scale = 128**-0.5
+    mask_mod, aux = build_fa4_tree_mask(
+        2, c_per_req, words, max_b, window=window, depths=depths
+    )
+    out = flash_attn_varlen_func(
+        q,
+        k_cache,
+        v_cache,
+        max_seqlen_q=max(query_lens),
+        cu_seqlens_q=cu,
+        max_seqlen_k=max(seq_lens),
+        cu_seqlens_k=None,
+        seqused_k=torch.tensor(seq_lens, dtype=torch.int32, device=DEVICE),
+        block_table=physical,
+        softmax_scale=scale,
+        fa_version=4,
+        num_splits=1,
+        causal=False,
+        window_size=(-1, -1),
+        mask_mod=mask_mod,
+        aux_tensors=aux,
+    )
+
+    n = seq_lens[1]
+    rows = torch.arange(chunk_c, n)[:, None]
+    masks = [
+        _manual_window_matrix(tree_c, tree_words, tree_depths, tree_b, window)[tree_c:],
+        (torch.arange(n)[None, :] <= rows)
+        & ((rows - torch.arange(n)[None, :]) < window),
+    ]
+    st = 0
+    for r, m in enumerate(masks):
+        qr = q[st : st + query_lens[r]].float().unsqueeze(0).transpose(1, 2)
+        kk = kfulls[r].transpose(0, 1)[None].float().repeat_interleave(Hq // Hkv, 1)
+        vv = vfulls[r].transpose(0, 1)[None].float().repeat_interleave(Hq // Hkv, 1)
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            qr, kk, vv, attn_mask=m[None, None].to(DEVICE), scale=scale
+        )
+        ref = ref.transpose(1, 2).squeeze(0)
+        err = (out[st : st + query_lens[r]].float() - ref).abs().max().item()
+        assert err < TOL, f"request {r} diverged from windowed reference: {err}"
+        st += query_lens[r]
 
 
 @requires_sm120_fa4
@@ -910,16 +1279,26 @@ class _FakeBackend:
         return self._name
 
 
-def _fake_tree(words, device) -> "object":
+def _fake_tree(words, device, depths=None):
+    if depths is None:
+        depths = list(range(len(words)))
     return type(
-        "Tree", (), {"words": torch.tensor(words, dtype=torch.long, device=device)}
+        "Tree",
+        (),
+        {
+            "words": torch.tensor(words, dtype=torch.long, device=device),
+            "depths": torch.tensor(depths, dtype=torch.long, device=device),
+            "token_ids": torch.zeros(len(words), dtype=torch.long, device=device),
+        },
     )()
 
 
-def _fake_fa4_kv_cache_config(block_size, layer_names=("target.attn", "target.attn2")):
+def _fake_fa4_kv_cache_config(
+    block_size, layer_names=("target.attn", "target.attn2"), sliding_window=None
+):
     import types
 
-    spec = types.SimpleNamespace(block_size=block_size)
+    spec = types.SimpleNamespace(block_size=block_size, sliding_window=sliding_window)
     group = types.SimpleNamespace(layer_names=list(layer_names), kv_cache_spec=spec)
     return types.SimpleNamespace(kv_cache_groups=[group])
 
@@ -948,12 +1327,74 @@ def _fake_runner(spec, req_states, device, attn_groups, kv_cache_config=None):
         "_stage_tree_fa4_mask",
         "_fa4_tree_verify_layer_names",
         "_fa4_tree_page_sizes",
+        "_df2t_tree_window",
         "_attach_tree_fa4_mask",
         "_attach_fa4_tree_mask_impl",
         "_ensure_df2t_tree_mask_buffers",
     ):
         setattr(runner, name, types.MethodType(getattr(GPUModelRunner, name), runner))
     return runner
+
+
+def test_runner_stage_attach_fa4_tree_mask_windowed():
+    """A windowed df2t target stages per-request depths and attaches a 3-aux
+    tree mask built with the target KV group's sliding window; the same stage
+    on a non-windowed group stays the 2-aux (window-less) mask."""
+    device = torch.device("cpu")
+    spec = type("Spec", (), {"tree_attention_backend": "fa4", "max_tree_budget": 64})()
+    num_computed = torch.tensor([4, 2, 0, 0], dtype=torch.int32)
+    req_states = type(
+        "ReqStates", (), {"num_computed_tokens": type("T", (), {"gpu": num_computed})()}
+    )()
+    trees = [
+        _fake_tree([0b1, 0b11, 0b101], device, depths=[0, 1, 2]),
+        _fake_tree([0b1, 0b11], device, depths=[0, 1]),
+    ]
+    idx_mapping = torch.tensor([0, 1], dtype=torch.int32)
+    attn_groups = [
+        [
+            type(
+                "G",
+                (),
+                {
+                    "backend": _FakeBackend("FLASH_ATTN"),
+                    "layer_names": ["target.attn", "target.attn2"],
+                },
+            )()
+        ]
+    ]
+    runner = _fake_runner(
+        spec,
+        req_states,
+        device,
+        attn_groups,
+        kv_cache_config=_fake_fa4_kv_cache_config(block_size=16, sliding_window=2048),
+    )
+    runner._stage_tree_fa4_mask(True, trees, 2, idx_mapping)
+    assert runner._pending_tree_fa4_mask is not None
+    assert runner._df2t_tree_mask_depths is not None
+    assert runner._df2t_tree_mask_depths[0][:3].tolist() == [0, 1, 2]
+    assert runner._df2t_tree_mask_depths[1][:2].tolist() == [0, 1]
+
+    target_meta = _fake_fa4_metadata()
+    runner._attach_tree_fa4_mask(
+        {"target.attn": target_meta, "target.attn2": target_meta}
+    )
+    _, c_per_req, words = target_meta.df2t_tree_aux_tensors[:3]
+    assert len(target_meta.df2t_tree_aux_tensors) == 3
+    assert c_per_req[:2].tolist() == [4, 2]
+
+    non_windowed = _fake_runner(
+        spec,
+        req_states,
+        device,
+        attn_groups,
+        kv_cache_config=_fake_fa4_kv_cache_config(block_size=16, sliding_window=None),
+    )
+    non_windowed._stage_tree_fa4_mask(True, trees, 2, idx_mapping)
+    other_meta = _fake_fa4_metadata()
+    non_windowed._attach_tree_fa4_mask({"target.attn": other_meta})
+    assert len(other_meta.df2t_tree_aux_tensors) == 2
 
 
 def test_runner_stage_attach_fa4_tree_mask():
@@ -1048,7 +1489,7 @@ def test_runner_stage_fa4_scopes_zero_context():
     runner._stage_tree_fa4_mask(True, trees, 2, idx_mapping)
     pending = runner._pending_tree_fa4_mask
     assert pending is not None
-    _, c_per_req, words, _ = pending
+    _, c_per_req, words, _, _, _ = pending
     assert c_per_req[:2].tolist() == [4, 0]
     assert bool((words[1] == 0).all().item())
 

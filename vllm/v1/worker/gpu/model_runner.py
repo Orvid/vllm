@@ -538,13 +538,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # ``prepare_inputs`` and attached to the Flex metadata in
         # ``execute_model``. Stays None except on flex-tree batches.
         self._pending_tree_flex_mask: (
-            tuple[int, torch.Tensor, torch.Tensor, int] | None
+            tuple[
+                int,
+                torch.Tensor,
+                torch.Tensor,
+                int,
+                int | None,
+                torch.Tensor | None,
+            ]
+            | None
         ) = None
         # df2t fa4 tree verify: same staging for the FlashAttention-4 mask_mod
         # vehicle (``tree_attention_backend == "fa4"``, the default). Stays
         # None except on fa4-tree batches.
         self._pending_tree_fa4_mask: (
-            tuple[int, torch.Tensor, torch.Tensor, int] | None
+            tuple[
+                int,
+                torch.Tensor,
+                torch.Tensor,
+                int,
+                dict[str, int | None] | None,
+                torch.Tensor | None,
+            ]
+            | None
         ) = None
         # Persistent CUDA-graph aux pools for the FA4 tree mask (ancestor
         # words ``[max_num_reqs, max_tree_budget]`` int64 and per-request
@@ -553,6 +569,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # written in place (``fill_tree_mask_inputs``) between replays.
         self._df2t_tree_mask_words: torch.Tensor | None = None
         self._df2t_tree_mask_c: torch.Tensor | None = None
+        self._df2t_tree_mask_depths: torch.Tensor | None = None
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -1316,8 +1333,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # mask; real steps refresh them before replay.
         assert self._df2t_tree_mask_words is not None
         assert self._df2t_tree_mask_c is not None
+        assert self._df2t_tree_mask_depths is not None
         self._df2t_tree_mask_words.zero_()
         self._df2t_tree_mask_c.zero_()
+        self._df2t_tree_mask_depths.zero_()
+        # The window is a fixed engine-run property (kv cache group spec), so
+        # bake the per-layer window map into the captured attach hook.
+        window_layer = self._df2t_tree_window(self._fa4_tree_verify_layer_names())
 
         def attach(attn_metadata: dict[str, Any] | None) -> None:
             # The pools are sized max_num_reqs; a captured descriptor uses at
@@ -1328,6 +1350,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self._df2t_tree_mask_c,
                 self._df2t_tree_mask_words,
                 width,
+                window_layer,
+                self._df2t_tree_mask_depths,
             )
 
         return attach
@@ -1931,11 +1955,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         words = pack_tree_mask_inputs(
             trees, num_reqs, spec.max_tree_budget, self.device
         )
+        # Per-layer sliding windows (positional-window term of the attached
+        # flex mask) and the per-request node depths backing it.
+        window_map = self._df2t_tree_window(self._tree_verify_layer_names())
+        depths = None
+        if trees is not None:
+            depths = torch.zeros(
+                num_reqs, spec.max_tree_budget, dtype=torch.int64, device=self.device
+            )
+            for r, tree in enumerate(trees[:num_reqs]):
+                if tree is not None and tree.depths.shape[0] > 0:
+                    depths[r, : tree.depths.shape[0]] = tree.depths
         self._pending_tree_flex_mask = (
             num_reqs,
             c_per_req,
             words,
             spec.max_tree_budget,
+            window_map,
+            depths,
         )
 
     def _tree_verify_layer_names(self) -> set[str]:
@@ -1972,7 +2009,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             attach_tree_flex_mask,
         )
 
-        num_reqs, c_per_req, words, b = pending
+        num_reqs, c_per_req, words, b, window_map, depths = pending
         # Only the target verify group(s) (see _tree_verify_layer_names) carry
         # the tree block; a second Flex group's metadata must stay untouched.
         target_layers = self._tree_verify_layer_names()
@@ -1986,7 +2023,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if id(metadata) in seen_metadata:
                 continue
             seen_metadata.add(id(metadata))
-            attach_tree_flex_mask(metadata, num_reqs, c_per_req, words, b)
+            window = window_map.get(layer_name)
+            attach_tree_flex_mask(
+                metadata, num_reqs, c_per_req, words, b, window=window, depths=depths
+            )
             attached = True
         if not attached:
             raise ValueError(
@@ -2001,7 +2041,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         ``width`` is the target attention mask arena width (``max_tree_budget``).
         The buffers stay fixed-address across steps so the captured tree-verify
-        graph can read their refreshed contents at replay.
+        graph can read their refreshed contents at replay. The node-depth pool
+        lazily backs the windowed FA4 mask's positional-window aux; it is still
+        allocated for every run so the aux-array addresses a captured windowed
+        graph bakes stay stable.
         """
         if self._df2t_tree_mask_words is not None:
             return
@@ -2010,6 +2053,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self._df2t_tree_mask_c = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=self.device
+        )
+        self._df2t_tree_mask_depths = torch.zeros(
+            self.max_num_reqs, width, dtype=torch.int32, device=self.device
         )
 
     def _stage_tree_fa4_mask(
@@ -2042,6 +2088,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._ensure_df2t_tree_mask_buffers(width)
         assert self._df2t_tree_mask_words is not None
         assert self._df2t_tree_mask_c is not None
+        assert self._df2t_tree_mask_depths is not None
         c_per_req = self.req_states.num_computed_tokens.gpu[idx_mapping]
         fill_tree_mask_inputs(
             self._df2t_tree_mask_words,
@@ -2050,16 +2097,51 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_reqs,
             width,
             c_per_req,
+            depths_out=self._df2t_tree_mask_depths,
         )
         # The whole persistent pool is handed to build_fa4_tree_mask (its
         # asserts accept >= num_reqs rows); only rows < num_reqs hold live
         # data. The same pool addresses are baked into the captured graph.
+        # Depths are always staged (even for a window-less target the windowed
+        # mask simply ignores them) so a captured descriptor's aux signature is
+        # stable across replays.
         self._pending_tree_fa4_mask = (
             num_reqs,
             self._df2t_tree_mask_c,
             self._df2t_tree_mask_words,
             spec.max_tree_budget,
+            self._df2t_tree_window(self._fa4_tree_verify_layer_names()),
+            self._df2t_tree_mask_depths,
         )
+
+    def _df2t_tree_window(self, target_layers: set[str]) -> dict[str, int | None]:
+        """Per-layer sliding window for the tree-verify layers.
+
+        Maps each tree-verify layer name to its KV cache group's sliding window
+        (``kv_cache_spec.sliding_window``), the same source the FA4 impl would
+        otherwise apply as ``window_size``, so the tree mask's positional
+        window term matches the non-spec windowed target exactly. Layers with
+        no KV cache group (or none listed) map to ``None`` (no window). The
+        tree mask is attached per metadata, and a single KV cache group holds
+        one merged window (``FullAttentionSpec.merge`` rejects mixed sizes), so
+        each layer's window is well-defined; the runner's attach builds the
+        mask per distinct window among the tree layers.
+        """
+        kv_cache_config = getattr(self, "kv_cache_config", None)
+        groups = (
+            list(kv_cache_config.kv_cache_groups) if kv_cache_config is not None else []
+        )
+        windows: dict[str, int | None] = {}
+        for layer in sorted(target_layers):
+            window = None
+            for group in groups:
+                layer_names = getattr(group, "layer_names", None) or []
+                if layer in layer_names:
+                    spec = getattr(group, "kv_cache_spec", None)
+                    window = getattr(spec, "sliding_window", None) if spec else None
+                    break
+            windows[layer] = window
+        return windows
 
     def _fa4_tree_verify_layer_names(self) -> set[str]:
         """Layer names whose group runs the df2t tree verify block on FA4.
@@ -2104,8 +2186,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._pending_tree_fa4_mask = None
         if pending is None:
             return
-        num_reqs, c_per_req, words, b = pending
-        self._attach_fa4_tree_mask_impl(attn_metadata, num_reqs, c_per_req, words, b)
+        num_reqs, c_per_req, words, b, window_layer, depths = pending
+        self._attach_fa4_tree_mask_impl(
+            attn_metadata, num_reqs, c_per_req, words, b, window_layer, depths
+        )
 
     def _attach_fa4_tree_mask_impl(
         self,
@@ -2114,12 +2198,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         c_per_req: torch.Tensor,
         words: torch.Tensor,
         b: int,
+        window_layer: dict[str, int | None] | None = None,
+        depths: torch.Tensor | None = None,
     ) -> None:
         """Attach the FA4 tree ``mask_mod`` + aux to the target verify layers.
 
         Shared by the per-step path (fresh metadata over ''_pending_tree_fa4__
         mask'') and by CUDA-graph capture (the captured metadata over the
         persistent aux pools), so both bake the same mask semantics.
+
+        The mask is built per distinct sliding window among the target layers:
+        a windowed layer gets the positional-window-composed mask (see
+        ``build_fa4_tree_mask``) and a window-less layer the plain tree mask,
+        so the df2t verify no longer widens windowed layers to full context.
         """
         if attn_metadata is None:
             # A staged tree mask must never silently vanish: no attention
@@ -2150,7 +2241,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "target's FlashAttention KV cache group is present in "
                 "kv_cache_config (or set tree_attention_backend='flex')."
             )
-        mask_mod, aux_tensors = build_fa4_tree_mask(num_reqs, c_per_req, words, b)
+        if window_layer is None:
+            window_layer = {layer: None for layer in target_layers}
+        if depths is None:
+            depths = getattr(self, "_df2t_tree_mask_depths", None)
+
+        masks: dict[int | None, tuple[Any, list[torch.Tensor]]] = {}
+
+        def mask_for(window: int | None):
+            if window not in masks:
+                masks[window] = build_fa4_tree_mask(
+                    num_reqs, c_per_req, words, b, window=window, depths=depths
+                )
+            return masks[window]
+
         attached = False
         seen_metadata: set[int] = set()
         for layer_name, metadata in attn_metadata.items():
@@ -2161,8 +2265,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if id(metadata) in seen_metadata:
                 continue
             seen_metadata.add(id(metadata))
+            mask_mod, aux = mask_for(window_layer.get(layer_name))
             metadata.df2t_tree_mask_mod = mask_mod
-            metadata.df2t_tree_aux_tensors = aux_tensors
+            metadata.df2t_tree_aux_tensors = aux
             attached = True
         if not attached:
             raise ValueError(

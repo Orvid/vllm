@@ -61,6 +61,7 @@ def fill_tree_mask_inputs(
     num_reqs: int,
     B: int,
     c_per_req: torch.Tensor,
+    depths_out: torch.Tensor | None = None,
 ) -> None:
     """Fill a persistent ``[>= num_reqs, B]`` ancestor-words buffer and its
     per-request anchor-length buffer for this step, in place.
@@ -83,6 +84,10 @@ def fill_tree_mask_inputs(
         num_reqs: Batch size (rows populated; the rest are zeroed).
         B: Node-count ceiling (``max_tree_budget``).
         c_per_req: [num_reqs] anchor context lengths (int64 or int32).
+        depths_out: optional [max_num_reqs, B] node-depth buffer filled for the
+            first ``num_reqs`` rows with each tree's per-arena depths (the
+            windowed FA4 mask's positional-window aux); zeroed when None-able
+            rows run past a tree's node count.
 
     """
     words_out.zero_()
@@ -92,11 +97,17 @@ def fill_tree_mask_inputs(
     c_per_req_out[:num_reqs].copy_(c_per_req.to(c_per_req_out.dtype))
     if c_per_req_out.numel() > num_reqs:
         c_per_req_out[num_reqs:].zero_()
+    if depths_out is not None:
+        depths_out.zero_()
+        if depths_out.numel() > num_reqs * depths_out.shape[1]:
+            depths_out[num_reqs:].zero_()
     if trees is None:
         return
     for r, tree in enumerate(trees[:num_reqs]):
         if tree is not None:
             words_out[r, : tree.words.shape[0]] = tree.words
+            if depths_out is not None:
+                depths_out[r, : tree.depths.shape[0]] = tree.depths
 
 
 def build_flex_tree_mask(
@@ -105,6 +116,8 @@ def build_flex_tree_mask(
     words: torch.Tensor,
     B: int,
     request_lookup: torch.Tensor,
+    window: int | None = None,
+    depths: torch.Tensor | None = None,
 ) -> tuple[Callable, BlockSparsityHint]:
     """Build the df2t tree verify ``logical_mask_mod`` and block-sparsity hint.
 
@@ -119,6 +132,14 @@ def build_flex_tree_mask(
             nodes keep zero padding bits, which never match.
         request_lookup: [num_tokens] int32 packed query index -> request index
             (the Flex metadata's ``doc_ids``), used to fetch per-request data.
+        window: The target's sliding window; ``None`` (default) keeps the
+            window-less ancestor-or-self mask (fully-causal target). A window
+            composes the positional ``q_pos - k_pos < window`` term into the
+            mask (positions: context ``k`` at ``k``, anchor at ``C``, node
+            ``j`` at ``C + depths[j]``), so a windowed target's tree rows
+            respect the target's window instead of widening to full context.
+        depths: [num_reqs, B] per-request node depths, required iff ``window``
+            is set.
 
     Returns:
         A ``(logical_mask_mod, block_sparsity_hint)`` pair for
@@ -128,13 +149,14 @@ def build_flex_tree_mask(
         not the batch index) and ``q_idx``/``kv_idx`` are *logical*
         (block-slot) indices. A key is allowed iff it is context (``< C``), the
         anchor (``== C``), or a node (``C + 1 + j``) whose bit ``j`` is set in
-        the query node's word. A request without a tree this step (a prefill
+        the query node's word -- each additionally subject to the positional
+        window when one is set. A request without a tree this step (a prefill
         chunk, fresh or continuing after cached context, co-scheduled with a
-        tree decode) falls back to per-request causal attention over its
-        context and its own rows. Tree presence is ``words[r, 0] != 0``: node
-        0's ancestor-or-self word always contains itself. All inputs broadcast
-        elementwise, matching the other flex mask mods (``causal_mask_mod`` et
-        al).
+        tree decode) falls back to per-request (windowed) causal attention over
+        its context and its own rows. Tree presence is ``words[r, 0] != 0``:
+        node 0's ancestor-or-self word always contains itself. All inputs
+        broadcast elementwise, matching the other flex mask mods
+        (``causal_mask_mod`` et al).
 
     """
     assert C_per_req.shape == (num_reqs,)
@@ -162,7 +184,26 @@ def build_flex_tree_mask(
         # A treeless request (a prefill chunk co-scheduled with a tree decode)
         # attends causally over its context and its own rows.
         causal = (words[r, 0] == 0) & (kv_idx <= q_idx)
-        return in_context | is_anchor | node_allowed | causal
+        keep = in_context | is_anchor | node_allowed | causal
+        if window is not None:
+            # Positional window term. Positions equal the block slot for
+            # context/anchor/treeless rows and ``C + depth`` for tree nodes:
+            # a pure slot-distance window would mis-window the depth-decoupled
+            # node rows (siblings at mirrored depths).
+            is_treeless = words[r, 0] == 0
+            q_pos = torch.where(
+                is_treeless,
+                q_idx,
+                torch.where(is_node_query, C + depths[r, arena], q_idx),
+            )
+            k_arena = torch.clamp(node, 0, B - 1)
+            k_pos = torch.where(
+                is_treeless,
+                kv_idx,
+                torch.where(is_node_key, C + depths[r, k_arena], kv_idx),
+            )
+            keep = keep & ((q_pos - k_pos) < window)
+        return keep
 
     def hint_fn(
         q_idx: torch.Tensor,
@@ -205,7 +246,7 @@ def build_flex_tree_mask(
 
 
 @cache
-def _make_fa4_tree_mask_mod(B: int):
+def _make_fa4_tree_mask_mod(B: int, window: int | None):
     """Build the cached FA4 CuTE-DSL ``mask_mod`` for the node budget ``B``.
 
     Mirrors ``_make_mm_prefix_mask_mod`` (``flash_attn.py``): FA4 reads aux
@@ -213,7 +254,7 @@ def _make_fa4_tree_mask_mod(B: int):
     ``aux_tensor_leading_dims``; naive tensor indexing and 1-D leading-dims
     fail), so the ancestor word ``words[r, arena]`` and per-request anchor
     length ``C_per_req[r]`` are loaded through ``ssa_to_scalar``-clamped scalar
-    indices, exactly like ``_load_q_range``. Cached by ``B``: FA4's
+    indices, exactly like ``_load_q_range``. Cached by ``(B, window)``: FA4's
     ``hash_callable`` mixes the closure-cell repr into the compile key, so an
     uncached closure would poke a fresh function address every forward and
     force a full JIT recompile.
@@ -227,6 +268,15 @@ def _make_fa4_tree_mask_mod(B: int):
     the block-slot of the query is ``C + q_idx``. A key is allowed iff it is
     context, the anchor, or a node ``j`` whose bit is set in the query node's
     ancestor-or-self word.
+
+    ``window`` is the target layer's sliding window (``None`` = no window, the
+    fully-causal target). With a window the mask additionally ANDs the
+    *positional* sliding-window term ``q_pos - k_pos < window`` using the
+    arena-decoupled positions (see ``build_flex_tree_mask``): a plain FA
+    ``window_size`` would window by block-slot, which equals position only for
+    context/anchor rows, not for tree nodes (node ``j`` sits at block-slot
+    ``C + 1 + j`` but position ``C + depths[j]``). ``aux_tensors[2]`` holds
+    ``depths`` ``[>= num_reqs, B]`` only when ``window`` is set.
     """
     import cutlass
     import cutlass.cute as cute
@@ -236,6 +286,8 @@ def _make_fa4_tree_mask_mod(B: int):
         ssa_to_scalar,
     )
 
+    # The unwindowed mask keeps the tree mask's ancestor-or-self semantics on
+    # scalar booleans exactly as before (the fully-causal target).
     @cute.jit
     def fa4_tree_mask_mod(
         batch_idx: cute.TensorSSA,
@@ -263,13 +315,78 @@ def _make_fa4_tree_mask_mod(B: int):
         # Treeless requests (node 0's self bit unset) attend causally over
         # their context and their own rows (query block-slot ``c + q``).
         causal = (words[batch_idx[0], 0] == 0) & (k <= c + q)
-        return scalar_to_ssa(
-            in_context | is_anchor | node_allowed | causal, cutlass.Int32
+        keep = in_context | is_anchor | node_allowed | causal
+        return scalar_to_ssa(keep, cutlass.Int32)
+
+    # The windowed mask additionally ANDs the positional sliding-window term,
+    # mirroring the Flex path. Positions are the block slot for
+    # context/anchor/treeless rows and ``c + depth`` for tree nodes
+    # (depth-decoupled from arena block slots), so the mask is built per
+    # ``(B, window)`` with ``window`` baked as the compile-time bound.
+    @cute.jit
+    def fa4_tree_mask_mod_windowed(
+        batch_idx: cute.TensorSSA,
+        head_idx: cute.TensorSSA,
+        q_idx: cute.TensorSSA,
+        kv_idx: cute.TensorSSA,
+        seqlen_info,
+        aux_tensors=None,
+    ):
+        del head_idx
+        words = aux_tensors[0]
+        c_per_req = aux_tensors[1]
+        depths = aux_tensors[2]
+        c = c_per_req[batch_idx[0]]
+        q = ssa_to_scalar(q_idx)
+        k = ssa_to_scalar(kv_idx)
+        in_context = k < c
+        is_anchor = k == c
+        node = k - (c + 1)
+        is_node_key = (node >= 0) & (node < B)
+        node_j = cutlass.min(cutlass.max(node, 0), 63)
+        arena = cutlass.max(q - 1, 0)
+        is_node_query = q >= 1
+        bit = ((words[batch_idx[0], arena] >> node_j) & 1) != 0
+        node_allowed = is_node_query & is_node_key & bit
+        causal = (words[batch_idx[0], 0] == 0) & (k <= c + q)
+        keep = in_context | is_anchor | node_allowed | causal
+        # Positional window term (select-free through cute.where on tensor
+        # conditions). ``is_treeless`` chooses the consecutive-positions row
+        # offset (c + q); tree rows use the depth offset (c + depth).
+        is_node_q_t = scalar_to_ssa(is_node_query, cutlass.Int32) != 0
+        is_treeless_t = scalar_to_ssa(words[batch_idx[0], 0] == 0, cutlass.Int32) != 0
+        q_pos = cute.where(
+            is_treeless_t,
+            scalar_to_ssa(c + q, cutlass.Int32),
+            cute.where(
+                is_node_q_t,
+                scalar_to_ssa(c + depths[batch_idx[0], arena], cutlass.Int32),
+                scalar_to_ssa(c, cutlass.Int32),
+            ),
+        )
+        is_node_k_t = scalar_to_ssa(is_node_key, cutlass.Int32) != 0
+        k_arena = cutlass.min(cutlass.max(node, 0), B - 1)
+        k_pos = cute.where(
+            is_treeless_t,
+            scalar_to_ssa(k, cutlass.Int32),
+            cute.where(
+                is_node_k_t,
+                scalar_to_ssa(c + depths[batch_idx[0], k_arena], cutlass.Int32),
+                scalar_to_ssa(k, cutlass.Int32),
+            ),
+        )
+        keep = (scalar_to_ssa(keep, cutlass.Int32) != 0) & ((q_pos - k_pos) < window)
+        # Materialize the bool tensor as an Int32 tensor (0/1) for the kernel.
+        return cute.where(
+            keep,
+            scalar_to_ssa(cutlass.Int32(1), cutlass.Int32),
+            scalar_to_ssa(cutlass.Int32(0), cutlass.Int32),
         )
 
-    fa4_tree_mask_mod.use_fast_sampling = True
-    fa4_tree_mask_mod.__vec_size__ = 1  # scalar reads take lane 0 of q/kv_idx
-    return fa4_tree_mask_mod
+    mask_mod = fa4_tree_mask_mod if window is None else fa4_tree_mask_mod_windowed
+    mask_mod.use_fast_sampling = True
+    mask_mod.__vec_size__ = 1  # scalar reads take lane 0 of q/kv_idx
+    return mask_mod
 
 
 def build_fa4_tree_mask(
@@ -277,29 +394,34 @@ def build_fa4_tree_mask(
     C_per_req: torch.Tensor,
     words: torch.Tensor,
     B: int,
+    window: int | None = None,
+    depths: torch.Tensor | None = None,
 ) -> tuple[Callable, list[torch.Tensor]]:
     """Build the df2t tree verify FA4 ``mask_mod`` and its aux tensors.
 
     Args:
-        num_reqs: Number of requests in the batch. ``C_per_req``/``words`` may
-            be larger (persistent CUDA-graph aux pools sized ``max_num_reqs``);
-            only the first ``num_reqs`` rows carry live data.
+        num_reqs: Number of requests in the batch. ``C_per_req``/``words``/
+            ``depths`` may be larger (persistent CUDA-graph aux pools sized
+            ``max_num_reqs``); only the first ``num_reqs`` rows carry live
+            data.
         C_per_req: [>= num_reqs] int32 anchor context length (block-slot ``C``)
             per request, read by scalar index in the mask_mod.
         words: [>= num_reqs, B] int64 ancestor-or-self bitmask over arena
             indices (bit ``j`` set iff node ``j`` is an ancestor or itself of
             the query node), read by scalar index in the mask_mod.
         B: Node-count ceiling (the width of ``words``).
+        window: The target's sliding window; ``None`` (default) keeps the
+            window-less ancestor-or-self mask (fully-causal target). A window
+            composes the positional ``q_pos - k_pos < window`` term into the
+            mask, so a windowed target no longer loses its window on tree rows.
+        depths: [>= num_reqs, B] per-request node depths (position ``C +
+            depths[r, arena]``), required iff ``window`` is set.
 
     Returns:
         A ``(mask_mod, aux_tensors)`` pair for the FA4 varlen paged forward.
-        ``mask_mod(batch_idx, head_idx, q_idx, kv_idx, seqlen_info,
-        aux_tensors)`` applies the same ancestor-or-self semantics as
-        ``build_flex_tree_mask`` under the FA4 coordinate conventions (see
-        ``_make_fa4_tree_mask_mod``): ``batch_idx`` is the request index,
-        ``q_idx`` is the local verify-block query index, ``kv_idx`` is the
-        absolute logical block-slot across pages. ``aux_tensors[0]`` is
-        ``words`` and ``aux_tensors[1]`` is ``C_per_req``.
+        ``aux_tensors`` is ``[words, C_per_req]`` when ``window`` is None and
+        ``[words, C_per_req, depths]`` when windowed, matching the mask_mod's
+        aux reads.
 
     """
     assert C_per_req.shape[0] >= num_reqs, (C_per_req.shape, num_reqs)
@@ -308,7 +430,15 @@ def build_fa4_tree_mask(
         num_reqs,
         B,
     )
-    return _make_fa4_tree_mask_mod(B), [words, C_per_req]
+    if window is None:
+        return _make_fa4_tree_mask_mod(B, None), [words, C_per_req]
+    assert depths is not None, "a windowed FA4 tree mask requires depths"
+    assert depths.shape[0] >= num_reqs and depths.shape[1] == B, (
+        depths.shape,
+        num_reqs,
+        B,
+    )
+    return _make_fa4_tree_mask_mod(B, window), [words, C_per_req, depths]
 
 
 def attach_tree_flex_mask(
@@ -317,6 +447,8 @@ def attach_tree_flex_mask(
     C_per_req: torch.Tensor,
     words: torch.Tensor,
     B: int,
+    window: int | None = None,
+    depths: torch.Tensor | None = None,
 ) -> None:
     """Attach the df2t tree mask to a built ``FlexAttentionMetadata``.
 
@@ -325,6 +457,12 @@ def attach_tree_flex_mask(
     request lookup) and rebuilds ``mask_mod`` and the block mask so the next
     forward runs tree-apportioned attention.
 
+    When ``window`` is set the tree mask already ANDs the positional window, so
+    the metadata's built-in *index-based* sliding-window term (``|q_idx -
+    kv_idx| < sliding_window``, valid only where block-slot == position) is
+    neutralized: composing both would double-window and mis-window the
+    depth-decoupled node rows.
+
     Args:
         metadata: A fully built ``FlexAttentionMetadata`` whose ``doc_ids``
             host the packed query index -> request lookup.
@@ -332,13 +470,26 @@ def attach_tree_flex_mask(
         C_per_req: [num_reqs] per-request anchor context length.
         words: [num_reqs, B] per-request ancestor-or-self words.
         B: Node-count ceiling (width of ``words``).
+        window: The target's sliding window (see ``build_flex_tree_mask``);
+            ``None`` keeps the window-less tree mask.
+        depths: [num_reqs, B] per-request node depths, required iff ``window``
+            is set.
 
     """
     mask_mod, hint = build_flex_tree_mask(
-        num_reqs, C_per_req, words, B, metadata.doc_ids
+        num_reqs,
+        C_per_req,
+        words,
+        B,
+        metadata.doc_ids,
+        window=window,
+        depths=depths,
     )
     metadata.logical_mask_mod = mask_mod
     metadata.block_sparsity_hint = hint
+    if window is not None:
+        # The tree mask carries the (positional) window itself.
+        metadata.sliding_window = None
     metadata.mask_mod = metadata.get_mask_mod()
     if metadata.direct_build:
         metadata.block_mask = metadata._build_block_mask_direct()

@@ -69,6 +69,124 @@ def _manual_matrix(C: int, words: list[int], B: int) -> torch.Tensor:
     return matrix
 
 
+def _manual_window_matrix(
+    C: int, words: list[int], depths: list[int], B: int, window: int
+) -> torch.Tensor:
+    """Manual ``[C + 1 + B, C + 1 + B]`` matrix for a windowed tree verify.
+
+    Key ``(q, k)`` is allowed iff the ancestor-or-self tree mask allows it AND
+    the key's position is within ``window`` of the query's position. Positions:
+    context keys ``k < C`` at ``k``, the anchor at ``C``, and tree node ``j``
+    at ``C + depths[j]`` (arena-decoupled from the block slot ``C + 1 + j``).
+    """
+    n = C + 1 + B
+    matrix = torch.zeros(n, n, dtype=torch.bool)
+    words_t = torch.tensor(words, dtype=torch.long)
+    depths_t = torch.tensor(depths, dtype=torch.long)
+
+    def kpos(k: int) -> int:
+        if k < C:
+            return k
+        if k == C:
+            return C
+        j = k - (C + 1)
+        if 0 <= j < B:
+            return C + int(depths_t[j].item())
+        return k
+
+    def in_window(qpos: int, kpos_v: int) -> bool:
+        return (qpos - kpos_v) < window
+
+    for arena in range(B):
+        q = C + 1 + arena
+        qpos = C + int(depths_t[arena].item())
+        for k in range(C):
+            if in_window(qpos, kpos(k)):
+                matrix[q, k] = True
+        if in_window(qpos, C):
+            matrix[q, C] = True
+        for j in range(B):
+            k = C + 1 + j
+            if bool((words_t[arena] >> j) & 1) and in_window(qpos, kpos(k)):
+                matrix[q, k] = True
+    for k in range(C + 1):
+        if in_window(C, kpos(k)):
+            matrix[C, k] = True
+    return matrix
+
+
+def test_flex_tree_mask_window_matches_manual():
+    """With a window the tree closure drops keys outside the query's positional
+    window, using the depth-decoupled positions (``C + depths``), not the arena
+    block slots: sibling nodes at depth beyond the window are excluded."""
+    C, B, window = 6, 4, 3
+    words = [0b1, 0b11, 0b101, 0b1111]
+    depths = [0, 1, 1, 2]  # arena 1 and 2 share depth 1 (siblings)
+    request_lookup = torch.zeros(1, dtype=torch.int32)
+    mask_mod, _ = build_flex_tree_mask(
+        1,
+        torch.tensor([C], dtype=torch.long),
+        torch.tensor([words], dtype=torch.long),
+        B,
+        request_lookup,
+        window=window,
+        depths=torch.tensor([depths], dtype=torch.long),
+    )
+    mask_unwindowed, _ = build_flex_tree_mask(
+        1,
+        torch.tensor([C], dtype=torch.long),
+        torch.tensor([words], dtype=torch.long),
+        B,
+        request_lookup,
+    )
+
+    n = C + 1 + B
+    b = torch.zeros(n, 1, dtype=torch.long)
+    h = torch.zeros(n, 1, dtype=torch.long)
+    q = torch.arange(n, dtype=torch.long)[:, None].expand(n, n)
+    k = torch.arange(n, dtype=torch.long)[None, :].expand(n, n)
+    got = mask_mod(b.expand(n, n), h, q, k)
+    got_unwindowed = mask_unwindowed(b.expand(n, n), h, q, k)
+
+    expected = _manual_window_matrix(C, words, depths, B, window)
+    # The window only ever removes keys: the unwindowed mask is a superset.
+    assert (got <= got_unwindowed).all(), "window must only remove keys"
+    assert torch.equal(got[C:], expected[C:])
+    assert torch.equal(got[C], expected[C])
+    # A node query whose window excludes some ancestor/context keys drops them.
+    assert not torch.equal(got, got_unwindowed), "window had no effect on this tree"
+
+
+def test_flex_tree_mask_window_treeless_is_windowed_causal():
+    """A treeless request (prefill chunk co-scheduled with a windowed tree
+    decode) attends positionally windowed causal attention: key ``k`` is kept
+    iff ``k <= q`` AND ``q - k < window``, while the co-batched tree request
+    keeps its windowed ancestor-or-self mask."""
+    max_b = 3
+    window = 5
+    C, n1 = 6, 4
+    n0 = 5
+    query_start_loc = [0, n0, n0 + n1]
+    request_lookup = torch.zeros(query_start_loc[-1], dtype=torch.int32)
+    request_lookup[query_start_loc[1] :] = 1
+
+    c_per_req = torch.tensor([4, C], dtype=torch.long)
+    words = torch.zeros(2, max_b, dtype=torch.long)
+    words[0] = torch.tensor([0b1, 0b11, 0b101], dtype=torch.long)
+    depths = torch.zeros(2, max_b, dtype=torch.long)
+
+    mask_mod, _ = build_flex_tree_mask(
+        2, c_per_req, words, max_b, request_lookup, window=window, depths=depths
+    )
+    n = C + n1
+    q = torch.arange(C, n, dtype=torch.long)[:, None].expand(n1, n)
+    k = torch.arange(n, dtype=torch.long)[None, :].expand(n1, n)
+    b = (query_start_loc[1] + torch.arange(n1, dtype=torch.long))[:, None]
+    got = mask_mod(b.expand(n1, n), torch.zeros(1, dtype=torch.long), q, k)
+    expected = (k <= q) & ((q - k) < window)
+    assert torch.equal(got, expected), "treeless request must be windowed-causal"
+
+
 def test_flex_tree_mask_matches_manual():
     """The closure reproduces the hand-computed matrix on the verify-block
     rows: context always allowed, the anchor allowed, and node keys allowed
@@ -403,13 +521,29 @@ class _FakeBackend:
         return self._name
 
 
-def _fake_tree(words, device) -> "object":
+def _fake_tree(words, device, depths=None):
+    if depths is None:
+        depths = list(range(len(words)))
     return type(
-        "Tree", (), {"words": torch.tensor(words, dtype=torch.long, device=device)}
+        "Tree",
+        (),
+        {
+            "words": torch.tensor(words, dtype=torch.long, device=device),
+            "depths": torch.tensor(depths, dtype=torch.long, device=device),
+            "token_ids": torch.zeros(len(words), dtype=torch.long, device=device),
+        },
     )()
 
 
-def _fake_runner(spec, req_states, device, attn_groups):
+def _FakeKVCacheConfig(sliding_window):
+    import types
+
+    spec = types.SimpleNamespace(block_size=16, sliding_window=sliding_window)
+    group = types.SimpleNamespace(layer_names=["target.attn"], kv_cache_spec=spec)
+    return types.SimpleNamespace(kv_cache_groups=[group])
+
+
+def _fake_runner(spec, req_states, device, attn_groups, kv_cache_config=None):
     import types
 
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -420,10 +554,12 @@ def _fake_runner(spec, req_states, device, attn_groups):
         device=device,
         _pending_tree_flex_mask=None,
         attn_groups=attn_groups,
+        kv_cache_config=kv_cache_config,
     )
     for name in (
         "_stage_tree_flex_mask",
         "_tree_verify_layer_names",
+        "_df2t_tree_window",
         "_attach_tree_flex_mask",
     ):
         setattr(runner, name, types.MethodType(getattr(GPUModelRunner, name), runner))
@@ -509,6 +645,58 @@ def test_runner_stage_attach_targets_only_the_flex_verify_group():
         start += query_lens[r]
 
 
+def test_runner_stage_attach_flex_mask_windowed_target():
+    """A windowed flex-tree target carries per-request depths and window onto
+    the attached mask, and the metadata's built-in index-based sliding-window
+    term is neutralized (the tree mask already ANDs the positional window)."""
+    device = torch.device("cpu")
+    spec = type("Spec", (), {"tree_attention_backend": "flex", "max_tree_budget": 64})()
+    num_computed = torch.tensor([4, 2, 0, 0], dtype=torch.int32)
+    req_states = type(
+        "ReqStates", (), {"num_computed_tokens": type("T", (), {"gpu": num_computed})()}
+    )()
+    trees = [
+        _fake_tree([0b1, 0b11, 0b101], device, depths=[0, 1, 2]),
+        _fake_tree([0b1, 0b11], device, depths=[0, 1]),
+    ]
+    idx_mapping = torch.tensor([0, 1], dtype=torch.int32)
+    attn_groups = [
+        [
+            type(
+                "G",
+                (),
+                {
+                    "backend": _FakeBackend("FLEX_ATTENTION"),
+                    "layer_names": ["target.attn"],
+                },
+            )()
+        ]
+    ]
+    runner = _fake_runner(
+        spec,
+        req_states,
+        device,
+        attn_groups,
+        kv_cache_config=_FakeKVCacheConfig(sliding_window=2048),
+    )
+    runner._stage_tree_flex_mask(True, trees, 2, idx_mapping)
+    assert runner._pending_tree_flex_mask is not None
+    _, c_per_req, words, b, window_map, depths = runner._pending_tree_flex_mask
+    assert window_map == {"target.attn": 2048}
+    assert depths[0][:3].tolist() == [0, 1, 2]
+
+    target_meta = _fake_flex_metadata(
+        torch.tensor([0, 0, 0, 0, 1, 1, 1], dtype=torch.int32)
+    )
+    target_meta.sliding_window = 2048
+    runner._attach_tree_flex_mask({"target.attn": target_meta})
+    assert target_meta.logical_mask_mod is not None
+    assert target_meta.sliding_window is None, (
+        "the metadata's index-based sliding window must be neutralized so the "
+        "tree mask's positional window is the only window term"
+    )
+
+
 def test_runner_stage_scopes_zero_context():
     """A zero-context (fresh-prompt prefill, C == 0) request staged in a
     flex-tree batch is scoped per-request (causal over its own rows) instead
@@ -542,7 +730,7 @@ def test_runner_stage_scopes_zero_context():
     runner._stage_tree_flex_mask(True, trees, 2, idx_mapping)
     pending = runner._pending_tree_flex_mask
     assert pending is not None
-    _, c_per_req, words, _ = pending
+    _, c_per_req, words, _, _, _ = pending
     # The contextless request is staged with a zero anchor length, not dropped.
     assert c_per_req.tolist() == [4, 0]
     assert bool((words[1] == 0).all().item())
@@ -582,8 +770,10 @@ def test_df2t_flex_selector_forces_flex_backend(qwen3_config_path):
             ).get_name()
 
     assert resolve("flex") == "FLEX_ATTENTION"
-    # Windowed / MLA / encoder kinds and the default 'fa4' are not forced.
-    assert resolve("flex", has_sliding_window=True) != "FLEX_ATTENTION"
+    # Windowed decoder layers route to Flex too (WS-C: the windowed tree mask
+    # composes the positional window); MLA / encoder kinds and the default
+    # 'fa4' are not forced.
+    assert resolve("flex", has_sliding_window=True) == "FLEX_ATTENTION"
     assert resolve("flex", use_mla=True) != "FLEX_ATTENTION"
     assert resolve("flex", attn_type=AttentionType.ENCODER_ONLY) != "FLEX_ATTENTION"
     assert resolve("fa4") != "FLEX_ATTENTION"
