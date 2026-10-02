@@ -25,7 +25,10 @@ Conventions mirror ``reference_verifier.tree_verify_reference`` exactly:
   at its row (invariant 4); otherwise one categorical sample is drawn per depth.
   With per-request ``seeds``, each request draws through its own sequential
   ``torch.Generator`` exactly as the reference does, so a fixed seed is
-  reproducible and bit-identical to ``tree_verify_reference``.
+  reproducible and bit-identical to ``tree_verify_reference``. A seed of ``-1``
+  selects the global RNG (no generator); the model-runner path passes
+  per-request ``-1`` for unseeded requests and derives per-step seeds for
+  explicitly-seeded ones, so draws are independent across (request, step).
 
 The output contract matches the rejection samplers so their plumbing consumes
 it unchanged: ``sampled [num_reqs, 1 + B]`` (int64; ``sampled[r, :num_sampled
@@ -126,7 +129,7 @@ class TreeVerifier:
         self,
         p: torch.Tensor,
         greedy_mask: torch.Tensor,
-        gens: list[torch.Generator] | None,
+        gens: list[torch.Generator | None] | None,
         lids: torch.Tensor,
     ) -> torch.Tensor:
         """Draw one token per live row: argmax when greedy, otherwise a single
@@ -138,7 +141,14 @@ class TreeVerifier:
         if gens is not None:
             for j in torch.nonzero(want_sample, as_tuple=False).squeeze(-1).tolist():
                 r = int(lids[j].item())
-                x[j] = torch.multinomial(p[j], 1, generator=gens[r])
+                g = gens[r]
+                if g is None:
+                    # No generator for this request (unseeded in a mixed batch,
+                    # or the caller's -1 sentinel): draw from the global RNG so
+                    # it stays independent across steps and batches.
+                    x[j] = torch.multinomial(p[j], 1)
+                else:
+                    x[j] = torch.multinomial(p[j], 1, generator=g)
         else:
             x[want_sample] = torch.multinomial(p[want_sample], 1).squeeze(-1)
         return x
@@ -172,7 +182,12 @@ class TreeVerifier:
             top_p: target nucleus mass applied after top-k (scalar or
                 ``[num_reqs]``).
             seeds: optional ``[num_reqs]`` generator seeds making the per-depth
-                draws reproducible and identical to the reference.
+                draws reproducible. A value of ``-1`` requests the global RNG
+                for that request (no generator), so an unseeded request in a
+                mixed batch is never pinned to a fixed per-step stream; the
+                caller derives per-step seeds for explicitly-seeded requests
+                (e.g. mixing the raw seed with the anchor position) so
+                successive steps draw independent streams.
 
         Returns:
             ``(sampled, num_sampled)``: ``sampled [R, 1 + B]`` with each row's
@@ -201,10 +216,13 @@ class TreeVerifier:
         gens = None
         if seeds is not None:
             seeds = seeds.to(torch.long).to(device)
-            gens = [
-                torch.Generator(device=device).manual_seed(int(seeds[r].item()))
-                for r in range(R)
-            ]
+            gens = []
+            for r in range(R):
+                s = int(seeds[r].item())
+                if s == -1:
+                    gens.append(None)
+                else:
+                    gens.append(torch.Generator(device=device).manual_seed(s))
 
         cur = torch.full((R,), -1, dtype=torch.long, device=device)
         done = torch.zeros(R, dtype=torch.bool, device=device)

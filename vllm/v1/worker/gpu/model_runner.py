@@ -282,6 +282,29 @@ def _df2t_chain_context(
     )
 
 
+def _df2t_step_seed(seed: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
+    """Per-step verifier seed, decorrelated from the raw request seed.
+
+    The ordinary sampler keys its draws on ``seed + position`` so successive
+    steps use independent streams. The tree verifier draws through a per-request
+    ``torch.Generator`` seeded fresh each verify call, which would replay the
+    same stream every step; mixing the raw seed with the request's anchor
+    position ``step`` (its ``num_computed_tokens``, strictly increasing) keys
+    each step's generator independently while remaining reproducible for a
+    fixed seed. The multiplier is odd and under 2**32, so ``step * mult`` stays
+    inside signed int64 for ``step < 2**31``.
+
+    Args:
+        seed: [R] int64 raw per-request seed.
+        step: [R] int64 anchor position (num_computed_tokens) per request.
+
+    Returns:
+        [R] int64 per-step seed.
+
+    """
+    return seed ^ (step * 0x9E3779B1)
+
+
 def _resolve_decode_query_len(
     speculative_config: SpeculativeConfig | None,
     num_speculative_steps: int,
@@ -2344,7 +2367,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # generator".
         seeds = None
         if ss.any_explicit_seed(input_batch.idx_mapping_np):
-            seeds = ss.seeds.gpu[idx]
+            seeded = torch.from_numpy(ss.seeds_set[input_batch.idx_mapping_np]).to(
+                self.device
+            )
+            raw = ss.seeds.gpu[idx].long()
+            steps = self.req_states.num_computed_tokens.gpu[idx].long()
+            derived = _df2t_step_seed(raw, steps)
+            seeds = torch.where(seeded, derived, torch.full_like(raw, -1))
         # temperature/top-k/top-p are already applied by the pipeline above, so
         # the verifier only softmaxes the processed rows for the draw.
         sampled, num_sampled = self.tree_verifier(
