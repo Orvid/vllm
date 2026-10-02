@@ -7372,14 +7372,16 @@ def _df2t_draft_model_config() -> SimpleNamespace:
     )
 
 
-def _df2t_scheduler(tmp_path) -> Scheduler:
+def _df2t_scheduler(tmp_path, enable_tree: bool = True) -> Scheduler:
     """A real :class:`Scheduler` over a df2t ``SpeculativeConfig`` with the tree
     budget ceiling raised above the drafter block depth (num_spec = 15,
-    max_tree_budget = 64)."""
+    max_tree_budget = 64). ``enable_tree=False`` keeps the same df2t drafter but
+    serves the DFlash2 chain, so the scheduler must fall back to the dflash
+    reservation."""
     import json
 
     root = tmp_path / "qwen3-0.6b"
-    root.mkdir()
+    root.mkdir(exist_ok=True)
     (root / "config.json").write_text(
         json.dumps(
             {
@@ -7420,6 +7422,7 @@ def _df2t_scheduler(tmp_path) -> Scheduler:
         method="df2t",
         num_speculative_tokens=15,
         draft_model_config=_df2t_draft_model_config(),
+        enable_tree=enable_tree,
     )
     obs_config = ObservabilityConfig(per_request_spec_decode_metrics="none")
     vllm_config = VllmConfig(
@@ -7467,3 +7470,22 @@ def test_df2t_scheduler_reserves_tree_budget_ceiling(tmp_path):
     assert scheduler.num_spec_tokens > spec.num_speculative_tokens
     assert scheduler.num_lookahead_tokens == spec.tree_lookahead
 
+
+def test_df2t_tree_off_scheduler_reserves_dflash_chain(tmp_path):
+    """``enable_tree=False`` collapses the df2t scheduler reservation to the
+    DFlash2 chain: per-request draft rows == ``num_speculative_tokens`` (not
+    the tree width) and the KV lookahead == ``num_speculative_tokens + 1``
+    (not the tree ceiling). This is the structural half of the 'tree disabled
+    reproduces DFlash2' invariant."""
+    scheduler = _df2t_scheduler(tmp_path, enable_tree=False)
+    spec = scheduler.vllm_config.speculative_config
+    assert spec.use_df2t()
+    assert not spec.use_df2t_tree()
+    assert scheduler.num_spec_tokens == spec.num_speculative_tokens
+    assert scheduler.num_lookahead_tokens == spec.num_speculative_tokens + 1
+    # The dflash chain values for this drafter: K draft rows and K+1 lookahead
+    # slots (DFlash reserves exactly these, per the SpeculativeConfig table and
+    # num_lookahead_tokens), so the tree-off df2t reservation matches dflash.
+    K = spec.num_speculative_tokens
+    assert scheduler.num_spec_tokens == K
+    assert scheduler.num_lookahead_tokens == K + 1

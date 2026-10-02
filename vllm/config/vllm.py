@@ -644,11 +644,14 @@ class VllmConfig:
             # DFlash (and df2t, which drafts with the DFlash drafter) requires an
             # extra lookahead slot since it uses in-fill-style decoding instead
             # of standard next-token sampling, so it has a query for the last
-            # sampled token plus queries for each draft token. DF2T reserves the
-            # tree budget ceiling (``1 + max_tree_budget``), so a tree wider
-            # than the drafter block depth stays expressible; it never derives
-            # from ``num_speculative_tokens``.
-            if speculative_config.use_df2t():
+            # sampled token plus queries for each draft token. DF2T with the
+            # tree enabled reserves the tree budget ceiling (``1 +
+            # max_tree_budget``), so a tree wider than the drafter block depth
+            # stays expressible; it never derives from
+            # ``num_speculative_tokens``. With ``enable_tree=False`` df2t
+            # serves the DFlash2 chain and keeps dflash's ``num_speculative_tokens
+            # + 1``.
+            if speculative_config.use_df2t_tree():
                 return speculative_config.tree_lookahead
             return self.num_speculative_tokens + 1
         if speculative_config.use_eagle() or speculative_config.uses_draft_model():
@@ -705,12 +708,13 @@ class VllmConfig:
         width ``1 + nodes_max`` (``tree_decode_width``), never the drafter
         block depth. The graph may be captured up to the reservation ceiling
         ``1 + max_tree_budget`` (``tree_lookahead``); that ceiling is a buffer,
-        not the query width.
+        not the query width. With ``enable_tree=False`` df2t falls back to the
+        dflash ``1 + num_speculative_tokens`` chain width.
         """
         speculative_config = self.speculative_config
         if (
             speculative_config is not None
-            and getattr(speculative_config, "use_df2t", lambda: False)()
+            and getattr(speculative_config, "use_df2t_tree", lambda: False)()
         ):
             return speculative_config.tree_decode_width
         return 1 + self.num_speculative_tokens
@@ -3146,10 +3150,13 @@ class VllmConfig:
         (``tree_attention_backend="flex"``). An explicit override to FA2/FA3
         or to a non-{fa4, flex} attention backend cannot run the df2t verify
         pass correctly, so reject it here rather than silently falling back.
-        Non-df2t configs are untouched.
+        Speculative decoding with the df2t TREE enabled requires FA4 or Flex
+        attention on every arch; a tree-off df2t serves the plain DFlash2
+        chain and needs no tree-mask backend. Non-df2t-tree configs are
+        untouched.
         """
         spec_config = self.speculative_config
-        if spec_config is None or not spec_config.use_df2t():
+        if spec_config is None or not spec_config.use_df2t_tree():
             return
 
         from vllm.v1.attention.backends.fa_utils import DF2T_TREE_ATTN_REQUIRED

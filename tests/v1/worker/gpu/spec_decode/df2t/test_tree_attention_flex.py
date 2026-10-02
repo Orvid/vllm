@@ -749,6 +749,7 @@ def test_df2t_flex_selector_forces_flex_backend(qwen3_config_path):
     def spec_obj(tree_attention_backend):
         return SimpleNamespace(
             use_df2t=lambda: True,
+            use_df2t_tree=lambda: True,
             tree_attention_backend=tree_attention_backend,
             enable_adaptive_verification=False,
             num_speculative_tokens=0,

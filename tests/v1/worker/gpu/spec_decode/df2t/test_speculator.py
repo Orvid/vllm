@@ -170,6 +170,68 @@ def test_generate_draft_builds_tree_and_draft_tokens() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_tree_off_serves_dflash_chain_identical() -> None:
+    """``enable_tree=False`` must serve the DFlash2 greedy CHAIN from the same
+    drafter: a DF2TSpeculator with the tree off and a plain DFlash2Speculator
+    produce BIT-IDENTICAL draft_tokens on the same candidate transition scores,
+    and no tree is ever staged. This is the runtime half of the 'tree disabled
+    reproduces DFlash2' invariant."""
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.gpu.spec_decode.df2t.speculator import DF2TSpeculator
+    from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
+        DFlash2Speculator,
+    )
+
+    torch.manual_seed(7)
+    num_reqs, steps, K, hidden = 3, 15, 3, 64
+
+    def drive(spec, captured) -> None:
+        def fake_run_model(*_a, **_k):
+            return torch.randn(num_reqs * steps, hidden, device="cuda")
+
+        def fake_compute_candidates(h):
+            cand = torch.randint(0, 512, (h.shape[0], K), device="cuda")
+            unary = torch.randn(h.shape[0], K, device="cuda")
+            captured["cand_flat"] = cand
+            return cand, unary
+
+        def fake_score_candidates(cand, unary, hidden):
+            scores = torch.randn(cand.shape[0], cand.shape[1], K, K, device="cuda")
+            captured["scores"] = scores
+            return scores
+
+        spec._run_model = fake_run_model
+        spec.model = SimpleNamespace(compute_candidates=fake_compute_candidates)
+        spec._score_candidates = fake_score_candidates
+        spec.sample_indices[: num_reqs * steps] = torch.arange(
+            num_reqs * steps, device="cuda"
+        )
+        spec._generate_draft(num_reqs, num_reqs * steps, None, None, None)
+        return captured
+
+    cfg = _fake_vllm_config()
+    cfg.speculative_config.enable_tree = False
+    df2t_off = init_speculator(cfg, torch.device("cuda"))
+    assert isinstance(df2t_off, DF2TSpeculator)
+    assert df2t_off.draft_tokens.shape[1] == steps  # chain carry width, not tree
+    assert df2t_off.latest_tree_drafts is None
+    assert df2t_off.get_latest_tree_drafts(num_reqs) is None
+
+    cfg2 = _fake_vllm_config()
+    cfg2.speculative_config.method = "dflash"
+    dflash = init_speculator(cfg2, torch.device("cuda"))
+    assert isinstance(dflash, DFlash2Speculator)
+
+    torch.manual_seed(99)
+    drive(df2t_off, {})
+    torch.manual_seed(99)
+    drive(dflash, {})
+    assert torch.equal(df2t_off.draft_tokens[:num_reqs], dflash.draft_tokens[:num_reqs])
+    assert df2t_off.latest_tree_drafts is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_generate_draft_budget_below_num_spec_degrades_not_crashes() -> None:
     """WS-A finding [7]: tree_budget x tree_s below num_speculative_tokens must
     hit the v5 §3.4 degradation order (below L, shorten to a chain of
@@ -301,8 +363,6 @@ def test_generate_draft_fails_closed_on_width_below_carry():
 
     # A narrower per-request width (e.g. a degraded/head budget) below the
     # carry width must raise at the width guard, never write a partial row.
-    spec.budget = SimpleNamespace(
-        shape=lambda *_: (spec.max_depth, spec.nodes_max - 1)
-    )
+    spec.budget = SimpleNamespace(shape=lambda *_: (spec.max_depth, spec.nodes_max - 1))
     with pytest.raises(AssertionError, match="carry width"):
         spec._generate_draft(num_reqs, num_reqs * steps, None, None, None)

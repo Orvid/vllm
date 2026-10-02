@@ -52,6 +52,44 @@ def test_use_df2t():
     assert not cfg.use_df2t()
 
 
+def test_df2t_enable_tree_default_and_off_switch():
+    """``enable_tree`` is the real df2t off-switch: it defaults to True (tree
+    serving is the df2t path, and existing df2t configs omit it), and setting
+    it False keeps the method identity (speculator selection) while flipping
+    ``use_df2t_tree()`` off."""
+    cfg = _build()
+    assert cfg.enable_tree
+    assert cfg.use_df2t()
+    assert cfg.use_df2t_tree()
+    cfg.enable_tree = False
+    assert cfg.use_df2t()  # method identity stays: still routed as df2t
+    assert not cfg.use_df2t_tree()
+
+
+def test_df2t_tree_off_reservations_match_dflash():
+    """``enable_tree=False`` collapses every tree-only reservation to the
+    DFlash2 chain values of the same drafter — the config half of the 'tree
+    disabled reproduces DFlash2' invariant."""
+    cfg = _build()
+    cfg._validate_df2t()
+    off = _build()
+    off._validate_df2t()
+    off.enable_tree = False
+    K = off.num_speculative_tokens
+    assert off.max_num_new_slots_for_drafting == K  # dflash: K slots
+    assert off.num_draft_rows_per_req == K  # chain carry width
+    assert off.get_num_draft_tokens() == K
+    assert off.tree_decode_width == 0  # no static tree width
+    # Same value a method="dflash" config resolves.
+    dflash = _build()
+    dflash.method = "dflash"
+    assert off.max_num_new_slots_for_drafting == dflash.max_num_new_slots_for_drafting
+    assert off.num_draft_rows_per_req == dflash.num_draft_rows_per_req
+    # And the tree ON config keeps the tree budget, not the drafter depth.
+    assert cfg.max_num_new_slots_for_drafting == cfg.max_tree_budget
+    assert cfg.max_num_new_slots_for_drafting != K
+
+
 def test_df2t_tree_resolution():
     cfg = _build()
     cfg._validate_df2t()

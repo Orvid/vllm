@@ -256,14 +256,16 @@ def test_df2t_decode_query_len_uses_tree_decode_width():
     """The target verify decode width for df2t is the static tree width
     (``1 + nodes_max``), decoupled from ``num_speculative_steps``; other
     methods keep ``steps + bonus``."""
-    df2t_cfg = SimpleNamespace(use_df2t=lambda: True, tree_decode_width=65)
+    df2t_cfg = SimpleNamespace(
+        use_df2t=lambda: True, use_df2t_tree=lambda: True, tree_decode_width=65
+    )
     assert (
         _resolve_decode_query_len(
             df2t_cfg, num_speculative_steps=15, num_new_sampled_per_step=1
         )
         == 65
     )
-    dflash_cfg = SimpleNamespace(use_df2t=lambda: False)
+    dflash_cfg = SimpleNamespace(use_df2t=lambda: False, use_df2t_tree=lambda: False)
     assert (
         _resolve_decode_query_len(
             dflash_cfg, num_speculative_steps=15, num_new_sampled_per_step=1

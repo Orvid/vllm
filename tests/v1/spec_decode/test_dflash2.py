@@ -295,6 +295,7 @@ def test_candidate_model_decoder_layer_cls(monkeypatch, variant):
             ),
             num_speculative_tokens=4,
             enable_adaptive_verification=False,
+            use_df2t_tree=lambda: False,
         ),
         model_config=SimpleNamespace(
             dtype=torch.float32,

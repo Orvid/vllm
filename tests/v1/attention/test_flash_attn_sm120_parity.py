@@ -108,6 +108,7 @@ def _fake_spec_config(df2t: bool, flex: bool = False):
     return types.SimpleNamespace(
         method="df2t" if df2t else "dflash",
         use_df2t=lambda: df2t,
+        use_df2t_tree=lambda: df2t,
         num_speculative_tokens=5,
         tree_attention_backend="flex" if flex else "fa4",
     )

@@ -688,7 +688,7 @@ class EngineCore:
             self.async_scheduling
             and self.check_for_draft_tokens
             and self.vllm_config.speculative_config is not None
-            and self.vllm_config.speculative_config.use_df2t()
+            and self.vllm_config.speculative_config.use_df2t_tree()
         ):
             return False
         draft_token_ids = self.model_executor.take_draft_token_ids()

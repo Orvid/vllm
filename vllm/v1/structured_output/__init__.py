@@ -327,13 +327,14 @@ class StructuredOutputManager:
         return 1
 
     def _is_df2t(self) -> bool:
-        """Whether the operative speculative config drafts df2t trees.
+        """Whether the operative speculative config drafts df2t TREES.
 
         df2t drafts are arena-ordered tree tokens, so the linear-chain grammar
-        checks below must not treat them as a sequence.
+        checks below must not treat them as a sequence. A tree-off df2t serves
+        the DFlash2 chain and needs no tree-aware grammar.
         """
         spec_config = getattr(self.vllm_config, "speculative_config", None)
-        return spec_config is not None and spec_config.use_df2t()
+        return spec_config is not None and spec_config.use_df2t_tree()
 
     def validate_tokens(self, request: "Request", spec_tokens: list[int]) -> list[int]:
         """Return the longest unconstrained or grammar-valid prefix of `spec_tokens`."""

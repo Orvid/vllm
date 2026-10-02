@@ -40,6 +40,16 @@ class DF2TSpeculator(DFlash2Speculator):
         # TreeBuilder buffers (eager build or a replayed drafter graph). Used
         # to fail closed if a consumer ever asks for more rows than were built.
         self._last_built_rows = 0
+        self._tree_enabled = d.use_df2t_tree()
+        if not self._tree_enabled:
+            # ``enable_tree=False``: serve the DFlash2 greedy CHAIN from the
+            # SAME drafter (``super()._generate_draft``), reproducing the dflash
+            # chain path exactly. The base DFlash2 buffers (draft_tokens sized
+            # to ``num_speculative_steps``, the candidate walk) stay untouched;
+            # the tree-only machinery (TreeBuilder, the tree-width draft carry,
+            # the arena->depth context) is skipped.
+            self.tree_builder = None
+            return
         self.tree_builder = TreeBuilder(
             self.max_num_reqs,
             self.max_depth,
@@ -79,8 +89,11 @@ class DF2TSpeculator(DFlash2Speculator):
         already relocated the accepted KV to — so ``accepted_depth[r, arena]``
         maps an arena to its chain depth. A request with no accepted chain
         leaves its row all-zero, and the prep kernel falls back to the plain
-        (linear) context those requests use.
+        (linear) context those requests use. Returns ``None`` (the linear
+        dflash prep) when the tree is disabled or no verifier is attached.
         """
+        if not self._tree_enabled:
+            return None
         tv = self.tree_verifier
         if tv is None:
             return None
@@ -118,8 +131,20 @@ class DF2TSpeculator(DFlash2Speculator):
         node token ids into ``draft_tokens`` (emit/arena order, padded to the
         per-step draft width) and stashes the batched tree for the scheduler
         carry. The tree is re-built every step from the fresh draft scores, so
-        the DFlash2 chain path (``method == "dflash"``) is untouched.
+        the DFlash2 chain path (``method == "dflash"``, or
+        ``method == "df2t"`` with ``enable_tree=False``) is untouched: with
+        the tree disabled this delegates to the DFlash2 greedy CHAIN
+        (``CandidateSampler`` walk) from the same drafter.
         """
+        if not self._tree_enabled:
+            return super()._generate_draft(
+                num_reqs,
+                num_tokens_padded,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+            )
         last_hidden_states = self._run_model(
             num_tokens_padded,
             attn_metadata,
@@ -180,7 +205,9 @@ class DF2TSpeculator(DFlash2Speculator):
         for more (padded) requests; ignoring ``self._last_tree``'s own width
         also avoids returning stale per-descriptor slices after capture. Only
         df2t speculators expose this; other speculators keep
-        ``set_draft_tokens`` on the plain draft-token path via None.
+        ``set_draft_tokens`` on the plain draft-token path via None. Always
+        ``None`` when ``enable_tree=False``: the chain carries plain draft
+        tokens, so the runner takes the plain rejection-sampler path.
 
         Args:
             num_reqs: Number of requests in the batch being scheduled. Must be
@@ -192,7 +219,7 @@ class DF2TSpeculator(DFlash2Speculator):
                 leftover trees from an older batch).
 
         """
-        if self._last_tree is None:
+        if not self._tree_enabled or self._last_tree is None:
             return None
         if num_reqs > self._last_built_rows:
             raise RuntimeError(
@@ -240,6 +267,10 @@ class DF2TSpeculator(DFlash2Speculator):
 
     def _mark_draft_graph_built(self, rows: int) -> None:
         """Record the row count a replayed drafter graph just wrote."""
+        if not self._tree_enabled:
+            # Tree-off: the chain never supplies trees; leave the build-wide
+            # bookkeeping inert so ``get_latest_tree_drafts`` stays None.
+            return
         self._last_built_rows = rows
 
     @property

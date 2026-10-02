@@ -196,7 +196,7 @@ def get_attn_backend(
     # their own backend explicitly, and MLA kinds never carry a tree.
     if (
         speculative_config is not None
-        and speculative_config.use_df2t()
+        and speculative_config.use_df2t_tree()
         and speculative_config.tree_attention_backend == "flex"
         and not use_mla
         and attn_type == AttentionType.DECODER

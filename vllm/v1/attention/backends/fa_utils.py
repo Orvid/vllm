@@ -117,12 +117,14 @@ def get_flash_attn_version(
             if active_vllm_config is not None
             else None
         )
-        df2t_active = speculative_config is not None and speculative_config.use_df2t()
+        df2t_active = (
+            speculative_config is not None and speculative_config.use_df2t_tree()
+        )
         # "flex" is the only FA4-exempt handle for the per-query tree mask, so
         # the fa4-unsupported arch only works when flex is the chosen vehicle.
         df2t_flex = (
             speculative_config is not None
-            and speculative_config.use_df2t()
+            and speculative_config.use_df2t_tree()
             and speculative_config.tree_attention_backend == "flex"
         )
 

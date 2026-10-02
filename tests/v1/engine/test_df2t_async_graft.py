@@ -59,7 +59,9 @@ class _CoreHarness:
             async_scheduling=True,
             check_for_draft_tokens=True,
             vllm_config=SimpleNamespace(
-                speculative_config=SimpleNamespace(use_df2t=lambda: True)
+                speculative_config=SimpleNamespace(
+                    use_df2t=lambda: True, use_df2t_tree=lambda: True
+                )
             ),
             model_executor=executor,
             scheduler=SimpleNamespace(

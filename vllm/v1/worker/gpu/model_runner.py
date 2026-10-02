@@ -432,7 +432,7 @@ def _resolve_decode_query_len(
     never the query width. Every other speculative method verifies
     ``num_speculative_steps + num_new_sampled_per_step``.
     """
-    if speculative_config is not None and speculative_config.use_df2t():
+    if speculative_config is not None and speculative_config.use_df2t_tree():
         return speculative_config.tree_decode_width
     return num_speculative_steps + num_new_sampled_per_step
 
@@ -665,7 +665,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         exceed the drafter block depth); other speculative methods carry
         ``num_speculative_steps``.
         """
-        if self.speculative_config is not None and self.speculative_config.use_df2t():
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.use_df2t_tree()
+        ):
             return self.speculative_config.num_draft_rows_per_req
         return self.num_speculative_steps
 
@@ -810,14 +813,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.vllm_config.watermark_config
                     ),
                 )
-                if self.speculative_config.use_df2t():
+                if self.speculative_config.use_df2t_tree():
                     # DF2T verifies with tree traversal, not rejection. The
                     # TreeVerifier is sized by the operative df2t node budget
                     # (BudgetPolicy.resolve_nodes_max, clamped to
                     # [nodes_floor, nodes_ceiling]) — the same single source
                     # that sizes the speculator's TreeBuilder — so the
                     # unclamped get_num_draft_tokens cannot silently diverge
-                    # from the tree buffers.
+                    # from the tree buffers. A tree-off df2t (enable_tree=False)
+                    # keeps ``tree_verifier`` None and reproduces the DFlash2
+                    # chain rejection path.
                     self.tree_verifier = TreeVerifier(
                         self.max_num_reqs,
                         BudgetPolicy.from_config(
@@ -1405,7 +1410,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         instead of falling into a PIECEWISE graph whose query layout would
         misapply the baked tree mask.
         """
-        if self.speculative_config is None or not self.speculative_config.use_df2t():
+        if (
+            self.speculative_config is None
+            or not self.speculative_config.use_df2t_tree()
+        ):
             return False
         return uniform_tok_count != self.decode_query_len
 
@@ -1421,7 +1429,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if (
             capture_decoder
             and self.speculative_config is not None
-            and (self.speculative_config.use_df2t())
+            and (self.speculative_config.use_df2t_tree())
         ):
             # df2t captures its uniform 1+B target tree-verify decode through
             # the V2 uniform FULL-graph machinery, with the FA4 tree mask
@@ -1725,12 +1733,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         use_df2t_trees = (
             bool(scheduler_output.spec_tree_draft)
             and self.speculative_config is not None
-            and self.speculative_config.use_df2t()
+            and self.speculative_config.use_df2t_tree()
         )
         if (
             draft_tokens
             and self.speculative_config is not None
-            and self.speculative_config.use_df2t()
+            and self.speculative_config.use_df2t_tree()
             and self.scheduler_config.async_scheduling
         ):
             _validate_df2t_async_tree_carry(
@@ -2411,7 +2419,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # verifier reads only the target logits rows, never any drafter
             # probability buffer.
             assert self.speculative_config is not None
-            assert self.speculative_config.use_df2t()
+            assert self.speculative_config.use_df2t_tree()
             assert self.tree_verifier is not None
             sampler_output = self._df2t_tree_verify(logits, input_batch)
         else:
@@ -2420,7 +2428,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # against meaningless draft_logits (df2t never writes them).
             assert self.speculative_config is not None
             _df2t_ensure_trees_staged(
-                use_df2t=self.speculative_config.use_df2t(),
+                use_df2t=self.speculative_config.use_df2t_tree(),
                 num_draft_tokens=input_batch.num_draft_tokens,
                 trees_staged=input_batch.trees is not None,
                 in_kernel_warmup=getattr(self, "_kernel_warmup", False),

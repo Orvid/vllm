@@ -240,6 +240,7 @@ def _df2t_spec_config():
     return types.SimpleNamespace(
         method="df2t",
         use_df2t=lambda: True,
+        use_df2t_tree=lambda: True,
         max_tree_budget=64,
         tree_attention_backend="fa4",
         num_speculative_tokens=5,
@@ -1656,7 +1657,9 @@ def test_runner_df2t_force_eager_only_when_non_uniform():
 
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
-    df2t_spec = type("Spec", (), {"use_df2t": lambda self: True})()
+    df2t_spec = type(
+        "Spec", (), {"use_df2t": lambda self: True, "use_df2t_tree": lambda self: True}
+    )()
     r = types.SimpleNamespace(speculative_config=df2t_spec, decode_query_len=16)
     _force = GPUModelRunner._df2t_force_eager
     # Uniform 1+B decode may use the FULL graph.
@@ -1668,7 +1671,11 @@ def test_runner_df2t_force_eager_only_when_non_uniform():
 
     # Non-df2t runners never force eager on shape alone.
     plain = types.SimpleNamespace(
-        speculative_config=type("S", (), {"use_df2t": lambda self: False})(),
+        speculative_config=type(
+            "S",
+            (),
+            {"use_df2t": lambda self: False, "use_df2t_tree": lambda self: False},
+        )(),
         decode_query_len=16,
     )
     assert not _force(plain, 1)

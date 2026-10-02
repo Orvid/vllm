@@ -560,8 +560,15 @@ class SpeculativeConfig:
     confidence. Currently only supported for method="dspark"."""
 
     # Tree speculative decoding (DF2T).
-    enable_tree: bool = False
-    """Verify the DFlash2 draft as a top-B tree instead of the greedy walk."""
+    enable_tree: bool = True
+    """Serve the DFlash2 draft as a top-B TREE (``method="df2t"``).
+
+    ``method="df2t"`` + ``enable_tree=True`` builds the prefix tree and
+    verifies it with tree traversal. ``enable_tree=False`` turns the SAME
+    drafter into the DFlash2 greedy CHAIN (``use_df2t_tree()`` is False and
+    every tree-only knob falls back to the dflash chain values), so a single
+    df2t checkpoint can serve either mode. Kept ``True`` by default because
+    tree serving is the df2t path; dedicated df2t tree configs omit it."""
     tree_budget: int | None = Field(default=None, ge=1)
     """Policy node count B at s=1.0; also the static decode shape 1+B."""
     max_tree_budget: int = Field(default=64, ge=1)
@@ -1951,12 +1958,14 @@ class SpeculativeConfig:
         """
         num_draft_tokens = self.num_speculative_tokens
 
-        if self.use_df2t():
-            # DF2T verifies a tree of up to max_tree_budget nodes.
+        if self.use_df2t_tree():
+            # DF2T (tree on) verifies a tree of up to max_tree_budget nodes.
             return self.max_tree_budget
 
-        if self.use_dflash():
-            # DFlash uses one bonus query followed by K mask queries.
+        if self.use_dflash() or self.use_df2t():
+            # DFlash reserves K slots; a df2t config with the tree OFF serves
+            # the DFlash2 greedy CHAIN from the same drafter, so it keeps the
+            # dflash slot math exactly (never the PARD K-1 beyond it).
             return num_draft_tokens
 
         if self.parallel_drafting:
@@ -1985,7 +1994,7 @@ class SpeculativeConfig:
         (B > L) expressible. Non-df2t methods return 0 (the base property
         derives their lookahead from ``num_speculative_tokens``).
         """
-        if not self.use_df2t():
+        if not self.use_df2t_tree():
             return 0
         return 1 + self.max_tree_budget
 
@@ -2005,7 +2014,7 @@ class SpeculativeConfig:
         Non-df2t methods return 0 (the decode width is ``1 +
         num_speculative_tokens`` in the base property).
         """
-        if not self.use_df2t():
+        if not self.use_df2t_tree():
             return 0
         budget = (
             self.tree_budget if self.tree_budget is not None else self.max_tree_budget
@@ -2022,10 +2031,12 @@ class SpeculativeConfig:
         """Per-request draft rows the scheduler schedules/pads each decode step.
 
         For df2t this is the static tree width ``nodes_max`` (a tree wider than
-        the drafter block depth is expressible); for every other speculative
-        method it is ``num_speculative_tokens``.
+        the drafter block depth is expressible) when the tree is enabled; a
+        df2t config with ``enable_tree=False`` carries the DFlash2 chain width
+        ``num_speculative_tokens``. Every other speculative method carries
+        ``num_speculative_tokens`` too.
         """
-        if self.use_df2t():
+        if self.use_df2t_tree():
             return self.tree_decode_width - 1
         return self.num_speculative_tokens
 
@@ -2064,8 +2075,20 @@ class SpeculativeConfig:
     def use_df2t(self) -> bool:
         return self.method == "df2t"
 
+    def use_df2t_tree(self) -> bool:
+        """Whether df2t actually serves the TREE (vs the DFlash2 greedy chain).
+
+        ``method="df2t"`` with ``enable_tree=False`` is the off-switch: the
+        speculator's chain ``_generate_draft`` and every tree-only reservation
+        (draft slots, lookahead, decode width, carry width) fall back to the
+        dflash chain values, so a df2t config can serve either mode from the
+        same drafter. ``use_df2t()`` (the method identity) still routes the
+        speculator selection and the df2t drafter validation.
+        """
+        return self.method == "df2t" and self.enable_tree
+
     def get_num_draft_tokens(self) -> int:
-        if self.use_df2t() and self.tree_budget is not None:
+        if self.use_df2t_tree() and self.tree_budget is not None:
             return int(round(self.tree_s * self.tree_budget))
         return self.num_speculative_tokens
 
