@@ -54,3 +54,30 @@ def test_mixed_batch_with_all_real_drafts_carried_passes():
     _validate_df2t_async_tree_carry(
         {"req0": [-1, -1, -1], "req1": [7, 8, 9]}, {"req1": tree}
     )
+
+
+def test_df2t_dispatch_guard_drafts_without_trees_raise():
+    """A df2t decode batch scheduling drafts but carrying no stashed tree must
+    raise at the sampler dispatch (the sync-path safety net): df2t never
+    populates draft_logits, so a chain rejection at T>0 would be rejection
+    against a meaningless distribution."""
+    from vllm.v1.worker.gpu.model_runner import _df2t_ensure_trees_staged
+
+    with pytest.raises(RuntimeError, match="stashed tree"):
+        _df2t_ensure_trees_staged(use_df2t=True, num_draft_tokens=4, trees_staged=False)
+
+
+def test_df2t_dispatch_guard_trees_staged_passes():
+    from vllm.v1.worker.gpu.model_runner import _df2t_ensure_trees_staged
+
+    _df2t_ensure_trees_staged(use_df2t=True, num_draft_tokens=4, trees_staged=True)
+    # No drafts (the treeless/prefill path) never triggers the guard.
+    _df2t_ensure_trees_staged(use_df2t=True, num_draft_tokens=0, trees_staged=False)
+
+
+def test_df2t_dispatch_guard_only_fires_for_df2t():
+    from vllm.v1.worker.gpu.model_runner import _df2t_ensure_trees_staged
+
+    # Chain methods (eagle/dflash) reject without draft_logits by design; the
+    # df2t-only guard must not constrain them.
+    _df2t_ensure_trees_staged(use_df2t=False, num_draft_tokens=4, trees_staged=False)

@@ -213,6 +213,34 @@ def _validate_df2t_async_tree_carry(
             )
 
 
+def _df2t_ensure_trees_staged(
+    *,
+    use_df2t: bool,
+    num_draft_tokens: int,
+    trees_staged: bool,
+) -> None:
+    """Fail closed when a df2t decode batch schedules drafts without trees.
+
+    The sampler dispatch branches on ``input_batch.trees``: a df2t batch whose
+    drafts arrived without any stashed tree (``use_df2t_trees`` False) would
+    otherwise fall through to the chain ``RejectionSampler``. DF2T never
+    populates ``draft_logits``, so at T>0 a chain rejection is against a
+    meaningless ``q``. A df2t decode batch must always carry its trees; a batch
+    that legitimately has none this step is the treeless/prefill path, which
+    schedules no drafts (``num_draft_tokens == 0``) and takes the sampler path
+    before this guard. The header guard only fires under ``use_df2t()``, so
+    chain methods (eagle/dflash) that reject with real draft_logits are
+    untouched.
+    """
+    if use_df2t and num_draft_tokens > 0 and not trees_staged:
+        raise RuntimeError(
+            "df2t decode batch scheduled draft tokens but carried no stashed "
+            "tree (the tree was dropped), so the tree-verify mask/rows have no "
+            "tree to work from. Refusing to fall through to chain rejection "
+            "sampling against meaningless draft_logits."
+        )
+
+
 def _df2t_tree_logprobs(
     processed: torch.Tensor,
     sampled: torch.Tensor,
@@ -2377,7 +2405,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert self.tree_verifier is not None
             sampler_output = self._df2t_tree_verify(logits, input_batch)
         else:
-            # Rejection sampling for spec decoding.
+            # Rejection sampling for spec decoding. A df2t batch must always
+            # carry its tree: drafts without a stashed tree would reject
+            # against meaningless draft_logits (df2t never writes them).
+            assert self.speculative_config is not None
+            _df2t_ensure_trees_staged(
+                use_df2t=self.speculative_config.use_df2t(),
+                num_draft_tokens=input_batch.num_draft_tokens,
+                trees_staged=input_batch.trees is not None,
+            )
             assert self.rejection_sampler is not None
             assert self.speculator is not None
             sampler_output = self.rejection_sampler(
