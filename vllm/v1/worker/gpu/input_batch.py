@@ -503,6 +503,90 @@ def combine_sampled_and_draft_tokens(
     return logits_indices
 
 
+@triton.jit
+def _prepare_tree_rows_kernel(
+    input_ids_ptr,
+    positions_ptr,
+    slot_positions_ptr,
+    last_sampled_ptr,
+    idx_mapping_ptr,
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    prefill_len_ptr,
+    tree_ptr,  # [R, W, 3] int64 per-request token_ids/depths/arena rows
+    widths_ptr,  # [R] int32 live node width per request (0 = treeless)
+    W,  # tree row stride
+    MAX_NODE: tl.constexpr,
+):
+    r = tl.program_id(0).to(tl.int64)
+    n = tl.load(widths_ptr + r)
+    if n <= 0:
+        return
+    qe = tl.load(query_start_loc_ptr + r + 1)
+    bs = qe - (n + 1)
+    anchor = tl.load(positions_ptr + bs)
+    cols = tl.arange(0, MAX_NODE)
+    ok = cols < n
+    base = r * W + cols
+    tok = tl.load(tree_ptr + base * 3 + 0, mask=ok, other=0).to(tl.int32)
+    dep = tl.load(tree_ptr + base * 3 + 1, mask=ok, other=0)
+    are = tl.load(tree_ptr + base * 3 + 2, mask=ok, other=0)
+    node_rows = bs + 1 + cols
+    tl.store(positions_ptr + node_rows, anchor + dep, mask=ok)
+    tl.store(slot_positions_ptr + node_rows, anchor + 1 + are, mask=ok)
+    tl.store(slot_positions_ptr + bs, anchor)
+    st = tl.load(idx_mapping_ptr + r)
+    sl = tl.load(seq_lens_ptr + r)
+    pl = tl.load(prefill_len_ptr + st)
+    if sl > pl:
+        tl.store(input_ids_ptr + bs, tl.load(last_sampled_ptr + st))
+        tl.store(input_ids_ptr + node_rows, tok, mask=ok)
+
+
+def _prepare_tree_inputs_cpu(
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    slot_positions: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    last_sampled_tokens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    prefill_len: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    logits_indices: torch.Tensor,
+    trees: "Sequence[TreeDraft | None]",
+    num_new_sampled_tokens: int = 1,
+) -> None:
+    """CPU reference of the tree-block rewrite (tests only; GPU uses the
+    triton kernel below so no host scalar round-trip gates the rewrite)."""
+    num_reqs = idx_mapping.shape[0]
+    for req_idx in range(num_reqs):
+        tree = trees[req_idx]
+        if tree is None:
+            continue
+        num_nodes = tree.token_ids.shape[0]
+        num_logits = int(cu_num_logits[req_idx + 1].item()) - int(
+            cu_num_logits[req_idx].item()
+        )
+        block_start = int(query_start_loc[req_idx + 1].item()) - num_logits
+        assert num_logits == num_nodes + num_new_sampled_tokens, (
+            f"scheduled {num_logits} logit rows for a {num_nodes}-node tree"
+        )
+        anchor_pos = int(positions[block_start].item())
+        node_rows = slice(block_start + 1, block_start + 1 + num_nodes)
+        positions[node_rows] = anchor_pos + tree.depths
+        slot_positions[block_start] = anchor_pos
+        slot_positions[node_rows] = anchor_pos + 1 + tree.arena
+        logits_start = int(cu_num_logits[req_idx].item())
+        logits_indices[logits_start : logits_start + num_logits] = torch.arange(
+            block_start, block_start + num_logits, device=logits_indices.device
+        )
+        req_state_idx = int(idx_mapping[req_idx].item())
+        if int(seq_lens[req_idx].item()) > int(prefill_len[req_state_idx].item()):
+            input_ids[block_start] = last_sampled_tokens[req_state_idx]
+            input_ids[node_rows] = tree.token_ids
+
+
 def prepare_tree_inputs(
     input_ids: torch.Tensor,
     positions: torch.Tensor,
@@ -529,11 +613,21 @@ def prepare_tree_inputs(
       * ``slot_positions``: ``C`` then ``C + 1 + arena_i`` (consecutive; this
         is what the block-table slot kernel translates, so sibling KV slots
         stay distinct even when positions collide).
-      * ``logits_indices``: every row of the ``1 + B`` block.
+      * ``logits_indices``: every row of the ``1 + B`` block (already written
+        by ``combine_sampled_and_draft_tokens`` with the same values; untouched
+        here).
 
     ``positions[block_start]`` must already equal ``C`` (the request's
     ``num_computed_tokens`` for a decode step), which ``prepare_pos_seq_lens``
     guarantees. Requests with a None tree are left untouched.
+
+    On CUDA the rewrite runs as one fixed-shape triton launch with per-request
+    masking, so the per-request ``.item()`` scalar round-trips of the older
+    host loop never gate the per-step path; the host loop remains as the CPU
+    reference (``_prepare_tree_inputs_cpu``). The scheduled width must equal
+    ``cu_num_logits[r+1] - cu_num_logits[r] - 1`` per tree request (the caller
+    asserts draft count vs tree width upstream); the kernel derives each
+    request's block start from that width, matching the host reference.
 
     Args:
         input_ids: [num_tokens_after_padding] int32.
@@ -546,38 +640,61 @@ def prepare_tree_inputs(
         seq_lens: [num_reqs] int32.
         prefill_len: [max_num_reqs] int32.
         cu_num_logits: [num_reqs + 1] int32.
-        logits_indices: [total_num_logits] int64, written for the block rows.
+        logits_indices: [total_num_logits] int64 (unused on the device path).
         trees: [num_reqs] per-request TreeDraft or None (unchanged).
         num_new_sampled_tokens: anchor rows per request (1 for LLM).
 
     """
     num_reqs = idx_mapping.shape[0]
     assert num_new_sampled_tokens == 1, "df2t verify supports one anchor"
-    for req_idx in range(num_reqs):
-        tree = trees[req_idx]
-        if tree is None:
-            continue
-        num_nodes = tree.token_ids.shape[0]
-        num_logits = int(cu_num_logits[req_idx + 1].item()) - int(
-            cu_num_logits[req_idx].item()
+    if input_ids.device.type == "cpu":
+        _prepare_tree_inputs_cpu(
+            input_ids,
+            positions,
+            slot_positions,
+            idx_mapping,
+            last_sampled_tokens,
+            query_start_loc,
+            seq_lens,
+            prefill_len,
+            cu_num_logits,
+            logits_indices,
+            trees,
+            num_new_sampled_tokens=num_new_sampled_tokens,
         )
-        block_start = int(query_start_loc[req_idx + 1].item()) - num_logits
-        assert num_logits == num_nodes + num_new_sampled_tokens, (
-            f"scheduled {num_logits} logit rows for a {num_nodes}-node tree"
-        )
-        anchor_pos = int(positions[block_start].item())
-        node_rows = slice(block_start + 1, block_start + 1 + num_nodes)
-        positions[node_rows] = anchor_pos + tree.depths
-        slot_positions[block_start] = anchor_pos
-        slot_positions[node_rows] = anchor_pos + 1 + tree.arena
-        logits_start = int(cu_num_logits[req_idx].item())
-        logits_indices[logits_start : logits_start + num_logits] = torch.arange(
-            block_start, block_start + num_logits, device=logits_indices.device
-        )
-        req_state_idx = int(idx_mapping[req_idx].item())
-        if int(seq_lens[req_idx].item()) > int(prefill_len[req_state_idx].item()):
-            input_ids[block_start] = last_sampled_tokens[req_state_idx]
-            input_ids[node_rows] = tree.token_ids
+        return
+    tree_rows = [r for r in range(num_reqs) if trees[r] is not None]
+    if not tree_rows:
+        return
+    device = input_ids.device
+    widths = [trees[r].token_ids.shape[0] for r in tree_rows]
+    W = max(widths)
+    # Fixed-shape per-request tree rows for the kernel (one small device temp;
+    # no host scalar reads). ``logits_indices`` was already written with these
+    # exact values by combine_sampled_and_draft_tokens, so it is not rewritten.
+    tree_buf = torch.zeros(num_reqs, W, 3, dtype=torch.int64, device=device)
+    widths_t = torch.zeros(num_reqs, dtype=torch.int32, device=device)
+    for local, r in enumerate(tree_rows):
+        tr = trees[r]
+        n = widths[local]
+        widths_t[r] = n
+        tree_buf[r, :n, 0] = tr.token_ids
+        tree_buf[r, :n, 1] = tr.depths
+        tree_buf[r, :n, 2] = tr.arena
+    _prepare_tree_rows_kernel[(num_reqs,)](
+        input_ids,
+        positions,
+        slot_positions,
+        last_sampled_tokens,
+        idx_mapping,
+        query_start_loc,
+        seq_lens,
+        prefill_len,
+        tree_buf,
+        widths_t,
+        W,
+        MAX_NODE=triton.next_power_of_2(W),
+    )
 
 
 @triton.jit
