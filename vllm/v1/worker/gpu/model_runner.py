@@ -230,8 +230,9 @@ def _df2t_ensure_trees_staged(
     carry its trees; a batch that legitimately has none this step is the
     treeless/prefill path, which schedules no drafts (``num_draft_tokens ==
     0``) and takes the sampler path before this guard. The header guard only
-    fires under ``use_df2t()``, so chain methods (eagle/dflash) that reject
-    with real draft_logits are untouched.
+    fires for a TREE-enabled df2t (``use_df2t_tree()``), so chain methods
+    (eagle/dflash, and tree-off df2t) that reject with real draft_logits are
+    untouched.
 
     ``in_kernel_warmup`` suppresses the guard during the mock prefill/decode
     kernel-warmup steps (gpu/warmup.py), which intentionally schedule draft
