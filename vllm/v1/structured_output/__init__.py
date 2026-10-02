@@ -461,25 +461,21 @@ class StructuredOutputManager:
                         else:
                             a = i - 1
                             path = chains[a] if a < len(chains) else []
+                            apply = False
                             if constrained and path:
-                                # Temporarily advance the grammar along the
-                                # node's chain; roll back only the tokens the
-                                # FSM actually accepted.
-                                advanced = 0
-                                for t in path:
-                                    if grammar.is_terminated() or not (
-                                        grammar.accept_tokens(req_id, [t])
-                                    ):
-                                        break
-                                    advanced += 1
-                                self._fill_bitmasks(
-                                    ((grammar, cumulative_index, True),)
-                                )
-                                grammar.rollback(advanced)
-                            else:
-                                self._fill_bitmasks(
-                                    ((grammar, cumulative_index, False),)
-                                )
+                                # Mask the row at the grammar state advanced
+                                # through the node's accepted chain. Only the
+                                # grammar-valid prefix can ever be accepted
+                                # (its row is the only reachable one), so
+                                # advance just that prefix — never logging the
+                                # rejection of a sibling's invalid proposal.
+                                valid = grammar.validate_tokens(path)
+                                if valid:
+                                    grammar.accept_tokens(req_id, valid)
+                                    apply = True
+                            self._fill_bitmasks(((grammar, cumulative_index, apply),))
+                            if apply:
+                                grammar.rollback(len(valid))
                         cumulative_index += 1
                     continue
 
