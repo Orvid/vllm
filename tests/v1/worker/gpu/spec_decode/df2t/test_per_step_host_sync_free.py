@@ -191,7 +191,7 @@ def test_df2t_per_step_verify_path_is_host_sync_free():
             logits_indices,
             rebuilt,
         )
-        tv = TreeVerifier(num_reqs, b_max, vocab, device)
+        tv = TreeVerifier(64, b_max, vocab, device)
         fake = _fake_runner(device, tv, num_reqs, vocab)
         batches = InputBuffers(num_reqs, total_logits, device)
         ib = InputBatch.make_dummy(

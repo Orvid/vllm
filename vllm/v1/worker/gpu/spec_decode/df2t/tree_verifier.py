@@ -307,13 +307,20 @@ class TreeVerifier:
             child_ok = m.any(dim=-1)
             child_arena = m.to(torch.long).argmax(dim=-1)
             stop = active & ~child_ok
-            self.sampled[active, d] = x[active]
-            self.num_sampled[stop] = d + 1
+            # Integer-index the persistent [max_num_reqs, ...] buffers (an
+            # [R] boolean mask would not broadcast against max_num_reqs).
+            lids = torch.nonzero(active, as_tuple=False).squeeze(-1)
+            self.sampled[lids, d] = x[lids]
+            stop_ids = lids[stop[lids]]
+            self.num_sampled[stop_ids] = d + 1
             accept = active & child_ok
+            accept_ids = lids[accept[lids]]
             # Column d + 1 is the accepted arena at chain depth d + 1;
             # a request still live at the last round (d == B) cannot accept
             # (there is no depth-B+1 node), so clamp keeps the write in-bounds.
-            self.accepted_arenas[accept, min(d + 1, B)] = child_arena[accept]
+            self.accepted_arenas[accept_ids, min(d + 1, B)] = child_arena[
+                accept_ids
+            ]
             cur = torch.where(accept, child_arena, cur)
             done = done | stop
         return self.sampled[:R, : B + 1], self.num_sampled[:R]
