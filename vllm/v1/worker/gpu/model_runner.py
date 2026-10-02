@@ -2311,8 +2311,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # no request needs logits processing (apply_sampling_params then
         # returns the logits untouched).
         chain_prefix_len = chain_prefix = None
-        if np.any(
-            self.sampler.needs_logits_processing[input_batch.idx_mapping_np]
+        needs_processing = getattr(self.sampler, "needs_logits_processing", None)
+        if needs_processing is None or np.any(
+            needs_processing[input_batch.idx_mapping_np]
         ):
             chain_prefix_len, chain_prefix = _df2t_chain_context(
                 trees, cu, b_max, self.device
