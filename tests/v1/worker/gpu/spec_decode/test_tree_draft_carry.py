@@ -196,6 +196,42 @@ def test_tree_draft_stash_overwrite_before_take_raises():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_tree_draft_throwaway_warmup_stash_is_abandoned():
+    """Warmup/graph-capture stages trees step after step with no take (its
+    drafts are discarded). The leftover throwaway stash must be abandoned by
+    the first real serving step — not tripping the take-ordering guard and
+    never served stale — while a real-serving take-skip still raises."""
+    h = DraftTokensHandler()
+    batch = SimpleNamespace(req_ids=["a"], has_structured_output_reqs=False)
+    nt = torch.zeros(1, 1, device="cuda", dtype=torch.long)
+
+    def _arrays(tok: int):
+        t = _tree_with_token(tok, "cuda")
+        return (
+            torch.stack([t.token_ids], dim=0),
+            torch.stack([t.depths], dim=0),
+            torch.stack([t.parents], dim=0),
+            torch.stack([t.arena], dim=0),
+            torch.stack([t.words], dim=0),
+            torch.stack([t.num_nodes], dim=0).reshape(-1),
+        )
+
+    # Two warmup stages (no take in between) — legal.
+    h.set_draft_tokens(batch, nt, tree_arrays=_arrays(1), allow_pending_overwrite=True)
+    h.set_draft_tokens(batch, nt, tree_arrays=_arrays(2), allow_pending_overwrite=True)
+    # First real serving step: the leftover throwaway stash is abandoned, and
+    # the real stash is served instead.
+    h.set_draft_tokens(batch, nt, tree_arrays=_arrays(3))
+    res = h.get_draft_tokens()
+    assert res is not None
+    assert res.spec_tree_draft[0].token_ids == [3]  # type: ignore[index]
+    # A real-serving re-stash before the take still fails closed.
+    h.set_draft_tokens(batch, nt, tree_arrays=_arrays(4))
+    with pytest.raises(RuntimeError, match="never taken"):
+        h.set_draft_tokens(batch, nt, tree_arrays=_arrays(5))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_from_lists_batched_variable_widths():
     """Per-request widths survive the batched rebuild (a scheduler-trimmed
     tree keeps its truncated width and num_nodes, so downstream shape checks

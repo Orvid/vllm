@@ -3449,6 +3449,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.req_states.draft_tokens[input_batch.idx_mapping],
                 trees=trees,
                 tree_arrays=tree_arrays,
+                # Kernel warmup stages draft trees step after step with no
+                # take_draft_token_ids in between (its drafts are discarded),
+                # so the pending-stash guard must not fire there.
+                allow_pending_overwrite=bool(
+                    getattr(self, "_kernel_warmup", False)
+                ),
             )
             if self.pp_handler is not None:
                 self.pp_handler.broadcast_drafts(

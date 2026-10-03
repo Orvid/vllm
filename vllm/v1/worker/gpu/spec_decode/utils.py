@@ -60,6 +60,11 @@ class DraftTokensHandler:
         # batch was taken would silently serve step N+1's trees for step N; the
         # flag makes that abuse fail closed.
         self._tree_pending = False
+        # True when the pending stash came from a throwaway phase (kernel
+        # warmup / graph capture, which stage step after step with no take):
+        # such a stash is abandoned rather than served stale, so the first real
+        # serving step after it starts clean instead of tripping the guard.
+        self._tree_throwaway = False
 
     def set_draft_tokens(
         self,
@@ -67,21 +72,36 @@ class DraftTokensHandler:
         draft_tokens: torch.Tensor,
         trees: "list[TreeDraft | None] | None" = None,
         tree_arrays: tuple[torch.Tensor, ...] | None = None,
+        allow_pending_overwrite: bool = False,
     ) -> None:
         self.req_ids = input_batch.req_ids
         self.num_draft_tokens = draft_tokens.shape[1]
         self.trees = None
         if tree_arrays is not None:
-            if self._tree_pending:
-                raise RuntimeError(
-                    "df2t tree stash from the previous step was never taken "
-                    "before the next step stashed its trees: the scheduler "
-                    "would receive step N+1's trees for step N (wrong tree => "
-                    "wrong mask/verify). take_draft_token_ids() must consume "
-                    "each stashed batch before the next execute_model() stages "
-                    "another one."
-                )
+            if self._tree_pending and not allow_pending_overwrite:
+                # A real serving step staging a second stash before the prior
+                # one was taken would silently serve step N+1's trees for step
+                # N (wrong tree => wrong mask/verify). A pending stash left by
+                # a throwaway warmup/capture phase is never taken, so it is
+                # abandoned instead of tripping this.
+                if not self._tree_throwaway:
+                    raise RuntimeError(
+                        "df2t tree stash from the previous step was never "
+                        "taken before the next step stashed its trees: the "
+                        "scheduler would receive step N+1's trees for step N "
+                        "(wrong tree => wrong mask/verify). "
+                        "take_draft_token_ids() must consume each stashed "
+                        "batch before the next execute_model() stages another "
+                        "one."
+                    )
+                self._tree_pending = False
+                self._tree_arrays_np = None
+                self._tree_throwaway = False
             self._stash_tree_arrays(tree_arrays)
+            if allow_pending_overwrite:
+                # Warmup/capture re-stash: mark this stash throwaway so any
+                # later real step abandons it rather than failing the guard.
+                self._tree_throwaway = True
         elif trees is not None:
             if len(trees) != len(self.req_ids):
                 raise ValueError(
@@ -95,10 +115,12 @@ class DraftTokensHandler:
             # A direct-list payload has no pending async batch; a leftover stash
             # (step N's trees never taken) is abandoned, never served stale.
             self._tree_pending = False
+            self._tree_throwaway = False
             self._tree_arrays_np = None
         else:
             # Plain (treeless) step: no tree payload this step.
             self._tree_pending = False
+            self._tree_throwaway = False
             self._tree_arrays_np = None
         if not input_batch.has_structured_output_reqs:
             # No draft token validation needs to be performed by
@@ -191,6 +213,7 @@ class DraftTokensHandler:
                 )
             )
         self._tree_pending = False
+        self._tree_throwaway = False
         self._tree_arrays_np = None
         self._tree_arr_w = 0
         return out
