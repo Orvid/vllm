@@ -2650,18 +2650,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # ``initialize_kv_cache`` from the profiling-phase reservation. If
             # a code path reached compaction without it, that is the exact OOM
             # the reservation prevents.
-            chain_width = getattr(self, "_df2t_chain_width", None)
-            chain_w = (
-                chain_width()
-                if chain_width is not None
-                else verifier.accepted_arenas.shape[1] - 1
-            )
             compaction = Df2tKVCompaction(
                 max(
                     getattr(self, "max_num_reqs", input_batch.num_reqs),
                     input_batch.num_reqs,
                 ),
-                chain_w,
+                self._df2t_chain_width(),
                 self._kv_cache_views_by_name,
                 self.kv_cache_config.kv_cache_groups,
                 self.device,
@@ -2708,11 +2702,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert self.sampler is not None
         num_reqs = input_batch.num_reqs
         # Host cumulative-logits offsets: the worker already keeps the numpy
-        # mirror (no ``.tolist()`` device round-trip; the runner unit tests fill
-        # it too, and the cpu-side reference keeps ``cu`` indexable).
+        # mirror (no ``.tolist()`` device round-trip). Required, so a future
+        # caller that forgets it fails loudly instead of silently adding a
+        # per-step device->host sync.
         cu = input_batch.cu_num_logits_np
-        if cu is None:
-            cu = input_batch.cu_num_logits.tolist()
+        assert cu is not None, (
+            "df2t verify requires the host cu_num_logits mirror; "
+            "make_input_batch must fill cu_num_logits_np"
+        )
         b_vals = [t.token_ids.shape[0] if t is not None else 0 for t in trees]
         b_max = max(b_vals)
 

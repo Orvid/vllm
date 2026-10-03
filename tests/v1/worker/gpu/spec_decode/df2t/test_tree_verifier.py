@@ -560,6 +560,9 @@ def test_model_runner_df2t_tree_verify_output_contract():
     fake_self._compact_df2t_accepted_kv = MethodType(
         GPUModelRunner._compact_df2t_accepted_kv, fake_self
     )
+    fake_self._df2t_chain_width = MethodType(
+        GPUModelRunner._df2t_chain_width, fake_self
+    )
 
     out = GPUModelRunner._df2t_tree_verify(fake_self, logits, ib)
     sampled, num_sampled = out.sampled_token_ids, out.num_sampled
@@ -668,6 +671,9 @@ def test_model_runner_df2t_tree_verify_mixed_batch():
     )
     fake_self._compact_df2t_accepted_kv = MethodType(
         GPUModelRunner._compact_df2t_accepted_kv, fake_self
+    )
+    fake_self._df2t_chain_width = MethodType(
+        GPUModelRunner._df2t_chain_width, fake_self
     )
 
     out = GPUModelRunner._df2t_tree_verify(fake_self, logits, ib)
@@ -923,6 +929,9 @@ def test_model_runner_df2t_compaction_wiring_moves_per_group():
     )
     ib = _df2t_compaction_ib(num_reqs, trees)
 
+    fake_self._df2t_chain_width = GPUModelRunner._df2t_chain_width.__get__(
+        fake_self
+    )
     GPUModelRunner._compact_df2t_accepted_kv(fake_self, ib)
 
     # Request 0 / group 0: node1 scatter 160 -> canonical 123 and node2 scatter
@@ -997,6 +1006,9 @@ def test_model_runner_df2t_compaction_wiring_noop_cases():
             device=device,
         )
         ib = _df2t_compaction_ib(num_reqs, trees)
+        fake_self._df2t_chain_width = GPUModelRunner._df2t_chain_width.__get__(
+            fake_self
+        )
         GPUModelRunner._compact_df2t_accepted_kv(fake_self, ib)
 
     # Zero-accepted: num_sampled all <= 1 -> nothing written.
@@ -1039,5 +1051,8 @@ def test_model_runner_df2t_compaction_wiring_noop_cases():
     ib_no_attrs.trees = [
         SimpleNamespace(depths=torch.zeros(4, dtype=torch.long, device=device))
     ] * num_reqs
+    fake_self._df2t_chain_width = GPUModelRunner._df2t_chain_width.__get__(
+        fake_self
+    )
     GPUModelRunner._compact_df2t_accepted_kv(fake_self, ib_no_attrs)
     assert torch.equal(storage, snapshot)
