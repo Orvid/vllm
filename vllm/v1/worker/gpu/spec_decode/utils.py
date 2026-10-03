@@ -55,6 +55,11 @@ class DraftTokensHandler:
         self._tree_arrays_np: list[np.ndarray] | None = None
         self._tree_arr_w: int = 0
         self._tree_pinned: list[torch.Tensor] | None = None
+        # True while a stashed tree batch is awaiting ``get_draft_tokens``. The
+        # pinned buffers are single-buffered, so re-stashing before the previous
+        # batch was taken would silently serve step N+1's trees for step N; the
+        # flag makes that abuse fail closed.
+        self._tree_pending = False
 
     def set_draft_tokens(
         self,
@@ -66,8 +71,16 @@ class DraftTokensHandler:
         self.req_ids = input_batch.req_ids
         self.num_draft_tokens = draft_tokens.shape[1]
         self.trees = None
-        self._tree_arrays_np = None
         if tree_arrays is not None:
+            if self._tree_pending:
+                raise RuntimeError(
+                    "df2t tree stash from the previous step was never taken "
+                    "before the next step stashed its trees: the scheduler "
+                    "would receive step N+1's trees for step N (wrong tree => "
+                    "wrong mask/verify). take_draft_token_ids() must consume "
+                    "each stashed batch before the next execute_model() stages "
+                    "another one."
+                )
             self._stash_tree_arrays(tree_arrays)
         elif trees is not None:
             if len(trees) != len(self.req_ids):
@@ -79,6 +92,14 @@ class DraftTokensHandler:
             self.trees = [
                 t.to_lists() if t is not None else None for t in trees
             ]
+            # A direct-list payload has no pending async batch; a leftover stash
+            # (step N's trees never taken) is abandoned, never served stale.
+            self._tree_pending = False
+            self._tree_arrays_np = None
+        else:
+            # Plain (treeless) step: no tree payload this step.
+            self._tree_pending = False
+            self._tree_arrays_np = None
         if not input_batch.has_structured_output_reqs:
             # No draft token validation needs to be performed by
             # the scheduler for this batch.
@@ -142,13 +163,19 @@ class DraftTokensHandler:
             pinned[5][:R].numpy()
         ]
         self._tree_arr_w = W
+        self._tree_pending = True
 
     def _materialize_trees(self) -> list[StashedTree | None] | None:
-        """Host-list the stashed tree batch, completing the async D2H."""
-        arrays = self._tree_arrays_np
-        if arrays is None:
+        """Host-list the stashed tree batch, completing the async D2H.
+
+        Consumes (clears) the pending stash so a second take for the same step
+        returns nothing and a later step cannot collide with it.
+        """
+        if not self._tree_pending:
             return self.trees
         self.copy_event.synchronize()
+        arrays = self._tree_arrays_np
+        assert arrays is not None, "a pending tree stash must have staged arrays"
         tok, dep, par, are, wrd, nn = arrays
         W = self._tree_arr_w
         out: list[StashedTree | None] = []
@@ -163,6 +190,9 @@ class DraftTokensHandler:
                     num_nodes=int(nn[i]),
                 )
             )
+        self._tree_pending = False
+        self._tree_arrays_np = None
+        self._tree_arr_w = 0
         return out
 
     def get_draft_tokens(self) -> DraftTokenIds | None:

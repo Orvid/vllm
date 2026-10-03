@@ -42,6 +42,18 @@ def _tree_on(device: str) -> TreeDraft:
     )
 
 
+def _tree_with_token(tok: int, device: str) -> TreeDraft:
+    """A one-node tree whose single token is ``tok`` (for stash tests)."""
+    return TreeDraft(
+        token_ids=torch.tensor([tok], dtype=torch.long, device=device),
+        depths=torch.tensor([1], dtype=torch.long, device=device),
+        parents=torch.tensor([-1], dtype=torch.long, device=device),
+        arena=torch.tensor([0], dtype=torch.long, device=device),
+        words=torch.tensor([1], dtype=torch.long, device=device),
+        num_nodes=torch.tensor([1], dtype=torch.int32, device=device),
+    )
+
+
 def _assert_tree_equal(a: TreeDraft, b: TreeDraft) -> None:
     assert torch.equal(a.token_ids, b.token_ids)
     assert torch.equal(a.depths, b.depths)
@@ -135,13 +147,52 @@ def test_tree_draft_carry_through_handler_batched():
         assert got.words == exp.words
         assert got.num_nodes == exp.num_nodes
 
-    # Batched rebuild, variable widths + a treeless request in the middle.
+    # The stash is consumed by the take: a second take returns no trees.
+    res2 = h.get_draft_tokens()
+    assert res2 is not None and res2.spec_tree_draft is None
+
+    # Rebuilt trees, variable widths + a treeless request in the middle.
     stashed = res.spec_tree_draft
     stashed[1] = None
     back = TreeDraft.from_lists_batched(stashed, device="cuda")
     assert back[1] is None
     tree0 = trees[0]
     _assert_tree_equal(back[0], tree0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_tree_draft_stash_overwrite_before_take_raises():
+    """Stashing a second step's trees before the previous step's stash was
+    taken must raise: the single pinned buffer is reused, so silently
+    overwriting it would hand step N+1's trees to step N. The staged->taken
+    ordering is the engine's graft contract, and this keeps it fail-closed."""
+    h = DraftTokensHandler()
+    batch = SimpleNamespace(req_ids=["a"], has_structured_output_reqs=False)
+    nt = torch.zeros(1, 1, device="cuda", dtype=torch.long)
+
+    def _arrays(tok: int):
+        t = _tree_with_token(tok, "cuda")
+        return (
+            torch.stack([t.token_ids], dim=0),
+            torch.stack([t.depths], dim=0),
+            torch.stack([t.parents], dim=0),
+            torch.stack([t.arena], dim=0),
+            torch.stack([t.words], dim=0),
+            torch.stack([t.num_nodes], dim=0).reshape(-1),
+        )
+
+    h.set_draft_tokens(batch, nt, tree_arrays=_arrays(7))
+    with pytest.raises(RuntimeError, match="never taken"):
+        h.set_draft_tokens(batch, nt, tree_arrays=_arrays(9))
+    # The first stash is still intact; consuming it succeeds normally.
+    res = h.get_draft_tokens()
+    assert res is not None
+    assert res.spec_tree_draft[0].token_ids == [7]  # type: ignore[index]
+    # And the normal set -> take -> set -> take cycle stays legal.
+    h.set_draft_tokens(batch, nt, tree_arrays=_arrays(11))
+    res = h.get_draft_tokens()
+    assert res is not None
+    assert res.spec_tree_draft[0].token_ids == [11]  # type: ignore[index]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
