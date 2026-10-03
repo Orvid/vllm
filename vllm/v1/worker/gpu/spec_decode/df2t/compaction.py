@@ -126,7 +126,7 @@ def _plan_group_kernel(
     for k in tl.range(0, W):
         vk = (k < n_acc) & (ht != 0)
         ark = tl.maximum(tl.load(arenas_ptr + r * astride + 1 + k), 0)
-        dk = tl.load(depth_ptr + r * W + ark)
+        dk = tl.load(depth_ptr + r * ARENA_W + ark)
         dbk = c + dk
         dbidx = tl.minimum(dbk // bs, nb - 1)
         dpk = tl.load(bt_ptr + r * nb + dbidx) * bs + dbk % bs
