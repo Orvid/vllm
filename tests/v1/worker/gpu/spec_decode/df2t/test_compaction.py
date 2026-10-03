@@ -983,18 +983,24 @@ def test_compaction_storage_carving_bit_identical():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_batched_compaction_chain_width_vs_arena_span():
     """The plan is sized to the real accepted-chain width while the per-arena
-    depth table keeps the full arena span.
+    depth table keeps the full arena span — and the stale-scan aliasing check
+    must index the depth table by the ARENA stride, not the chain width.
 
-    A plan built with W (chain width) < arena_span (node arena space)
-    must still relocate accepted nodes at deep arenas (>= W) — the depth lookup
-    goes through arena_span — bit-identically to the per-request reference,
-    and the plan columns past W never read anything."""
+    A plan built with W (chain width) < arena_span (node arena space) must
+    still relocate accepted nodes at deep arenas (>= W) bit-identically to the
+    per-request reference. Request 1's accepted chain uses a deep arena (5)
+    whose canonical slot equals the SOURCE slot of a later accepted node, so the
+    reference must NOT zero that source (its data is an accepted destination).
+    The depth-table read inside the aliasing scan is the discriminating detail:
+    a chain-width stride (r*W + arena) would read another request's row for
+    r >= 1 and misjudge the alias as stale, zeroing relocated KV.
+    """
     from vllm.v1.worker.gpu.spec_decode.df2t.compaction import (
         Df2tKVCompaction,
     )
 
-    R, W, arena_span = 3, 2, 8
-    block_size, num_blocks = 16, 64
+    R, W, arena_span = 2, 2, 8
+    block_size, num_blocks = 1, 128
     group_specs = [[("l.0", 2, 3), ("l.1", 1, 4)], [("l.2", 4, 2)]]
     views, buf = _make_batched_cache(group_specs, block_size, num_blocks)
     groups = [
@@ -1004,21 +1010,28 @@ def test_batched_compaction_chain_width_vs_arena_span():
         )
         for grp in group_specs
     ]
-    num_sampled = torch.tensor([1, 2, 3], dtype=torch.int32, device="cuda")
+    num_sampled = torch.tensor([1, 3], dtype=torch.int32, device="cuda")
     accepted_arenas = torch.full((R, W + 1), -1, dtype=torch.long, device="cuda")
-    accepted_arenas[1, 1] = arena_span - 1  # deep arena, past the chain width
-    accepted_arenas[2, 1] = 5
-    accepted_arenas[2, 2] = 3
-    num_computed = torch.tensor([1, 40, 70], dtype=torch.int32, device="cuda")
-    block_tables = torch.randint(0, num_blocks, (R, 6), dtype=torch.long, device="cuda")
-    trees = []
-    for r in range(R):
-        depths = torch.zeros(arena_span, dtype=torch.long, device="cuda")
-        for j in range(1, int(num_sampled[r].item())):
-            a = int(accepted_arenas[r, j].item())
-            depths[a] = j
-        trees.append(SimpleNamespace(depths=depths))
-    num_slots = int(num_computed.max().item()) + arena_span + 2
+    # Request 1 accepts node 5 (deep arena, past the chain width) at depth 2
+    # (canonical slot C+2 == the next accepted node's source slot C+1+1), then
+    # node 1 at depth 1 (canonical slot C+1). Node 1's source (C+2) holds the
+    # relocated KV of node 5 and must NOT be zeroed by the stale scan.
+    accepted_arenas[1, 1] = 5
+    accepted_arenas[1, 2] = 1
+    num_computed = torch.tensor([0, 0], dtype=torch.int32, device="cuda")
+    # block tables: physical slot == block slot (identity map, block size 1).
+    # Contiguous (a stride-0 expanded view would be indexed flat inside the
+    # plan kernel and read the wrong row).
+    block_tables = torch.arange(num_blocks, device="cuda").repeat(R, 1)
+    trees: list[SimpleNamespace | None] = [
+        None,
+        SimpleNamespace(
+            depths=torch.tensor(
+                [0, 1, 0, 0, 0, 2, 0, 0], dtype=torch.long, device="cuda"
+            )
+        ),
+    ]
+    num_slots = arena_span + 2
     _seed_kv(views, group_specs, block_size, num_slots)
     torch.cuda.synchronize()
     initial = buf.clone()
