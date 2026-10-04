@@ -162,6 +162,66 @@ def test_verifier_micrograph_replays_bit_identical_to_eager():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_greedy_fused_walk_bit_identical_to_torch_loop():
+    """The fused triton T=0 tree-walk kernel must be bit-identical to the
+    torch device loop (the reference) on sampled/num_sampled/accepted_arenas
+    across varied trees (early-stop, full chain, multi-request, small B) and
+    must reproduce the reference oracle's emitted stream on every column it
+    reads."""
+    from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import (
+        TreeVerifier as TV,
+    )
+
+    torch.manual_seed(4)
+    for R, B, V in ((1, 4, 96), (8, 6, 256), (6, 8, 512)):
+        device = torch.device("cuda")
+        token_ids, parents, num_nodes = _random_trees(R, B, V, seed=R * 101 + B)
+        target = torch.randn(R, 1 + B, V, device=device)
+        token_ids_d = token_ids.to(device)
+        parents_d = parents.to(device)
+        num_nodes_d = num_nodes.to(device)
+        gm = torch.full((R,), True, dtype=torch.bool, device=device)
+
+        # unfused torch loop (reference)
+        tv_u = TV(R, B, V, device, num_rounds=1 + B)
+        s_u, n_u = tv_u._verify_device(
+            target.clone(), token_ids_d.clone(), parents_d.clone(),
+            num_nodes_d.clone(), gm.clone(), all_greedy=True, fused=False)
+        a_u = tv_u.accepted_arenas[:R].clone()
+        torch.cuda.synchronize()
+
+        # fused kernel (production)
+        tv_f = TV(R, B, V, device, num_rounds=1 + B)
+        s_f, n_f = tv_f._verify_device(
+            target.clone(), token_ids_d.clone(), parents_d.clone(),
+            num_nodes_d.clone(), gm.clone(), all_greedy=True, fused=True)
+        a_f = tv_f.accepted_arenas[:R].clone()
+        torch.cuda.synchronize()
+
+        assert torch.equal(s_f, s_u), (R, B, "sampled")
+        assert torch.equal(n_f, n_u), (R, B, "num_sampled")
+        assert torch.equal(a_f, a_u), (R, B, "accepted_arenas")
+
+        # and the emitted stream matches the oracle on every read column
+        for r in range(R):
+            b = int(num_nodes[r])
+            out_ref, nacc_ref = tree_verify_reference(
+                target[r].cpu(), token_ids[r, :b], parents[r, :b], greedy=True)
+            n = int(n_f[r].item())
+            assert n - 1 == nacc_ref
+            assert s_f[r, :n].tolist() == out_ref
+    # exercise __call__ routing (fused used under the production shape)
+    R, B, V = 5, 6, 320
+    token_ids, parents, num_nodes = _random_trees(R, B, V, seed=71)
+    target = torch.randn(R, 1 + B, V, device=device)
+    tv = TV(R, B, V, device, num_rounds=1 + B)
+    gm = torch.full((R,), True, dtype=torch.bool, device=device)
+    s, n = tv(target.clone(), token_ids.to(device), parents.to(device),
+              num_nodes.to(device), greedy=gm.clone(), all_greedy=True)
+    assert s.shape == (R, 1 + B) and n.shape == (R,)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_alloc_rewrite_preserves_observable_contract():
     """The masked full-batch-write rewrite must keep the exact observable
     contract of the device loop: read columns match the oracle and don't-care

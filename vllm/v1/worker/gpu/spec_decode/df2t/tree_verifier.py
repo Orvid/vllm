@@ -40,7 +40,61 @@ number of emitted tokens, ``num_accepted + 1``).
 
 import torch
 
+from vllm.triton_utils import tl, triton
+
 _NEG_INF = float("-inf")
+
+
+@triton.jit
+def _tree_walk_greedy_kernel(
+    argmax_ptr,  # [R, 1 + B] int64  (per-row T=0 argmax of the verify block)
+    token_ids_ptr,  # [R, B] int64
+    parents_ptr,  # [R, B] int64
+    num_nodes_ptr,  # [R] int64
+    sampled_ptr,  # [max_num_reqs, persist_B + 1] int64 (persistent)
+    num_sampled_ptr,  # [max_num_reqs] int32 (persistent)
+    arena_ptr,  # [max_num_reqs, persist_B + 1] int64 (persistent)
+    B: tl.constexpr,
+    num_rounds: tl.constexpr,
+    persist_B: tl.constexpr,
+):
+    """One T=0 greedy tree walk per request (grid = R).
+
+    Replicates the all_greedy torch traversal exactly (bit-identical):
+    at round ``d`` draw ``x = argmax`` of the current row (row 0 = anchor, row
+    ``1 + arena`` = node), descend to the FIRST arena whose parent is the
+    current node and token equals ``x``; else emit ``x`` and stop. The bonus is
+    emitted at a leaf in the same round (a full chain never finds a child on
+    its last round, so ``num_sampled = accepted + 1`` always). Replaces the
+    per-round full-vocab argmax + mask kernels of the torch loop with one tiny
+    per-request serial walk over the precomputed ``argmax`` block.
+    """
+    r = tl.program_id(0)
+    nn = tl.load(num_nodes_ptr + r)
+    base_a = r * (B + 1)
+    base_b = r * B
+    base_s = r * (persist_B + 1)
+    cur = tl.full((), -1, tl.int64)
+    stopped = 0
+    for d in range(num_rounds):
+        if stopped == 0:
+            row = cur + 1  # -1 -> row 0 (anchor); arena a -> row 1 + a
+            x = tl.load(argmax_ptr + base_a + row)
+            found = 0
+            child = tl.full((), B, tl.int64)  # B = "no arena" sentinel (>= nn)
+            for i in range(0, nn):
+                p = tl.load(parents_ptr + base_b + i)
+                t = tl.load(token_ids_ptr + base_b + i)
+                if (p == cur) & (t == x) & (found == 0):
+                    child = i
+                    found = 1
+            tl.store(sampled_ptr + base_s + d, x)
+            if found == 0:
+                tl.store(num_sampled_ptr + r, d + 1)
+                stopped = 1
+            else:
+                tl.store(arena_ptr + base_s + tl.minimum(d + 1, B), child)
+                cur = child
 
 
 def _row_param(
@@ -440,6 +494,7 @@ class TreeVerifier:
         num_nodes: torch.Tensor,
         greedy_mask: torch.Tensor,
         all_greedy: bool = False,
+        fused: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Fixed-shape, host-sync-free traversal over ``num_rounds`` depths.
 
@@ -478,10 +533,35 @@ class TreeVerifier:
         arange_r = torch.arange(R, device=device)
         nn = num_nodes.to(torch.long).clamp(0, B)
         want = ~greedy_mask
+        if all_greedy:
+            # T=0: argmax is monotone-invariant (argmax(x) == argmax(softmax(x))
+            # per row), so the walk only ever needs the per-row argmax of the
+            # verify block. Compute it once as a single block-wide reduction,
+            # then run the walk. ``fused`` emits the whole traverse as ONE tiny
+            # triton kernel (grid = R, serial per-request walk) instead of the
+            # per-round loop of argmax-gather + mask kernels below — the loop
+            # is kept as the torch reference oracle for the fused kernel.
+            argmax_block = torch.argmax(target_logits, dim=-1)
+            if fused:
+                _tree_walk_greedy_kernel[(R,)](
+                    argmax_block,
+                    token_ids,
+                    parents,
+                    nn,
+                    self.sampled,
+                    self.num_sampled,
+                    self.accepted_arenas,
+                    B=B,
+                    num_rounds=self._num_rounds,
+                    persist_B=self.B,
+                )
+                return self.sampled[:R, : B + 1], self.num_sampled[:R]
+        else:
+            argmax_block = None
         # One block-wide log-softmax for the sampled path instead of a
         # per-round softmax over the drawn row: graded once, gathered per
-        # round (the T=0 fast path never computes it). exp(log_softmax) is
-        # the same distribution as the per-row softmax up to fp rounding.
+        # round. exp(log_softmax) is the same distribution as the per-row
+        # softmax up to fp rounding.
         logp = None
         if not all_greedy:
             logp = torch.log_softmax(target_logits, dim=-1)
@@ -489,7 +569,8 @@ class TreeVerifier:
             rows = torch.where(cur == -1, torch.zeros_like(cur), cur + 1)
             active = ~done
             if all_greedy:
-                x = torch.argmax(target_logits[arange_r, rows], dim=-1)
+                assert argmax_block is not None
+                x = argmax_block[arange_r, rows]
             else:
                 assert logp is not None
                 row_logp = logp[arange_r, rows]
