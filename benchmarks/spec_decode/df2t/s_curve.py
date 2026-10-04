@@ -30,7 +30,15 @@ import torch
 
 _MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "64"))
 _L = int(os.environ.get("MAX_TREE_DEPTH", "15"))
-_S_VALUES = (0.25, 0.5, 1.0, 2.0, 4.0)
+# tree_s values to sweep (plan Step 4: {0.25, 0.5, 1, 2, 4}). Note: tree_s that
+# resolve to nodes_max < max_tree_depth (s <= 0.5 -> B in {4, 8}) cannot boot
+# the production server on this stack — a pre-existing upstream VLLM_COMPILE
+# shape assert in the DFlash2 candidate_selector at the df2t 1+B decode widths
+# (reproduced at base HEAD) — so the benchmark driver overrides S_VALUES with
+# the servable subset {1.0, 2.0, 4.0} (B in {16, 32, 64}).
+_S_VALUES = tuple(
+    float(v) for v in os.environ.get("S_VALUES", "0.25,0.5,1.0,2.0,4.0").split(",") if v
+)
 _PROMPTS = E.PROMPTS["chat"] + E.PROMPTS["math"] + E.PROMPTS["code"]
 
 
@@ -47,12 +55,11 @@ def complete(port: int, prompt: str, max_tokens: int = _MAX_TOKENS) -> tuple[str
 
 def bench(port: int, c: int, rounds: int = 4) -> tuple[float, float, str]:
     """Return (tok/s, out_tokens, stream_hash). Concurrency c = threaded stream
-    count co-batched by the engine; rounds repeats for stable timing."""
-    batch = (
-        (_PROMPTS * ((c // len(_PROMPTS)) + 1))[:c]
-        if c > len(_PROMPTS)
-        else _PROMPTS[:c]
-    )
+    count co-batched by the engine; rounds repeats for stable timing. The batch
+    replicates the prompt list to at least ``c`` streams, so C=1 still churns
+    the full held-out list sequentially (a large stable token sample) while
+    C>1 co-batches >= c concurrent streams."""
+    batch = (_PROMPTS * ((c // len(_PROMPTS)) + 1))[: max(c, len(_PROMPTS))]
     tokens_total = 0
     elapsed = 0.0
     hashes: list[str] = []

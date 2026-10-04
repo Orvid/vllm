@@ -135,7 +135,7 @@ def _counters(port: int) -> dict:
 
 def _boot(port: int, method: str, tree_budget: int | None, max_tree_depth: int | None,
           spec_tokens: int = 15, tree_s: float | None = None,
-          eager: bool = True) -> subprocess.Popen:
+          eager: bool = True, spec_extra: dict | None = None) -> subprocess.Popen:
     spec = {"method": method, "model": DRAFT, "num_speculative_tokens": spec_tokens}
     if method == "df2t":
         if tree_budget is not None:
@@ -144,6 +144,8 @@ def _boot(port: int, method: str, tree_budget: int | None, max_tree_depth: int |
             spec["max_tree_depth"] = max_tree_depth
         if tree_s is not None:
             spec["tree_s"] = tree_s
+    if spec_extra:
+        spec.update(spec_extra)
     cmd = [
         VENV_PY, "-m", "vllm.entrypoints.openai.api_server",
         "--model", TARGET,
