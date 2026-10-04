@@ -37,7 +37,11 @@ from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
     get_aux_output_connector,
 )
-from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
+from vllm.distributed.parallel_state import (
+    get_dcp_group,
+    get_pp_group,
+    graph_capture,
+)
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
@@ -1540,6 +1544,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         ),
                         df2t_tree_mask_attach=df2t_capture_mask_attach,
                     )
+                    if (
+                        df2t_capture_mask_attach is not None
+                        and self.tree_verifier is not None
+                    ):
+                        # Capture the all_greedy (T=0) verifier micro-graphs at
+                        # the same decode batch sizes so a serving T=0 step
+                        # replays the whole fixed-shape tree walk as one graph
+                        # (see TreeVerifier.capture_cudagraph). Each capture
+                        # runs on the graph_capture stream, so it never races
+                        # the decode captures. The shared buffer set is sized
+                        # to the largest captured decode batch (~16 reqs), not
+                        # max_num_reqs, so the resident footprint is ~80 MiB.
+                        token_counts = self.cudagraph_manager.captured_token_counts()
+                        reqs = sorted(
+                            {
+                                tok // self.decode_query_len
+                                for tok in token_counts
+                                if tok // self.decode_query_len > 0
+                            }
+                        )
+                        if reqs:
+                            with graph_capture(device=self.device):
+                                self.tree_verifier.ensure_capture_capacity(
+                                    min(max(reqs), self.max_num_reqs)
+                                )
+                                for r in reqs:
+                                    self.tree_verifier.capture_cudagraph(
+                                        min(r, self.max_num_reqs)
+                                    )
                     if self.speculator is not None:
                         with use_workspace_lane(self._draft_workspace_lane):
                             self.speculator.capture()
@@ -1803,6 +1836,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and self.speculative_config is not None
             and self.speculative_config.use_df2t_tree()
             and self.scheduler_config.async_scheduling
+            and not getattr(self, "_kernel_warmup", False)
         ):
             _validate_df2t_async_tree_carry(
                 draft_tokens, scheduler_output.spec_tree_draft
@@ -2748,31 +2782,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             (num_reqs, b_max), -2, dtype=torch.long, device=self.device
         )
         num_nodes = torch.zeros(num_reqs, dtype=torch.long, device=self.device)
-        target = torch.zeros(
-            num_reqs,
-            1 + b_max,
-            logits.shape[-1],
-            dtype=processed.dtype,
-            device=self.device,
-        )
-        for r, (tree, b) in enumerate(zip(trees, b_vals)):
-            if tree is None:
-                # Empty tree: a single-token draw from the anchor row.
-                target[r, 0] = processed[cu[r]]
-                continue
-            token_ids[r, :b] = tree.token_ids
-            parents[r, :b] = tree.parents
-            # Delimit by the per-request LIVE node count (the builder's
-            # num_nodes), not the buffer width: a tree whose prefix space is
-            # exhausted (or a narrower per-request width) leaves inert padding
-            # in columns [num_nodes, b) that must never be matched. Clamped on
-            # device, so no per-request scalar round-trip.
-            live = getattr(tree, "num_nodes", None)
-            num_nodes[r] = live.clamp(min=0, max=b) if live is not None else b
-            target[r, : 1 + b] = processed[cu[r] : cu[r + 1]]
-
         ss = self.sampler.sampling_states
         idx = input_batch.idx_mapping
+        all_greedy = ss.all_greedy(input_batch.idx_mapping_np)
         # Only explicitly-seeded requests get a generator; each seeded request
         # keys its generator on the raw seed mixed with its anchor position so
         # successive steps draw independent streams (the ordinary sampler's
@@ -2789,16 +2801,70 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             steps = self.req_states.num_computed_tokens.gpu[idx].long()
             derived = _df2t_step_seed(raw, steps)
             seeds = torch.where(seeded, derived, torch.full_like(raw, -1))
-        # temperature/top-k/top-p are already applied by the pipeline above, so
-        # the verifier only softmaxes the processed rows for the draw.
-        sampled, num_sampled = self.tree_verifier(
-            target,
-            token_ids,
-            parents,
-            num_nodes,
-            greedy=ss.temperature.gpu[idx] == 0.0,
-            seeds=seeds,
+        # A T=0 all-greedy batch with no explicit seeds can replay the captured
+        # verifier micro-graph: write the gathered verify rows straight into the
+        # graph's shared target buffer, then one graph replay runs the whole
+        # fixed-shape walk (see TreeVerifier.capture_cudagraph). Any other
+        # batch takes the eager verifier.
+        replay = (
+            all_greedy
+            and seeds is None
+            and self.tree_verifier.pick_capture(num_reqs) is not None
         )
+        if replay:
+            assert self.tree_verifier._cap_target is not None
+            assert self.tree_verifier._cap_target.dtype == processed.dtype, (
+                "df2t verifier micro-graph capture dtype "
+                f"{self.tree_verifier._cap_target.dtype} != processed "
+                f"{processed.dtype}"
+            )
+            target = self.tree_verifier._cap_target[:num_reqs, : 1 + b_max]
+        else:
+            target = torch.zeros(
+                num_reqs,
+                1 + b_max,
+                logits.shape[-1],
+                dtype=processed.dtype,
+                device=self.device,
+            )
+        for r, (tree, b) in enumerate(zip(trees, b_vals)):
+            if tree is None:
+                # Empty tree: a single-token draw from the anchor row.
+                target[r, 0] = processed[cu[r]]
+                continue
+            token_ids[r, :b] = tree.token_ids
+            parents[r, :b] = tree.parents
+            # Delimit by the per-request LIVE node count (the builder's
+            # num_nodes), not the buffer width: a tree whose prefix space is
+            # exhausted (or a narrower per-request width) leaves inert padding
+            # in columns [num_nodes, b) that must never be matched. Clamped on
+            # device, so no per-request scalar round-trip.
+            live = getattr(tree, "num_nodes", None)
+            num_nodes[r] = live.clamp(min=0, max=b) if live is not None else b
+            target[r, : 1 + b] = processed[cu[r] : cu[r + 1]]
+
+        # temperature/top-k/top-p are already applied by the pipeline above, so
+        # the verifier only softmaxes the processed rows for the draw. When
+        # every request in the batch is greedy (temperature == 0, read from the
+        # host numpy mirror — no device->host read), the verifier takes its
+        # all_greedy fast path: argmax-only, skipping the per-round full-vocab
+        # softmax + batched multinomial entirely.
+        if replay:
+            staged = self.tree_verifier.stage_and_replay(
+                token_ids, parents, num_nodes, num_reqs
+            )
+            assert staged is not None
+            sampled, num_sampled = staged
+        else:
+            sampled, num_sampled = self.tree_verifier(
+                target,
+                token_ids,
+                parents,
+                num_nodes,
+                greedy=ss.temperature.gpu[idx] == 0.0,
+                seeds=seeds,
+                all_greedy=all_greedy,
+            )
         num_sampled, num_rejected = get_num_sampled_and_rejected(
             num_sampled,
             input_batch.seq_lens,

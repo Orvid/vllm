@@ -77,6 +77,7 @@ class TreeVerifier:
         device: torch.device,
         num_rounds: int | None = None,
     ):
+        self.max_num_reqs = max_num_reqs
         self.B = B
         self.vocab_size = vocab_size
         # Number of traversal rounds (one draw per depth): the depth loop bound.
@@ -92,6 +93,21 @@ class TreeVerifier:
         self.accepted_arenas = torch.full(
             (max_num_reqs, B + 1), -1, dtype=torch.long, device=device
         )
+        # CUDA-graph micro-capture of the all_greedy (T=0) device loop. One
+        # shared buffer set backs every captured size; each graph reads the
+        # first ``R`` rows of the same buffers at replay (see
+        # ``capture_cudagraph`` / ``stage_and_replay``). The buffer set is
+        # sized to the largest captured decode batch via
+        # ``ensure_capture_capacity`` (the runner derives it from the captured
+        # decode token counts), not ``max_num_reqs``, so a typical 1+B tree
+        # step (~16 reqs) costs ~80 MiB instead of ~1.3 GiB.
+        self._cap_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._cap_capacity: int | None = None
+        self._cap_target: torch.Tensor | None = None
+        self._cap_token_ids: torch.Tensor | None = None
+        self._cap_parents: torch.Tensor | None = None
+        self._cap_num_nodes: torch.Tensor | None = None
+        self._cap_greedy: torch.Tensor | None = None
 
     def _processed(
         self,
@@ -117,7 +133,7 @@ class TreeVerifier:
                 k = top_k.clamp(min=1, max=v)
                 thr_val = torch.topk(logits, int(k.max()), dim=-1).values
                 thr = torch.gather(thr_val, -1, (k - 1).unsqueeze(-1)).squeeze(-1)
-                thr = torch.where(do_k, thr, torch.full_like(thr, n_e))
+                thr = torch.where(do_k, thr, torch.full_like(thr, _NEG_INF))
                 logits = torch.where(logits < thr[:, None], n_e, logits)
         if top_p is not None:
             do_p = (top_p > 0) & (top_p < 1.0)
@@ -172,8 +188,9 @@ class TreeVerifier:
         temperature: float | torch.Tensor | None = None,
         top_k: int | torch.Tensor | None = None,
         top_p: float | torch.Tensor | None = None,
-        seeds: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+            seeds: torch.Tensor | None = None,
+            all_greedy: bool = False,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run multi-round traversal verification for a batch of requests.
 
         Args:
@@ -197,6 +214,11 @@ class TreeVerifier:
                 caller derives per-step seeds for explicitly-seeded requests
                 (e.g. mixing the raw seed with the anchor position) so
                 successive steps draw independent streams.
+            all_greedy: host-computed batch flag: every request is greedy
+                (T=0). The device loop then draws argmax only, skipping the
+                per-round softmax and the discarded batched multinomial (no
+                global RNG consumed), so a T=0 batch skips ~16 full-vocab
+                passes and stays capturable as a CUDA micro-graph.
 
         Returns:
             ``(sampled, num_sampled)``: ``sampled [R, 1 + B]`` with each row's
@@ -236,9 +258,19 @@ class TreeVerifier:
         if seeds is None and temperature is None and top_k is None and top_p is None:
             # Production shape (the runner applies temperature/top-k/top-p
             # through the ordinary sampling pipeline and never passes seeds):
-            # a fixed-round, host-sync-free device loop.
+            # a fixed-round, host-sync-free device loop. ``all_greedy`` is a
+            # host-computed batch flag (temperature == 0 for every request);
+            # when set, the loop draws argmax only — no per-round softmax and
+            # no batched multinomial that would be discarded by the greedy
+            # mask — so a T=0 batch skips ~16 full-vocab softmax+multinomial
+            # passes per step (see the fast path in :meth:`_verify_device`).
             return self._verify_device(
-                target_logits, token_ids, parents, num_nodes, greedy_mask
+                target_logits,
+                token_ids,
+                parents,
+                num_nodes,
+                greedy_mask,
+                all_greedy=all_greedy,
             )
         # Seeded/parametrized verification (reproducibility and oracle tests):
         # per-request sequential generators. Kept verbatim so a fixed seed is
@@ -255,6 +287,151 @@ class TreeVerifier:
             gens,
         )
 
+    def ensure_capture_capacity(
+        self, capacity: int, dtype: torch.dtype = torch.bfloat16
+    ) -> None:
+        """Size the shared capture buffer set to ``capacity`` rows.
+
+        Must be called before any graph is captured (the buffers back every
+        captured graph; reallocating them after capture would invalidate the
+        baked addresses). ``capacity`` is the largest captured decode batch —
+        typically ``max_num_batched_tokens // (1 + B)``, far below
+        ``max_num_reqs`` — so the resident footprint is the bytes of one
+        real-size tree block, not the max-reqs ceiling.
+        """
+        cap_capacity = self._cap_capacity
+        if self._cap_target is not None:
+            if cap_capacity is None or capacity > cap_capacity:
+                raise RuntimeError(
+                    "df2t verifier capture buffers already fixed; cannot grow "
+                    "the captured capacity"
+                )
+            return
+        if capacity <= 0 or capacity > self.max_num_reqs:
+            raise ValueError(
+                f"df2t verifier capture capacity {capacity} not in "
+                f"[1, {self.max_num_reqs}]"
+            )
+        self._cap_capacity = capacity
+        d = self.device  # type: ignore[attr-defined]
+        self._cap_target = torch.empty(
+            capacity, self.B + 1, self.vocab_size, dtype=dtype, device=d
+        )
+        self._cap_token_ids = torch.empty(
+            capacity, self.B, dtype=torch.long, device=d
+        )
+        self._cap_parents = torch.empty(
+            capacity, self.B, dtype=torch.long, device=d
+        )
+        self._cap_num_nodes = torch.empty(capacity, dtype=torch.long, device=d)
+        self._cap_greedy = torch.full(
+            (capacity,), True, dtype=torch.bool, device=d
+        )
+
+    @property
+    def device(self) -> torch.device:
+        return self.sampled.device
+
+    def capture_cudagraph(self, R: int, *, pool=None) -> None:
+        """Capture the all_greedy (T=0) device loop at batch size ``R``.
+
+        The loop is pure argmax / compare / masked write over fixed-shape
+        tensors with no data-dependent ``nonzero`` compaction, no host scalar
+        reads and no RNG (``all_greedy=True`` skips the multinomial), so it is
+        a safe, self-contained CUDA micro-graph. One shared buffer set backs
+        every captured size; any step with ``R_step <= R`` can replay the graph
+        after staging its rows into the first ``R_step`` rows of the buffers
+        (rows beyond ``R_step`` are stale and never read by the step's
+        consumers, which index ``[:num_sampled]``). The graph must be captured
+        inside ``graph_capture`` so the current stream is the capture stream.
+
+        Args:
+            R: Batch size to capture (must be ``<=`` the buffer capacity set by
+                ``ensure_capture_capacity``, which ``<= max_num_reqs``).
+            pool: CUDA graph memory pool; ``None`` uses the platform global
+                graph pool.
+
+        """
+        if self._cap_target is None:
+            raise RuntimeError(
+                "df2t verifier capture capacity not set; call "
+                "ensure_capture_capacity before capture_cudagraph"
+            )
+        cap_target = self._cap_target
+        cap_tok = self._cap_token_ids
+        cap_par = self._cap_parents
+        cap_nn = self._cap_num_nodes
+        cap_g = self._cap_greedy
+        assert cap_target is not None and cap_tok is not None
+        assert cap_par is not None and cap_nn is not None and cap_g is not None
+        assert self._cap_capacity is not None
+        if R <= 0 or self._cap_capacity < R:
+            raise ValueError(
+                f"df2t verifier capture size {R} out of [1, {self._cap_capacity}]"
+            )
+        if R in self._cap_graphs:
+            return
+        from vllm.platforms import current_platform
+
+        if pool is None:
+            pool = current_platform.get_global_graph_pool()
+        cap_target.zero_()
+        cap_tok.zero_()
+        cap_par.fill_(-1)
+        cap_nn.zero_()
+        cap_g.fill_(True)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=pool):
+            self._verify_device(
+                cap_target[:R],
+                cap_tok[:R],
+                cap_par[:R],
+                cap_nn[:R],
+                cap_g[:R],
+                all_greedy=True,
+            )
+        self._cap_graphs[R] = graph
+
+    def pick_capture(self, R: int) -> int | None:
+        """Smallest captured batch size ``>= R`` (``None`` if none fits)."""
+        return min((k for k in self._cap_graphs if k >= R), default=None)
+
+    def stage_and_replay(
+        self,
+        token_ids: torch.Tensor,
+        parents: torch.Tensor,
+        num_nodes: torch.Tensor,
+        R: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Stage a step's per-request arrays and replay the captured graph.
+
+        The caller writes the step's gathered verify rows into the shared
+        capture buffer ``_cap_target[:R, :nrows]`` (see the runner wiring);
+        this stages only the small per-request arrays, replays the graph at the
+        smallest captured size ``>= R``, and returns ``[:R]`` views of the
+        persistent ``sampled`` / ``num_sampled`` buffers. Returns ``None``
+        when no captured graph fits, in which case the caller falls back to the
+        eager verifier.
+        """
+        R_use = self.pick_capture(R)
+        cap_tok = self._cap_token_ids
+        cap_par = self._cap_parents
+        cap_nn = self._cap_num_nodes
+        if (
+            R_use is None
+            or self._cap_target is None
+            or cap_tok is None
+            or cap_par is None
+            or cap_nn is None
+        ):
+            return None
+        cap_tok[:R].copy_(token_ids)
+        cap_par[:R].copy_(parents)
+        cap_nn[:R].copy_(num_nodes.to(torch.long))
+        self._cap_graphs[R_use].replay()
+        return self.sampled[:R], self.num_sampled[:R]
+
     def _verify_device(
         self,
         target_logits: torch.Tensor,
@@ -262,6 +439,7 @@ class TreeVerifier:
         parents: torch.Tensor,
         num_nodes: torch.Tensor,
         greedy_mask: torch.Tensor,
+        all_greedy: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Fixed-shape, host-sync-free traversal over ``num_rounds`` depths.
 
@@ -273,9 +451,21 @@ class TreeVerifier:
         the rest (dummy uniform probability feeds the non-greedy rows of the
         same batched draw and is discarded by the greedy mask), so a T=0 batch
         never samples and is bit-identical to the reference; done requests are
-        simply masked out of every write and later round. The round count is
+        masked out of every write and later round. The round count is
         ``self._num_rounds`` (the runner sizes it to the chain cap + 1), so no
         data-dependent host loop bound exists.
+
+        The loop writes through full-batch masked updates only (no data-
+        dependent ``torch.nonzero`` compaction), so every intermediate is a
+        fixed-size ``[R]``/``[R, B]``/``[R, V]`` tensor — the ``all_greedy``
+        T=0 shape is capturable as a self-contained CUDA micro-graph.
+
+        When ``all_greedy`` is set the per-round softmax and the batched
+        ``multinomial`` are skipped entirely: ``argmax`` is monotone-
+        equivalent on raw logits (``argmax(x) == argmax(softmax(x))``), so the
+        emitted tokens are bit-identical while a T=0 batch avoids the ~16
+        full-vocab softmax + multinomial passes (and no global RNG is
+        consumed, making the micro-graph replay-safe).
         """
         R, nrows, _ = target_logits.shape
         B = nrows - 1
@@ -288,17 +478,27 @@ class TreeVerifier:
         arange_r = torch.arange(R, device=device)
         nn = num_nodes.to(torch.long).clamp(0, B)
         want = ~greedy_mask
+        # One block-wide log-softmax for the sampled path instead of a
+        # per-round softmax over the drawn row: graded once, gathered per
+        # round (the T=0 fast path never computes it). exp(log_softmax) is
+        # the same distribution as the per-row softmax up to fp rounding.
+        logp = None
+        if not all_greedy:
+            logp = torch.log_softmax(target_logits, dim=-1)
         for d in range(self._num_rounds):
             rows = torch.where(cur == -1, torch.zeros_like(cur), cur + 1)
             active = ~done
-            p = torch.softmax(target_logits[arange_r, rows], dim=-1)
-            p_draw = torch.where(
-                want[:, None], p, torch.ones((), dtype=p.dtype, device=device)
-            )
-            x = torch.argmax(p, dim=-1)
-            x = torch.where(
-                want, torch.multinomial(p_draw, 1).squeeze(-1), x
-            )
+            if all_greedy:
+                x = torch.argmax(target_logits[arange_r, rows], dim=-1)
+            else:
+                assert logp is not None
+                row_logp = logp[arange_r, rows]
+                p_draw = torch.where(
+                    want[:, None], row_logp.exp(), torch.ones((), dtype=logp.dtype,
+                                                              device=device)
+                )
+                x = torch.argmax(row_logp, dim=-1)
+                x = torch.where(want, torch.multinomial(p_draw, 1).squeeze(-1), x)
             m = (
                 (parents == cur[:, None])
                 & (token_ids == x[:, None])
@@ -307,20 +507,17 @@ class TreeVerifier:
             child_ok = m.any(dim=-1)
             child_arena = m.to(torch.long).argmax(dim=-1)
             stop = active & ~child_ok
-            # Integer-index the persistent [max_num_reqs, ...] buffers (an
-            # [R] boolean mask would not broadcast against max_num_reqs).
-            lids = torch.nonzero(active, as_tuple=False).squeeze(-1)
-            self.sampled[lids, d] = x[lids]
-            stop_ids = lids[stop[lids]]
-            self.num_sampled[stop_ids] = d + 1
+            # Full-batch masked writes: inactive rows keep their current
+            # (init/final) values so don't-care columns stay 0 / -1 exactly as
+            # the pre-rewrite per-active-row writes left them.
+            self.sampled[:R, d] = torch.where(active, x, self.sampled[:R, d])
+            self.num_sampled[:R] = torch.where(
+                stop, d + 1, self.num_sampled[:R]
+            )
             accept = active & child_ok
-            accept_ids = lids[accept[lids]]
-            # Column d + 1 is the accepted arena at chain depth d + 1;
-            # a request still live at the last round (d == B) cannot accept
-            # (there is no depth-B+1 node), so clamp keeps the write in-bounds.
-            self.accepted_arenas[accept_ids, min(d + 1, B)] = child_arena[
-                accept_ids
-            ]
+            self.accepted_arenas[:R, min(d + 1, B)] = torch.where(
+                accept, child_arena, self.accepted_arenas[:R, min(d + 1, B)]
+            )
             cur = torch.where(accept, child_arena, cur)
             done = done | stop
         return self.sampled[:R, : B + 1], self.num_sampled[:R]
