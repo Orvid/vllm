@@ -71,7 +71,7 @@ def _run_engine(
         max_num_batched_tokens=256,
         max_model_len=512,
         dtype="float32",
-        gpu_memory_utilization=0.45,
+        gpu_memory_utilization=0.3,
         trust_remote_code=True,
         disable_log_stats=True,
         attention_config={"backend": "FLEX_ATTENTION"},

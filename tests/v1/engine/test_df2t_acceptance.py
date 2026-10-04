@@ -75,7 +75,7 @@ def _run_engine(
         max_num_batched_tokens=256,
         max_model_len=512,
         dtype="float32" if fp32 else "bfloat16",
-        gpu_memory_utilization=0.45,
+        gpu_memory_utilization=0.3,
         trust_remote_code=True,
         disable_log_stats=False,
         attention_config={"backend": "FLEX_ATTENTION"} if fp32 else None,

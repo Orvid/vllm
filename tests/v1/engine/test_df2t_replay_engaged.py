@@ -68,7 +68,7 @@ def test_replay_engaged():
         max_num_batched_tokens=256,
         max_model_len=512,
         dtype="bfloat16",
-        gpu_memory_utilization=0.5,
+        gpu_memory_utilization=0.3,
         trust_remote_code=True,
     )
     out = llm.generate(

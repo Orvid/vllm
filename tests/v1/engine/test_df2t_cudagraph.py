@@ -52,7 +52,7 @@ def _run(cudagraph_mode: str) -> list[int]:
         max_num_batched_tokens=256,
         max_model_len=512,
         dtype="bfloat16",
-        gpu_memory_utilization=0.5,
+        gpu_memory_utilization=0.3,
         trust_remote_code=True,
         disable_log_stats=False,
     )
@@ -102,7 +102,7 @@ def test_df2t_with_piecewise_only_mode_fails_closed() -> None:
             max_num_batched_tokens=256,
             max_model_len=512,
             dtype="bfloat16",
-            gpu_memory_utilization=0.5,
+            gpu_memory_utilization=0.3,
             trust_remote_code=True,
             disable_log_stats=False,
         )

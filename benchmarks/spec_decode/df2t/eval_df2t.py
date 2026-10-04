@@ -150,7 +150,7 @@ def _boot(port: int, method: str, tree_budget: int | None, max_tree_depth: int |
         VENV_PY, "-m", "vllm.entrypoints.openai.api_server",
         "--model", TARGET,
         "--speculative-config", json.dumps(spec),
-        "--gpu-memory-utilization", "0.45",
+        "--gpu-memory-utilization", "0.3",
         "--port", str(port), "--host", "127.0.0.1",
         "--max-model-len", "512",
     ]
