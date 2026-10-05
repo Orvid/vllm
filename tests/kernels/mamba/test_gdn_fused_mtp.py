@@ -327,7 +327,7 @@ def test_fused_model_path_matches_reference(
     )
     mixed_qkvz = torch.cat((mixed_qkv, output_gate.flatten(1)), dim=-1)
     ba = torch.cat((b, a), dim=-1)
-    context = types.SimpleNamespace(attn_metadata={PREFIX: metadata})
+    context = types.SimpleNamespace(attn_metadata={PREFIX: metadata}, tree_verify=None)
 
     reference_layer = _build_layer(
         vllm_config,

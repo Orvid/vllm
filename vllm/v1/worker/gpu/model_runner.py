@@ -124,6 +124,7 @@ from vllm.v1.worker.gpu.input_batch import (
     prepare_pos_seq_lens,
     prepare_prefill_inputs,
     prepare_tree_inputs,
+    prepare_tree_mrope_positions,
     set_dummy_context,
 )
 from vllm.v1.worker.gpu.kv_connector import (
@@ -3433,6 +3434,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # values above.
             **self.model_state.prepare_inputs(input_batch, self.req_states),
         }
+        tree_batch = input_batch.tree_batch
+        mrope_positions = model_inputs["positions"]
+        if tree_batch is not None and mrope_positions is not input_batch.positions:
+            # Multi-dimensional (M-RoPE) positions were filled as a chain.
+            prepare_tree_mrope_positions(
+                mrope_positions,
+                input_batch.positions,
+                input_batch.query_start_loc,
+                tree_batch.widths,
+                input_batch.num_reqs,
+                tree_batch.token_ids.shape[1],
+            )
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
             model_inputs["input_ids"] = None
@@ -3500,9 +3513,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
-                tree_verify=(
-                    self._tree_ctx if input_batch.tree_batch is not None else None
-                ),
+                # Published for every forward under tree verification: a
+                # batch's draft rows are always tree rows, even in dummy runs.
+                tree_verify=self._tree_ctx,
             ):
                 self.kv_connector.pre_forward(**connector_kwargs)
                 if ubatch_state is not None:

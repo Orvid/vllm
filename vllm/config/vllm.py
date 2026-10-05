@@ -3155,6 +3155,16 @@ class VllmConfig:
         if spec_config is None or not spec_config.use_tree():
             return
 
+        if self.cache_config.mamba_cache_mode != "none":
+            # Prefix-cached recurrent state snapshots block-aligned states,
+            # which the tree commit does not write yet.
+            raise ValueError(
+                "tree speculative verification does not support "
+                f"mamba_cache_mode={self.cache_config.mamba_cache_mode!r} yet; "
+                "disable prefix caching for this hybrid model "
+                "(--no-enable-prefix-caching)."
+            )
+
         from vllm.v1.attention.backends.fa_utils import TREE_ATTN_REQUIRED
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 

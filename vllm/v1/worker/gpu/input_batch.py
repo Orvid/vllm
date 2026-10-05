@@ -700,6 +700,56 @@ def prepare_tree_inputs(
     )
 
 
+@triton.jit
+def _tree_mrope_positions_kernel(
+    mrope_ptr,  # [num_dims, >= num_tokens]
+    mrope_stride,
+    positions_ptr,  # [>= num_tokens] tree-rewritten 1-D positions
+    query_start_loc_ptr,
+    widths_ptr,
+    NUM_DIMS: tl.constexpr,
+    MAX_NODE: tl.constexpr,
+):
+    r = tl.program_id(0).to(tl.int64)
+    n = tl.load(widths_ptr + r)
+    if n <= 0:
+        return
+    qe = tl.load(query_start_loc_ptr + r + 1)
+    bs = qe - (n + 1)
+    cols = tl.arange(0, MAX_NODE)
+    ok = cols < n
+    rows = bs + 1 + cols
+    depth = tl.load(positions_ptr + rows, mask=ok, other=0) - tl.load(
+        positions_ptr + bs
+    )
+    for j in tl.static_range(NUM_DIMS):
+        anchor = tl.load(mrope_ptr + j * mrope_stride + bs)
+        tl.store(mrope_ptr + j * mrope_stride + rows, anchor + depth, mask=ok)
+
+
+def prepare_tree_mrope_positions(
+    mrope_positions: torch.Tensor,
+    positions: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    widths: torch.Tensor,
+    num_reqs: int,
+    max_width: int,
+) -> None:
+    """Give tree node rows their depth below the anchor in every M-RoPE
+    dimension (the ordinary decode fill numbers them as a chain)."""
+    if num_reqs == 0:
+        return
+    _tree_mrope_positions_kernel[(num_reqs,)](
+        mrope_positions,
+        mrope_positions.stride(0),
+        positions,
+        query_start_loc,
+        widths,
+        NUM_DIMS=mrope_positions.shape[0],
+        MAX_NODE=triton.next_power_of_2(max_width),
+    )
+
+
 def _tree_batch_from_drafts(
     trees: "Sequence[TreeDraft | None]", num_reqs: int, device: torch.device
 ) -> tuple[torch.Tensor, ...] | None:

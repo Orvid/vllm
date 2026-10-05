@@ -3,7 +3,7 @@
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
 import os
-from typing import Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 from einops import rearrange
@@ -20,7 +20,11 @@ from vllm.config import (
 from vllm.distributed import (
     divide,
 )
-from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.forward_context import (
+    ForwardContext,
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
 from vllm.model_executor.layers.layernorm import RMSNormGated
@@ -38,6 +42,11 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
+)
+from vllm.model_executor.layers.mamba.ops.tree_verify import (
+    commit_gated_delta_rule_paths,
+    tree_causal_conv1d,
+    tree_gated_delta_rule,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
@@ -66,6 +75,12 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.spec_decode.tree.context import (
+        TreeCommit,
+        TreeVerifyContext,
+    )
 
 # Optional ROCm AITER Triton kernels for the GDN decode path.
 # Availability is checked centrally via rocm_aiter_ops; the actual function
@@ -1242,6 +1257,121 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out,
         )
 
+    # Tree verification (TreeRecurrentLayer): the verify rows' raw inputs are
+    # stashed per batch row, and the accepted path is replayed from the stash.
+    _tree_stash: torch.Tensor | None = None
+
+    def tree_stash_spec(self) -> tuple[int, torch.dtype]:
+        conv_dim = (self.key_dim * 2 + self.value_dim) // self.tp_size
+        return conv_dim + 2 * (self.num_v_heads // self.tp_size), (
+            self.model_config.dtype
+        )
+
+    def bind_tree_stash(self, stash: torch.Tensor) -> None:
+        self._tree_stash = stash
+
+    def _conv_state_and_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        conv_state = (
+            self.kv_cache[0]
+            if is_conv_state_dim_first()
+            else self.kv_cache[0].transpose(-1, -2)
+        )
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+        return conv_state, conv_weights
+
+    def _forward_core_tree(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        conv_state: torch.Tensor,
+        conv_weights: torch.Tensor,
+        ssm_state: torch.Tensor,
+        state_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        num_seqs: int,
+        tree: "TreeVerifyContext",
+    ) -> torch.Tensor:
+        """Verify rows (the batch's leading rows) as continuations of their
+        parent rows; returns ``[1, T, HV, V]``."""
+        num_rows = mixed_qkv.shape[0]
+        stash = self._tree_stash
+        assert stash is not None and num_rows <= stash.shape[0]
+        conv_dim = mixed_qkv.shape[1]
+        num_v_heads = b.shape[1]
+        stash[:num_rows, :conv_dim].copy_(mixed_qkv)
+        stash[:num_rows, conv_dim : conv_dim + num_v_heads].copy_(b)
+        stash[:num_rows, conv_dim + num_v_heads :].copy_(a)
+        conv_out = tree_causal_conv1d(
+            mixed_qkv,
+            conv_state,
+            conv_weights,
+            self.conv1d.bias,
+            self.activation,
+            state_indices,
+            query_start_loc,
+            num_seqs,
+            tree.row_parent,
+        )
+        query, key, value, g, beta = fused_post_conv_prep(
+            conv_output=conv_out,
+            a=a,
+            b=b,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            num_k_heads=self.num_k_heads // self.tp_size,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+            apply_l2norm=True,
+            output_g_exp=False,
+        )
+        out = tree_gated_delta_rule(
+            query,
+            key,
+            value,
+            g,
+            beta,
+            ssm_state,
+            state_indices,
+            query_start_loc,
+            num_seqs,
+            tree.row_parent,
+            max_depth=tree.max_depth + 1,
+        )
+        return out.unsqueeze(0)
+
+    def tree_commit(self, commit: "TreeCommit", attn_metadata: Any) -> None:
+        metadata = (
+            attn_metadata.get(self.prefix) if isinstance(attn_metadata, dict) else None
+        )
+        if not isinstance(metadata, GDNAttentionMetadata):
+            return
+        num_seqs = metadata.num_spec_decodes
+        if num_seqs == 0:
+            return
+        assert self._tree_stash is not None
+        assert metadata.spec_state_indices_tensor is not None
+        conv_state, conv_weights = self._conv_state_and_weights()
+        commit_gated_delta_rule_paths(
+            self._tree_stash[commit.rows],
+            commit.cu_rows[: num_seqs + 1],
+            num_seqs,
+            commit.max_rows_per_req,
+            metadata.spec_state_indices_tensor[:num_seqs, 0],
+            conv_state,
+            conv_weights,
+            self.conv1d.bias,
+            self.activation,
+            self.kv_cache[1],
+            self.A_log,
+            self.dt_bias,
+            self.num_k_heads // self.tp_size,
+            self.head_k_dim,
+            self.head_v_dim,
+        )
+
     def _forward_core(
         self,
         mixed_qkv: torch.Tensor,
@@ -1328,8 +1458,32 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
 
+        # Tree verification: the verify requests' rows continue their parent
+        # rows from the untouched committed state; the accepted path is
+        # committed after the walk (tree_commit).
+        tree = get_forward_context().tree_verify
+        core_attn_out_tree = None
+        if tree is not None and spec_sequence_masks is not None:
+            assert spec_state_indices_tensor is not None
+            assert spec_query_start_loc is not None
+            core_attn_out_tree = self._forward_core_tree(
+                mixed_qkv_spec,
+                b_spec,
+                a_spec,
+                conv_state,
+                conv_weights,
+                ssm_state,
+                spec_state_indices_tensor[: attn_metadata.num_spec_decodes, 0],
+                spec_query_start_loc[: attn_metadata.num_spec_decodes + 1],
+                attn_metadata.num_spec_decodes,
+                tree,
+            )
+            spec_sequence_masks_for_chain = None
+        else:
+            spec_sequence_masks_for_chain = spec_sequence_masks
+
         # 1.1: Process the multi-query part
-        if spec_sequence_masks is not None:
+        if spec_sequence_masks_for_chain is not None:
             # spec_state_indices_tensor is always set when spec_sequence_masks is set
             assert spec_state_indices_tensor is not None
             mixed_qkv_spec = causal_conv1d_update(
@@ -1380,7 +1534,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_non_spec = None
 
-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
+        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(
+            mixed_qkv_spec if spec_sequence_masks_for_chain is not None else None
+        )
 
         # Split mixed non-spec-decode+prefill to process independently
         split_non_spec = (
@@ -1443,7 +1599,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 2. Recurrent attention
 
         # 2.1: Process the multi-query part
-        if spec_sequence_masks is not None:
+        if core_attn_out_tree is not None:
+            core_attn_out_spec, last_recurrent_state = core_attn_out_tree, None
+        elif spec_sequence_masks is not None:
             core_attn_out_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
@@ -1801,6 +1959,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         state_indices = attn_metadata.spec_state_indices_tensor
         return (
             attn_metadata.spec_sequence_masks is not None
+            and not (
+                is_forward_context_available()
+                and get_forward_context().tree_verify is not None
+            )
             and attn_metadata.num_decodes == 0
             and attn_metadata.num_spec_decodes > 0
             and self.kv_cache[1].dtype in FUSED_GDN_STATE_DTYPES

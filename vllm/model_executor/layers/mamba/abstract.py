@@ -74,11 +74,16 @@ class MambaBase(AttentionLayerBase):
             mamba_type=self.mamba_type,
             tp_replicated=self.is_kv_cache_tp_replicated,
             mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
-            # RecoverSSM verifies the whole window off one checkpoint, so it
-            # never writes the baseline's per-draft-token state slots.
+            # RecoverSSM verifies the whole window off one checkpoint, and tree
+            # verification commits the accepted path after the walk, so neither
+            # writes the baseline's per-draft-token state slots.
             num_speculative_blocks=(
                 0
                 if vllm_config.cache_config.use_kda_recoverssm
+                or (
+                    vllm_config.speculative_config is not None
+                    and vllm_config.speculative_config.use_tree()
+                )
                 else vllm_config.num_speculative_tokens
             ),
         )

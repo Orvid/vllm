@@ -40,9 +40,12 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         self.cache_config = vllm_config.cache_config
         self.quant_config = vllm_config.quant_config
         self.speculative_config = vllm_config.speculative_config
+        # Chain verification keeps conv inputs for every draft position so the
+        # next step can slide back to the accepted one; tree verification
+        # commits the accepted path exactly, so the state holds no extra rows.
         self.num_spec = (
             self.speculative_config.num_speculative_tokens
-            if self.speculative_config
+            if self.speculative_config and not self.speculative_config.use_tree()
             else 0
         )
 

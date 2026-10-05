@@ -103,9 +103,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         self.gdn_prefill_backend: Literal["triton", "flashinfer", "cutedsl"]
         _, self.gdn_prefill_backend = _resolve_gdn_prefill_backend(vllm_config)
 
+        # Rows a verify request contributes beyond its anchor, and state slots
+        # per verify request. Chain verification keeps one slot per draft
+        # position; tree verification reads one committed slot and writes it
+        # only when the accepted path is committed after the walk.
+        self.num_state_slots = 1
         if self.speculative_config:
             assert self.speculative_config.num_speculative_tokens is not None
-            self.num_spec: int = self.speculative_config.num_speculative_tokens
+            if self.speculative_config.use_tree():
+                self.num_spec: int = self.speculative_config.tree_decode_width - 1
+            else:
+                self.num_spec = self.speculative_config.num_speculative_tokens
+                self.num_state_slots = self.num_spec + 1
         else:
             self.num_spec = 0
         self.use_spec_decode: bool = self.num_spec > 0
@@ -125,7 +134,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
 
         self.spec_state_indices_tensor: torch.Tensor = torch.empty(
-            (self.decode_cudagraph_max_bs, self.num_spec + 1),
+            (self.decode_cudagraph_max_bs, self.num_state_slots),
             dtype=torch.int32,
             device=device,
         )
@@ -338,7 +347,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
                 # Filter by spec_sequence_masks to exclude padded sequences
                 spec_state_indices_tensor = block_table_tensor[
-                    spec_sequence_masks_cpu, : self.num_spec + 1
+                    spec_sequence_masks_cpu, : self.num_state_slots
                 ]
                 non_spec_state_indices_tensor = None
                 # Padded sequences are always at the back, so the first
@@ -359,7 +368,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_token_indx = index[num_non_spec_tokens:]
 
                 spec_state_indices_tensor = block_table_tensor[
-                    spec_sequence_masks_cpu, : self.num_spec + 1
+                    spec_sequence_masks_cpu, : self.num_state_slots
                 ]
                 non_spec_state_indices_tensor = block_table_tensor[
                     non_spec_sequence_masks_cpu, 0

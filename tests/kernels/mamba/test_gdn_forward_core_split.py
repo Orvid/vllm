@@ -139,7 +139,7 @@ def _run_forward_core(layer, meta, mixed_qkv, b, a, num_tokens):
     core_attn_out = torch.zeros(
         num_tokens, HV, V, dtype=mixed_qkv.dtype, device=mixed_qkv.device
     )
-    ctx = types.SimpleNamespace(attn_metadata={PREFIX: meta})
+    ctx = types.SimpleNamespace(attn_metadata={PREFIX: meta}, tree_verify=None)
     with patch.object(qwen_gdn_linear_attn, "get_forward_context", return_value=ctx):
         layer._forward_core(
             mixed_qkv=mixed_qkv.clone(),
