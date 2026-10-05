@@ -1036,8 +1036,15 @@ def test_batched_compaction_chain_width_vs_arena_span():
     torch.cuda.synchronize()
     initial = buf.clone()
     _old_compact_reference(
-        views, group_specs, block_size, num_sampled, accepted_arenas,
-        num_computed, block_tables, trees, R,
+        views,
+        group_specs,
+        block_size,
+        num_sampled,
+        accepted_arenas,
+        num_computed,
+        block_tables,
+        trees,
+        R,
     )
     torch.cuda.synchronize()
     reference = buf.clone()
@@ -1060,9 +1067,12 @@ def test_batched_compaction_chain_width_vs_arena_span():
     torch.cuda.synchronize()
     assert torch.equal(buf, reference), "deep-arena accepted nodes diverged"
     # The reservation must agree with the split sizing.
-    assert Df2tKVCompaction.reserved_bytes(
-        max_num_reqs=R,
-        nodes_max=arena_span,
-        chain_w=W,
-        kv_cache_groups=_spec_groups(group_specs, block_size),
-    ) == compactor._reserved_bytes
+    assert (
+        Df2tKVCompaction.reserved_bytes(
+            max_num_reqs=R,
+            nodes_max=arena_span,
+            chain_w=W,
+            kv_cache_groups=_spec_groups(group_specs, block_size),
+        )
+        == compactor._reserved_bytes
+    )

@@ -54,6 +54,25 @@ def _tree_with_token(tok: int, device: str) -> TreeDraft:
     )
 
 
+def _packed(trees: list[TreeDraft]) -> torch.Tensor:
+    """The builder's packed carry rows: tokens | depths | parents | words |
+    num_nodes."""
+    return torch.stack(
+        [
+            torch.cat(
+                [
+                    t.token_ids,
+                    t.depths,
+                    t.parents,
+                    t.words,
+                    t.num_nodes.to(torch.long).reshape(1),
+                ]
+            )
+            for t in trees
+        ]
+    )
+
+
 def _assert_tree_equal(a: TreeDraft, b: TreeDraft) -> None:
     assert torch.equal(a.token_ids, b.token_ids)
     assert torch.equal(a.depths, b.depths)
@@ -116,22 +135,15 @@ def test_tree_length_mismatch_raises():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_tree_draft_carry_through_handler_batched():
-    """The batched tree-array carry (worker -> scheduler) must produce the
+    """The packed tree carry (worker -> scheduler) must produce the
     exact same ``StashedTree`` host lists as per-request ``to_lists``, and the
     batched ``from_lists_batched`` rebuild must recover identical tensors."""
     h = DraftTokensHandler()
     trees = [_tree_on("cuda"), _tree_on("cuda")]
-    arrays = (
-        torch.stack([t.token_ids for t in trees], dim=0),
-        torch.stack([t.depths for t in trees], dim=0),
-        torch.stack([t.parents for t in trees], dim=0),
-        torch.stack([t.arena for t in trees], dim=0),
-        torch.stack([t.words for t in trees], dim=0),
-        torch.stack([t.num_nodes for t in trees], dim=0).reshape(-1),
-    )
+    arrays = _packed(trees)
     batch = SimpleNamespace(req_ids=["0", "1"], has_structured_output_reqs=False)
     h.set_draft_tokens(
-        batch, torch.zeros(2, 4, device="cuda", dtype=torch.long), tree_arrays=arrays
+        batch, torch.zeros(2, 4, device="cuda", dtype=torch.long), tree_packed=arrays
     )
 
     res = h.get_draft_tokens()
@@ -171,25 +183,17 @@ def test_tree_draft_stash_overwrite_before_take_raises():
     nt = torch.zeros(1, 1, device="cuda", dtype=torch.long)
 
     def _arrays(tok: int):
-        t = _tree_with_token(tok, "cuda")
-        return (
-            torch.stack([t.token_ids], dim=0),
-            torch.stack([t.depths], dim=0),
-            torch.stack([t.parents], dim=0),
-            torch.stack([t.arena], dim=0),
-            torch.stack([t.words], dim=0),
-            torch.stack([t.num_nodes], dim=0).reshape(-1),
-        )
+        return _packed([_tree_with_token(tok, "cuda")])
 
-    h.set_draft_tokens(batch, nt, tree_arrays=_arrays(7))
+    h.set_draft_tokens(batch, nt, tree_packed=_arrays(7))
     with pytest.raises(RuntimeError, match="never taken"):
-        h.set_draft_tokens(batch, nt, tree_arrays=_arrays(9))
+        h.set_draft_tokens(batch, nt, tree_packed=_arrays(9))
     # The first stash is still intact; consuming it succeeds normally.
     res = h.get_draft_tokens()
     assert res is not None
     assert res.spec_tree_draft[0].token_ids == [7]  # type: ignore[index]
     # And the normal set -> take -> set -> take cycle stays legal.
-    h.set_draft_tokens(batch, nt, tree_arrays=_arrays(11))
+    h.set_draft_tokens(batch, nt, tree_packed=_arrays(11))
     res = h.get_draft_tokens()
     assert res is not None
     assert res.spec_tree_draft[0].token_ids == [11]  # type: ignore[index]
@@ -206,29 +210,21 @@ def test_tree_draft_throwaway_warmup_stash_is_abandoned():
     nt = torch.zeros(1, 1, device="cuda", dtype=torch.long)
 
     def _arrays(tok: int):
-        t = _tree_with_token(tok, "cuda")
-        return (
-            torch.stack([t.token_ids], dim=0),
-            torch.stack([t.depths], dim=0),
-            torch.stack([t.parents], dim=0),
-            torch.stack([t.arena], dim=0),
-            torch.stack([t.words], dim=0),
-            torch.stack([t.num_nodes], dim=0).reshape(-1),
-        )
+        return _packed([_tree_with_token(tok, "cuda")])
 
     # Two warmup stages (no take in between) — legal.
-    h.set_draft_tokens(batch, nt, tree_arrays=_arrays(1), allow_pending_overwrite=True)
-    h.set_draft_tokens(batch, nt, tree_arrays=_arrays(2), allow_pending_overwrite=True)
+    h.set_draft_tokens(batch, nt, tree_packed=_arrays(1), allow_pending_overwrite=True)
+    h.set_draft_tokens(batch, nt, tree_packed=_arrays(2), allow_pending_overwrite=True)
     # First real serving step: the leftover throwaway stash is abandoned, and
     # the real stash is served instead.
-    h.set_draft_tokens(batch, nt, tree_arrays=_arrays(3))
+    h.set_draft_tokens(batch, nt, tree_packed=_arrays(3))
     res = h.get_draft_tokens()
     assert res is not None
     assert res.spec_tree_draft[0].token_ids == [3]  # type: ignore[index]
     # A real-serving re-stash before the take still fails closed.
-    h.set_draft_tokens(batch, nt, tree_arrays=_arrays(4))
+    h.set_draft_tokens(batch, nt, tree_packed=_arrays(4))
     with pytest.raises(RuntimeError, match="never taken"):
-        h.set_draft_tokens(batch, nt, tree_arrays=_arrays(5))
+        h.set_draft_tokens(batch, nt, tree_packed=_arrays(5))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

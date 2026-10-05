@@ -10,11 +10,15 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils import random_uuid
 from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import async_tensor_h2d
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.attn_utils import FastPrefillBatchMetadata
     from vllm.v1.worker.gpu.block_table import BlockTables
-    from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import TreeDraft
+    from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import (
+        TreeBatch,
+        TreeDraft,
+    )
 
 
 class InputBuffers:
@@ -124,6 +128,9 @@ class InputBatch:
     # [num_reqs] per-request df2t TreeDraft from the scheduler carry, or None
     # for non-tree batches. Populated in prepare_inputs for the sample step.
     trees: "list[TreeDraft | None] | None" = None
+    # The same trees as batched [num_reqs, W] device tensors (``trees`` holds
+    # per-request views of them).
+    tree_batch: "TreeBatch | None" = None
 
     @classmethod
     def make_dummy(
@@ -513,9 +520,10 @@ def _prepare_tree_rows_kernel(
     query_start_loc_ptr,
     seq_lens_ptr,
     prefill_len_ptr,
-    tree_ptr,  # [R, W, 3] int64 per-request token_ids/depths/arena rows
-    widths_ptr,  # [R] int32 live node width per request (0 = treeless)
-    W,  # tree row stride
+    tok_ptr,  # [R, W] int64 per-request node token ids (arena order)
+    dep_ptr,  # [R, W] int64 per-request node depths
+    widths_ptr,  # [R] live node width per request (0 = treeless)
+    stride,  # row stride of tok/dep
     MAX_NODE: tl.constexpr,
 ):
     r = tl.program_id(0).to(tl.int64)
@@ -527,13 +535,13 @@ def _prepare_tree_rows_kernel(
     anchor = tl.load(positions_ptr + bs)
     cols = tl.arange(0, MAX_NODE)
     ok = cols < n
-    base = r * W + cols
-    tok = tl.load(tree_ptr + base * 3 + 0, mask=ok, other=0).to(tl.int32)
-    dep = tl.load(tree_ptr + base * 3 + 1, mask=ok, other=0)
-    are = tl.load(tree_ptr + base * 3 + 2, mask=ok, other=0)
+    base = r * stride + cols
+    tok = tl.load(tok_ptr + base, mask=ok, other=0).to(tl.int32)
+    dep = tl.load(dep_ptr + base, mask=ok, other=0)
     node_rows = bs + 1 + cols
     tl.store(positions_ptr + node_rows, anchor + dep, mask=ok)
-    tl.store(slot_positions_ptr + node_rows, anchor + 1 + are, mask=ok)
+    # Node arena == its column, so its block slot is C + 1 + column.
+    tl.store(slot_positions_ptr + node_rows, anchor + 1 + cols, mask=ok)
     tl.store(slot_positions_ptr + bs, anchor)
     st = tl.load(idx_mapping_ptr + r)
     sl = tl.load(seq_lens_ptr + r)
@@ -600,6 +608,7 @@ def prepare_tree_inputs(
     logits_indices: torch.Tensor,
     trees: "Sequence[TreeDraft | None]",
     num_new_sampled_tokens: int = 1,
+    tree_batch: tuple[torch.Tensor, ...] | None = None,
 ) -> None:
     """Rewrite the verify-block rows of requests that carry a df2t tree.
 
@@ -643,6 +652,9 @@ def prepare_tree_inputs(
         logits_indices: [total_num_logits] int64 (unused on the device path).
         trees: [num_reqs] per-request TreeDraft or None (unchanged).
         num_new_sampled_tokens: anchor rows per request (1 for LLM).
+        tree_batch: optional ``(token_ids, depths, widths)`` batched device
+            tensors of ``trees`` (``[R, W]`` row-strided / ``[R]``); packed
+            from ``trees`` when omitted. Node arenas are their column index.
 
     """
     num_reqs = idx_mapping.shape[0]
@@ -663,24 +675,14 @@ def prepare_tree_inputs(
             num_new_sampled_tokens=num_new_sampled_tokens,
         )
         return
-    tree_rows = [r for r in range(num_reqs) if trees[r] is not None]
-    if not tree_rows:
-        return
-    device = input_ids.device
-    widths = [trees[r].token_ids.shape[0] for r in tree_rows]
-    W = max(widths)
-    # Fixed-shape per-request tree rows for the kernel (one small device temp;
-    # no host scalar reads). ``logits_indices`` was already written with these
-    # exact values by combine_sampled_and_draft_tokens, so it is not rewritten.
-    tree_buf = torch.zeros(num_reqs, W, 3, dtype=torch.int64, device=device)
-    widths_t = torch.zeros(num_reqs, dtype=torch.int32, device=device)
-    for local, r in enumerate(tree_rows):
-        tr = trees[r]
-        n = widths[local]
-        widths_t[r] = n
-        tree_buf[r, :n, 0] = tr.token_ids
-        tree_buf[r, :n, 1] = tr.depths
-        tree_buf[r, :n, 2] = tr.arena
+    if tree_batch is None:
+        tree_batch = _tree_batch_from_drafts(trees, num_reqs, input_ids.device)
+        if tree_batch is None:
+            return
+    tok, dep, widths_t = tree_batch
+    assert tok.stride(0) == dep.stride(0) and tok.stride(1) == dep.stride(1) == 1
+    # ``logits_indices`` was already written with these exact values by
+    # combine_sampled_and_draft_tokens, so it is not rewritten.
     _prepare_tree_rows_kernel[(num_reqs,)](
         input_ids,
         positions,
@@ -690,11 +692,32 @@ def prepare_tree_inputs(
         query_start_loc,
         seq_lens,
         prefill_len,
-        tree_buf,
+        tok,
+        dep,
         widths_t,
-        W,
-        MAX_NODE=triton.next_power_of_2(W),
+        tok.stride(0),
+        MAX_NODE=triton.next_power_of_2(tok.shape[1]),
     )
+
+
+def _tree_batch_from_drafts(
+    trees: "Sequence[TreeDraft | None]", num_reqs: int, device: torch.device
+) -> tuple[torch.Tensor, ...] | None:
+    """Pack per-request trees into ``(token_ids, depths, widths)`` ``[R, W]`` /
+    ``[R]`` device tensors without host scalar reads."""
+    widths = [t.token_ids.shape[0] if t is not None else 0 for t in trees[:num_reqs]]
+    W = max(widths, default=0)
+    if W == 0:
+        return None
+    buf = torch.zeros(2, num_reqs, W, dtype=torch.int64, device=device)
+    for r, tr in enumerate(trees[:num_reqs]):
+        if tr is None:
+            continue
+        n = widths[r]
+        buf[0, r, :n] = tr.token_ids
+        buf[1, r, :n] = tr.depths
+    widths_t = async_tensor_h2d(np.asarray(widths, dtype=np.int64), device=device)
+    return buf[0], buf[1], widths_t
 
 
 @triton.jit

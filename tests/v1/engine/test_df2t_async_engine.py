@@ -4,8 +4,8 @@
 
 With async scheduling the engine runs ``step_with_batch_queue`` (batch queue
 depth = ``max_concurrent_batches`` = 2), so consecutive decode steps of
-different requests overlap in the queue and the df2t tree is carried from the
-previous worker batch via ``_graft_df2t_async_drafts``. This test drives two
+different requests overlap in the queue and each request's df2t tree is carried
+on device from the worker step that drafted it. This test drives two
 requests through that genuinely concurrent path and asserts the T=0 output is
 the plain target's greedy continuation for every request. A dropped or
 misrouted tree would skip compaction, leave accepted KV scattered, and the next

@@ -30,7 +30,7 @@ from vllm.v1.worker.gpu.input_batch import (
 )
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.sample.states import SamplingStates
-from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import TreeDraft
+from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import TreeBatch, TreeDraft
 from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import TreeVerifier
 
 
@@ -187,29 +187,36 @@ def _fake_runner(device, tree_verifier, batch_size, vocab):
         GPUModelRunner._compact_df2t_accepted_kv, fake
     )
     fake._df2t_chain_width = MethodType(GPUModelRunner._df2t_chain_width, fake)
+    fake._df2t_finish_verify = MethodType(GPUModelRunner._df2t_finish_verify, fake)
     return fake
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_df2t_per_step_verify_path_is_host_sync_free():
+@pytest.mark.parametrize("uniform", [False, True])
+def test_df2t_per_step_verify_path_is_host_sync_free(uniform):
     """The per-step verify path (tree rebuild -> layout rewrite -> verifier ->
     verifier-output assembly) makes no CUDA scalar reads or synchronize calls.
 
     The runtime path this exercises is exactly what a decode step runs
     (`make_input_batch`'s ``prepare_tree_inputs`` and ``_df2t_tree_verify``);
     the instrumentation fail-closes if any ``.item()``/``.tolist()`` on a CUDA
-    tensor or an explicit synchronize reappears on that path.
+    tensor, an explicit synchronize, or any other synchronizing CUDA op (e.g. a
+    blocking scalar host->device write) reappears on that path. ``uniform``
+    covers the same-width (uniform ``1 + B`` decode) batch, whose verify reads
+    the logits and the batched trees in place.
     """
     device = torch.device("cuda")
     vocab = 64
     torch.manual_seed(3)
 
-    # Two requests: request 0 a 2-deep tree, request 1 a 3-node chain, so the
-    # verifier processes a real depth mix.
-    trees = [
-        _tree_on([10, 11, 12], [-1, 0, 1], [1, 2, 3], device),
-        _tree_on([20, 21], [-1, 0], [1, 2], device),
-    ]
+    # Request 0 a 2-deep tree, request 1 a chain, so the verifier processes a
+    # real depth mix.
+    second = (
+        _tree_on([20, 21, 22], [-1, 0, 0], [1, 2, 2], device)
+        if uniform
+        else _tree_on([20, 21], [-1, 0], [1, 2], device)
+    )
+    trees = [_tree_on([10, 11, 12], [-1, 0, 1], [1, 2, 3], device), second]
     widths = [t.token_ids.shape[0] for t in trees]
     b_max = max(widths)
     num_reqs = len(trees)
@@ -226,18 +233,36 @@ def test_df2t_per_step_verify_path_is_host_sync_free():
     input_ids = torch.zeros(total_logits, dtype=torch.int32, device=device)
     idx_mapping = torch.arange(num_reqs, dtype=torch.int32, device=device)
     last_sampled = torch.full((num_reqs,), 7, dtype=torch.int32, device=device)
-    seq_lens = (torch.ones(num_reqs, dtype=torch.int32, device=device) * 100)
+    seq_lens = torch.ones(num_reqs, dtype=torch.int32, device=device) * 100
     prefill_len = torch.zeros(num_reqs, dtype=torch.int32, device=device)
     cu = torch.tensor(cu_np, dtype=torch.int32, device=device)
     logits_indices = torch.zeros(total_logits, dtype=torch.int64, device=device)
 
     cu_np_ib = cu_np
 
-    # Rebuilt trees exactly as the scheduler carry round-trip produces.
-    stashed = [t.to_lists() for t in trees]
-    rebuilt = TreeDraft.from_lists_batched(stashed, device)
+    # The device tree store as the drafter leaves it: one packed row per
+    # request (tokens | depths | parents | words | num_nodes), inert tails.
+    store = torch.zeros(num_reqs, 4 * b_max + 1, dtype=torch.long, device=device)
+    store[:, 2 * b_max : 3 * b_max] = -2
+    for r, t in enumerate(trees):
+        n = widths[r]
+        store[r, :n] = t.token_ids
+        store[r, b_max : b_max + n] = t.depths
+        store[r, 2 * b_max : 2 * b_max + n] = t.parents
+        store[r, 3 * b_max : 3 * b_max + n] = t.words
+        store[r, 4 * b_max] = n
+    widths_np = np.asarray(widths)
+    tv = TreeVerifier(64, b_max, vocab, device)
+    fake = _fake_runner(device, tv, num_reqs, vocab)
+    batches = InputBuffers(num_reqs, total_logits, device)
+    ib = InputBatch.make_dummy(num_reqs, total_logits, batches, is_padding=True)
+    ib.cu_num_logits = cu
+    ib.cu_num_logits_np = cu_np_ib
+    ib.seq_lens = seq_lens
 
-    with _CountingSync() as cnt:
+    def step():
+        tree_batch = TreeBatch.from_store(store, idx_mapping, widths_np)
+        assert (tree_batch.uniform_width is not None) == uniform
         prepare_tree_inputs(
             input_ids,
             positions,
@@ -249,19 +274,23 @@ def test_df2t_per_step_verify_path_is_host_sync_free():
             prefill_len,
             cu,
             logits_indices,
-            rebuilt,
+            tree_batch.drafts,
+            tree_batch=(tree_batch.token_ids, tree_batch.depths, tree_batch.widths),
         )
-        tv = TreeVerifier(64, b_max, vocab, device)
-        fake = _fake_runner(device, tv, num_reqs, vocab)
-        batches = InputBuffers(num_reqs, total_logits, device)
-        ib = InputBatch.make_dummy(
-            num_reqs, total_logits, batches, is_padding=True
-        )
-        ib.cu_num_logits = cu
-        ib.cu_num_logits_np = cu_np_ib
-        ib.seq_lens = seq_lens
-        ib.trees = rebuilt
-        out = GPUModelRunner._df2t_tree_verify(fake, logits, ib)
+        ib.trees = tree_batch.drafts
+        ib.tree_batch = tree_batch
+        return GPUModelRunner._df2t_tree_verify(fake, logits, ib)
+
+    # One warm-up step builds the compactor (a one-time init), so the counted
+    # step below is the steady-state per-step path.
+    step()
+    torch.accelerator.synchronize()
+    with _CountingSync() as cnt:
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            out = step()
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
         assert out.sampled_token_ids.shape == (num_reqs, b_max + 1)
 
     assert cnt.counts == {
@@ -305,12 +334,21 @@ def test_df2t_verify_layout_rewrite_is_host_sync_free():
     input_ids = torch.zeros(total, dtype=torch.int32, device=device)
     idx = torch.arange(num_reqs, dtype=torch.int32, device=device)
     last = torch.full((num_reqs,), 3, dtype=torch.int32, device=device)
-    seq_lens = (torch.ones(num_reqs, dtype=torch.int32, device=device) * 50)
+    seq_lens = torch.ones(num_reqs, dtype=torch.int32, device=device) * 50
     prefill = torch.zeros(num_reqs, dtype=torch.int32, device=device)
     li = torch.zeros(total, dtype=torch.int64, device=device)
     with _CountingSync() as cnt:
         prepare_tree_inputs(
-            input_ids, positions, slot, idx, last, qsl, seq_lens, prefill, cu, li,
+            input_ids,
+            positions,
+            slot,
+            idx,
+            last,
+            qsl,
+            seq_lens,
+            prefill,
+            cu,
+            li,
             trees,
         )
     assert cnt.counts == {

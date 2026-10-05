@@ -587,6 +587,9 @@ class SpeculativeConfig:
     """Cap on nodes_max (deployment throughput/runtime knob)."""
     tree_attention_backend: Literal["flex", "fa4"] = "fa4"
     """Tree-verification attention vehicle."""
+    tree_builder_num_warps: Literal[1, 2, 4, 8, 16] = 2
+    """Warps per request in the df2t tree-builder kernel. 2 is fastest on an
+    RTX 5090 (SM120); other GPUs may prefer a different value."""
 
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:

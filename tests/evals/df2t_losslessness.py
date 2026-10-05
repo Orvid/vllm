@@ -39,6 +39,7 @@ import pytest
 import torch
 
 from tests.v1.worker.gpu.spec_decode.df2t.reference_verifier import _processed
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.df2t.tree_builder import TreeBuilder
 from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import TreeVerifier
 
@@ -106,7 +107,7 @@ def _build_step(
         picks = cand[:, d].unsqueeze(1).expand(R, K, K)
         scores[:, d] = q_logits[cand[:, d - 1]].gather(-1, picks)
     tree = builder.build(scores, cand)
-    return tree.token_ids, tree.parents, tree.num_nodes
+    return tree.token_ids, tree.parents, tree.num_nodes, tree.depths
 
 
 def _target_rows(
@@ -147,9 +148,13 @@ def _decode(
 
     With ``prod_ss`` set, every target row is preprocessed through the real
     production sampling kernels (apply_temperature / apply_min_p /
-    apply_top_k_top_p on a per-request SamplingStates) before the verifier
-    softmaxes it — the exact architecture ``_df2t_tree_verify`` uses in
-    serving — instead of the verifier's reference-convention ``_processed``.
+    apply_top_k_top_p on a per-request SamplingStates), one token is drawn
+    per row with the production Gumbel sampler keyed by (request seed, row
+    position), and ``TreeVerifier.walk`` traverses the trees — the exact
+    architecture ``_df2t_tree_verify`` uses in serving — instead of the
+    verifier's reference-convention ``_processed`` and per-round draws. Row
+    positions follow serving: anchor at ``C``, node at ``C + depth``, and
+    ``C`` advances by the emitted token count each step.
     """
     dev = p_logits.device
     g = torch.Generator().manual_seed(seed)
@@ -165,8 +170,9 @@ def _decode(
     )
     pos = torch.arange(builder.B + 1, device=dev)[None, :].expand(replicas, -1)
     rr = torch.arange(replicas, device=dev)[:, None].expand(replicas, builder.B + 1)
+    ctx = torch.zeros(replicas, dtype=torch.long, device=dev)
     for _ in range(steps):
-        token_ids, parents, num_nodes = _build_step(anchors, q_logits, builder)
+        token_ids, parents, num_nodes, depths = _build_step(anchors, q_logits, builder)
         target = _target_rows(anchors, token_ids, num_nodes, p_logits)
         if prod_ss is not None:
             rows = target.shape[1]
@@ -179,16 +185,21 @@ def _decode(
             idx_np = np.arange(replicas)
             prod_ss.apply_temperature(flat, exp_map, idx_np)
             prod_ss.apply_min_p(flat, exp_map, idx_np)
-            target = prod_ss.apply_top_k_top_p(flat, exp_map, idx_np).reshape(
-                replicas, rows, vocab
+            flat = prod_ss.apply_top_k_top_p(flat, exp_map, idx_np)
+            row_pos = torch.cat([ctx[:, None], ctx[:, None] + depths], dim=1)
+            row_tokens = gumbel_sample(
+                flat,
+                exp_map,
+                prod_ss.temperature.gpu,
+                prod_ss.seeds.gpu,
+                row_pos.reshape(-1),
+                apply_temperature=False,
+                is_drafting=False,
+            ).view(replicas, rows)
+            sampled, num_sampled = verifier.walk(
+                row_tokens, token_ids, parents, num_nodes
             )
-            sampled, num_sampled = verifier(
-                target,
-                token_ids,
-                parents,
-                num_nodes,
-                greedy=greedy,
-            )
+            ctx += num_sampled.to(torch.long)
         else:
             sampled, num_sampled = verifier(
                 target,
@@ -278,6 +289,8 @@ def _run_gates(**knobs: int | float) -> dict[str, float]:
     prod_ss.top_k.np[:] = int(knobs.get("PROD_TOP_K", 8))
     prod_ss.top_p.np[:] = float(knobs.get("PROD_TOP_P", 0.95))
     prod_ss.min_p.np[:] = 0.0
+    prod_ss.seeds.np[:] = np.arange(r) * 7919 + 17
+    prod_ss.seeds.copy_to_uva()
     prod_ss.seeds_set[:] = False
     prod_ss.temperature.copy_to_uva()
     prod_ss.top_k.copy_to_uva()
@@ -358,6 +371,14 @@ def test_df2t_losslessness() -> None:
     assert results["covered_tgt"] == results["VOCAB"], "prod: contexts starved"
     assert results["kl_tgt"] < results["KL_GATE"], (
         f"production-kernel KL {results['kl_tgt']}"
+    )
+    # The per-transition KL cannot see a traversal that matches the wrong
+    # children (it changes how many tokens a step accepts, not which
+    # distribution each emitted token comes from). Both T>0 gates target the
+    # same processed distribution, so their emitted-token totals must agree.
+    ratio = results["total_tgt"] / results["total_raw"]
+    assert abs(ratio - 1.0) < 0.02, (
+        f"production path accepts {ratio:.3f}x the reference traversal's tokens"
     )
 
 

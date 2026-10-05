@@ -39,6 +39,7 @@ from tests.v1.attention.utils import (
     create_vllm_config,
 )
 from vllm.config import set_current_vllm_config
+from vllm.config.compilation import CUDAGraphMode
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.worker.gpu.spec_decode.df2t.attention import (
@@ -1648,10 +1649,23 @@ def test_runner_attach_fa4_fails_closed_without_fa4_metadata():
         runner._attach_tree_fa4_mask({"target.attn": _fake_fa4_metadata()})
 
 
-def test_runner_df2t_force_eager_only_when_non_uniform():
-    """df2t must force non-uniform batches to eager (never a PIECEWISE graph):
-    the tree mask's q layout is defined only for the uniform 1+B verify block,
-    so any other shape runs the eager path. Non-df2t runners never force eager
+@pytest.mark.parametrize(
+    "cudagraph_mode,non_uniform_eager",
+    [
+        # Mixed batches dispatch to PIECEWISE graphs, whose attention runs
+        # outside the graph with the step's tree mask: no need to force eager.
+        (CUDAGraphMode.FULL_AND_PIECEWISE, False),
+        # Mixed batches would replay FULL graphs: those must run eager.
+        (CUDAGraphMode.FULL, True),
+    ],
+)
+def test_runner_df2t_force_eager_only_when_non_uniform(
+    cudagraph_mode, non_uniform_eager
+):
+    """df2t must never replay a FULL graph for a non-uniform batch (the tree
+    mask baked into FULL captures is defined only for the uniform 1+B verify
+    block), so a mode that serves mixed batches with FULL graphs forces them
+    eager; PIECEWISE graphs are left alone. Non-df2t runners never force eager
     on shape alone."""
     import types
 
@@ -1660,14 +1674,19 @@ def test_runner_df2t_force_eager_only_when_non_uniform():
     df2t_spec = type(
         "Spec", (), {"use_df2t": lambda self: True, "use_df2t_tree": lambda self: True}
     )()
-    r = types.SimpleNamespace(speculative_config=df2t_spec, decode_query_len=16)
+    compilation_config = types.SimpleNamespace(cudagraph_mode=cudagraph_mode)
+    r = types.SimpleNamespace(
+        speculative_config=df2t_spec,
+        decode_query_len=16,
+        compilation_config=compilation_config,
+    )
     _force = GPUModelRunner._df2t_force_eager
     # Uniform 1+B decode may use the FULL graph.
     assert not _force(r, 16)
-    # Non-uniform / mixed / prefill batches run eager.
-    assert _force(r, 1)
-    assert _force(r, None)
-    assert _force(r, 8)
+    # Non-uniform / mixed / prefill batches.
+    assert _force(r, 1) is non_uniform_eager
+    assert _force(r, None) is non_uniform_eager
+    assert _force(r, 8) is non_uniform_eager
 
     # Non-df2t runners never force eager on shape alone.
     plain = types.SimpleNamespace(
@@ -1677,6 +1696,7 @@ def test_runner_df2t_force_eager_only_when_non_uniform():
             {"use_df2t": lambda self: False, "use_df2t_tree": lambda self: False},
         )(),
         decode_query_len=16,
+        compilation_config=compilation_config,
     )
     assert not _force(plain, 1)
     assert not _force(plain, None)

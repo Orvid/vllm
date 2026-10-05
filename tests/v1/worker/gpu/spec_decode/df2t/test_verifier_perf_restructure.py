@@ -47,8 +47,9 @@ def _random_trees(num_reqs, B, vocab, seed):
     return token_ids, parents, num_nodes
 
 
-def _check_against_reference(sampled, num_sampled, accepted_arenas, target,
-                             token_ids, parents, num_nodes):
+def _check_against_reference(
+    sampled, num_sampled, accepted_arenas, target, token_ids, parents, num_nodes
+):
     """Assert every READ column matches the greedy reference oracle and every
     don't-care column keeps its init value (sampled 0, accepted_arenas -1)."""
     R, nbuf, V = target.shape  # nbuf = 1 + B
@@ -90,9 +91,14 @@ def test_all_greedy_fast_path_bit_identical_and_multinomial_free(monkeypatch):
     def run(all_greedy):
         tv = TreeVerifier(R, B, V, device, num_rounds=1 + B)
         gm = torch.full((R,), True, dtype=torch.bool, device=device)
-        s, n = tv(target.clone(), token_ids.to(device), parents.to(device),
-                  num_nodes.to(device), greedy=gm.clone(),
-                  all_greedy=all_greedy)
+        s, n = tv(
+            target.clone(),
+            token_ids.to(device),
+            parents.to(device),
+            num_nodes.to(device),
+            greedy=gm.clone(),
+            all_greedy=all_greedy,
+        )
         return s.clone(), n.clone(), tv.accepted_arenas[:R].clone()
 
     calls[0] = 0
@@ -108,57 +114,9 @@ def test_all_greedy_fast_path_bit_identical_and_multinomial_free(monkeypatch):
     assert torch.equal(s_slow, s_fast)
     assert torch.equal(n_slow, n_fast)
     assert torch.equal(a_slow, a_fast)
-    _check_against_reference(s_fast, n_fast, a_fast, target, token_ids,
-                             parents, num_nodes)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_verifier_micrograph_replays_bit_identical_to_eager():
-    """The captured all_greedy micro-graph replays bit-identically to the eager
-    device loop across steps with fresh data, batch sizes below the captured
-    size (replay at the smallest captured R >= batch), and varied trees."""
-    from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import (
-        TreeVerifier as TV,
+    _check_against_reference(
+        s_fast, n_fast, a_fast, target, token_ids, parents, num_nodes
     )
-
-    torch.manual_seed(0)
-    device = torch.device("cuda")
-    B, V = 8, 512
-    for cap_R, batch_R in ((1, 1), (8, 8), (8, 3), (32, 17)):
-        tv_cap = TV(max_num_reqs=64, B=B, vocab_size=V, device=device,
-                    num_rounds=1 + B)
-        tv_eager = TV(max_num_reqs=64, B=B, vocab_size=V, device=device,
-                      num_rounds=1 + B)
-        # Capture at size cap_R (capacity sized to the max captured batch).
-        tv_cap.ensure_capture_capacity(cap_R, dtype=torch.float32)
-        tv_cap.capture_cudagraph(cap_R)
-        for step in range(3):
-            token_ids = torch.randint(0, V, (batch_R, B), device=device)
-            parents = torch.randint(-1, B, (batch_R, B), device=device)
-            num_nodes = torch.randint(2, B + 1, (batch_R,), device=device)
-            target = torch.randn(batch_R, 1 + B, V, device=device)
-
-            # Eager reference.
-            gm = torch.full((batch_R,), True, dtype=torch.bool, device=device)
-            s_e, n_e = tv_eager(target.clone(), token_ids.clone(),
-                                parents.clone(), num_nodes.clone(),
-                                greedy=gm.clone(), all_greedy=True)
-            a_e = tv_eager.accepted_arenas[:batch_R].clone()
-            torch.cuda.synchronize()
-
-            # Replay path: stage rows into the capture buffer, replay.
-            tbuf = tv_cap._cap_target[:batch_R, : 1 + B]
-            tbuf.copy_(target)
-            staged = tv_cap.stage_and_replay(token_ids, parents, num_nodes,
-                                             batch_R)
-            assert staged is not None
-            s_c, n_c = staged
-            a_c = tv_cap.accepted_arenas[:batch_R].clone()
-            torch.cuda.synchronize()
-
-            assert torch.equal(s_c, s_e), (cap_R, batch_R, step, "sampled")
-            assert torch.equal(n_c, n_e), (cap_R, batch_R, step, "num_sampled")
-            assert torch.equal(a_c, a_e), (cap_R, batch_R, step, "arenas")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -185,16 +143,28 @@ def test_greedy_fused_walk_bit_identical_to_torch_loop():
         # unfused torch loop (reference)
         tv_u = TV(R, B, V, device, num_rounds=1 + B)
         s_u, n_u = tv_u._verify_device(
-            target.clone(), token_ids_d.clone(), parents_d.clone(),
-            num_nodes_d.clone(), gm.clone(), all_greedy=True, fused=False)
+            target.clone(),
+            token_ids_d.clone(),
+            parents_d.clone(),
+            num_nodes_d.clone(),
+            gm.clone(),
+            all_greedy=True,
+            fused=False,
+        )
         a_u = tv_u.accepted_arenas[:R].clone()
         torch.cuda.synchronize()
 
         # fused kernel (production)
         tv_f = TV(R, B, V, device, num_rounds=1 + B)
         s_f, n_f = tv_f._verify_device(
-            target.clone(), token_ids_d.clone(), parents_d.clone(),
-            num_nodes_d.clone(), gm.clone(), all_greedy=True, fused=True)
+            target.clone(),
+            token_ids_d.clone(),
+            parents_d.clone(),
+            num_nodes_d.clone(),
+            gm.clone(),
+            all_greedy=True,
+            fused=True,
+        )
         a_f = tv_f.accepted_arenas[:R].clone()
         torch.cuda.synchronize()
 
@@ -206,7 +176,8 @@ def test_greedy_fused_walk_bit_identical_to_torch_loop():
         for r in range(R):
             b = int(num_nodes[r])
             out_ref, nacc_ref = tree_verify_reference(
-                target[r].cpu(), token_ids[r, :b], parents[r, :b], greedy=True)
+                target[r].cpu(), token_ids[r, :b], parents[r, :b], greedy=True
+            )
             n = int(n_f[r].item())
             assert n - 1 == nacc_ref
             assert s_f[r, :n].tolist() == out_ref
@@ -216,8 +187,14 @@ def test_greedy_fused_walk_bit_identical_to_torch_loop():
     target = torch.randn(R, 1 + B, V, device=device)
     tv = TV(R, B, V, device, num_rounds=1 + B)
     gm = torch.full((R,), True, dtype=torch.bool, device=device)
-    s, n = tv(target.clone(), token_ids.to(device), parents.to(device),
-              num_nodes.to(device), greedy=gm.clone(), all_greedy=True)
+    s, n = tv(
+        target.clone(),
+        token_ids.to(device),
+        parents.to(device),
+        num_nodes.to(device),
+        greedy=gm.clone(),
+        all_greedy=True,
+    )
     assert s.shape == (R, 1 + B) and n.shape == (R,)
 
 
@@ -242,11 +219,20 @@ def test_alloc_rewrite_preserves_observable_contract():
     tv = TreeVerifier(R, B, V, device, num_rounds=1 + B)
     gm = torch.full((R,), True, dtype=torch.bool, device=device)
     sampled, num_sampled = tv(
-        target.clone(), token_ids.to(device), parents.to(device),
-        num_nodes.to(device), greedy=gm.clone(), all_greedy=True
+        target.clone(),
+        token_ids.to(device),
+        parents.to(device),
+        num_nodes.to(device),
+        greedy=gm.clone(),
+        all_greedy=True,
     )
     assert int(num_sampled[0].item()) == 1
     _check_against_reference(
-        sampled, num_sampled, tv.accepted_arenas[:R], target, token_ids,
-        parents, num_nodes
+        sampled,
+        num_sampled,
+        tv.accepted_arenas[:R],
+        target,
+        token_ids,
+        parents,
+        num_nodes,
     )

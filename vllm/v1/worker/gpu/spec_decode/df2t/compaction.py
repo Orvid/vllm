@@ -78,58 +78,72 @@ def _zero_kernel(
 
 
 @triton.jit
-def _plan_group_kernel(
+def _plan_kernel(
     num_sampled_ptr,  # [R] int32 per-request emitted-token count
-    has_tree_ptr,  # [R] int8 1 when the request carries a tree
+    has_tree_ptr,  # [R] nonzero when the request carries a tree
     arenas_ptr,  # [R, 1 + W] int64 accepted arena per chain depth (-1 = none)
-    depth_ptr,  # [R, ARENA_W] int64 per-arena tree node depth (0 = padding)
-    c_ptr,  # [R] int64 anchor block-slot C per request
-    bt_ptr,  # [R, nb] int64 per-group block table
+    depth_ptr,  # [R, >= depth_w] int64 per-arena node depth, row stride below
+    c_ptr,  # [>= R] anchor block-slot C, indexed through idx_mapping
+    idx_ptr,  # [R] batch -> c_ptr row
+    bt_ptrs,  # [G] int64 base pointer of each group's [R, nb] table
+    bt_strides,  # [G] int64 row stride of each group's block table
+    bt_nbs,  # [G] int64 blocks per request row
+    bt_bss,  # [G] int64 tokens per block
     out_src,  # [G, max_a] int64 source phys slot per entry
     out_dst,  # [G, max_a] int64 destination phys slot per entry
     out_enter,  # [G, max_a] int8 1 when the entry must move
     out_stale,  # [G, max_a] int8 1 when the source is stale and must be zeroed
-    a,  # R * W live entry count
     W,  # accepted-chain width (plan columns per request)
-    ARENA_W,  # arena-space stride of the per-arena depth table
-    nb,  # blocks per request row
-    bs,  # tokens per block
-    g,  # this kernel's kv-cache group index
+    depth_stride,  # row stride of depth_ptr
+    depth_w,  # arenas below this have a depth entry (others read 0)
     astride,  # row stride of accepted_arenas (1 + W)
     max_a,  # persistent stride of the [G, max_a] plan buffers
+    BT_INT64: tl.constexpr,  # block tables hold int64 (else int32) ids
 ):
+    """One (entry, kv-cache group) plan cell: the source/destination phys
+    slots of accepted node ``j`` of request ``r`` and whether it moves.
+
+    Aliasing protection mirrors the reference's per-request semantics: a
+    source is stale only when it is not the destination of any valid
+    accepted node of the SAME request (``torch.isin(src, dst)`` over the
+    request's own accepted nodes). Cross-request physical slots cannot
+    coincide (each request owns disjoint KV blocks), so the scan is bounded
+    to this request's ``W`` columns.
+    """
     i = tl.program_id(0).to(tl.int64)
+    g = tl.program_id(1)
     r = i // W
     j = i - r * W
+    if BT_INT64:
+        bt_ptr = tl.load(bt_ptrs + g).to(tl.pointer_type(tl.int64))
+    else:
+        bt_ptr = tl.load(bt_ptrs + g).to(tl.pointer_type(tl.int32))
+    bstride = tl.load(bt_strides + g)
+    nb = tl.load(bt_nbs + g)
+    bs = tl.load(bt_bss + g)
     n_acc = tl.load(num_sampled_ptr + r) - 1
-    ht = tl.load(has_tree_ptr + r)
-    valid = (j < n_acc) & (ht != 0)
+    ht = tl.load(has_tree_ptr + r) != 0
+    valid = (j < n_acc) & ht
     arena = tl.load(arenas_ptr + r * astride + 1 + j)
     ar = tl.maximum(arena, 0)
-    depth = tl.load(depth_ptr + r * ARENA_W + ar)
-    c = tl.load(c_ptr + r)
+    depth = tl.load(depth_ptr + r * depth_stride + ar, mask=ar < depth_w, other=0)
+    c = tl.load(c_ptr + tl.load(idx_ptr + r)).to(tl.int64)
     s_block = c + 1 + arena
     d_block = c + depth
     s_bidx = tl.minimum(s_block // bs, nb - 1)
     d_bidx = tl.minimum(d_block // bs, nb - 1)
-    src_phys = tl.load(bt_ptr + r * nb + s_bidx) * bs + s_block % bs
-    dst_phys = tl.load(bt_ptr + r * nb + d_bidx) * bs + d_block % bs
+    row = bt_ptr + r * bstride
+    src_phys = tl.load(row + s_bidx).to(tl.int64) * bs + s_block % bs
+    dst_phys = tl.load(row + d_bidx).to(tl.int64) * bs + d_block % bs
     move = src_phys != dst_phys
     stale = move & valid
-    # Aliasing protection, exactly the reference's per-request semantics: a
-    # source is stale only when it is not the destination of any valid
-    # accepted node of the SAME request (``torch.isin(src, dst)`` over the
-    # request's own accepted nodes). Cross-request physical slots cannot
-    # coincide in the engine (each request owns disjoint KV blocks), so the
-    # scan is bounded to this request's ``W`` columns and masked by the
-    # per-column validity. O(R * W^2) per group for the whole batch.
     for k in tl.range(0, W):
-        vk = (k < n_acc) & (ht != 0)
+        vk = (k < n_acc) & ht
         ark = tl.maximum(tl.load(arenas_ptr + r * astride + 1 + k), 0)
-        dk = tl.load(depth_ptr + r * ARENA_W + ark)
+        dk = tl.load(depth_ptr + r * depth_stride + ark, mask=ark < depth_w, other=0)
         dbk = c + dk
         dbidx = tl.minimum(dbk // bs, nb - 1)
-        dpk = tl.load(bt_ptr + r * nb + dbidx) * bs + dbk % bs
+        dpk = tl.load(row + dbidx).to(tl.int64) * bs + dbk % bs
         stale = stale & ((src_phys != dpk) | (vk == 0))
     base = g * max_a
     tl.store(out_src + base + i, src_phys)
@@ -166,6 +180,8 @@ def _gather_all_kernel(
     # <= g_stride``.
     in_plan = i < a
     do = tl.load(enter_ptr + g * g_stride + entry, mask=in_plan, other=0)
+    if do == 0:
+        return
     phys = tl.load(src_ptr + g * g_stride + entry, mask=in_plan, other=0)
     base_off = tl.load(layer_off_ptr + layer) + phys * el
     offs = tl.arange(0, BLOCK)
@@ -210,6 +226,8 @@ def _scatter_zero_all_kernel(
     in_plan = i < a
     do = tl.load(enter_ptr + idx, mask=in_plan, other=0)
     stale = tl.load(stale_ptr + idx, mask=in_plan, other=0)
+    if (do == 0) & (stale == 0):
+        return
     base_dst = (
         tl.load(layer_off_ptr + layer)
         + tl.load(dst_ptr + idx, mask=in_plan, other=0) * el
@@ -722,6 +740,30 @@ class Df2tKVCompaction:
             slab=slab,
         )
 
+    def _block_table_args(
+        self, block_tables: Sequence[Tensor]
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Per-group device pointer/stride/width/block-size tables for the
+        plan kernel, cached by the block tables' addresses and shapes."""
+        assert len(block_tables) == self._G, (len(block_tables), self._G)
+        assert len({bt.dtype for bt in block_tables}) == 1
+        key = tuple((bt.data_ptr(), bt.stride(0), bt.shape[1]) for bt in block_tables)
+        cached = getattr(self, "_bt_args", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        dev = self._src.device
+        args = tuple(
+            torch.tensor(vals, dtype=torch.int64, device=dev)
+            for vals in (
+                [k[0] for k in key],
+                [k[1] for k in key],
+                [k[2] for k in key],
+                list(self.block_sizes),
+            )
+        )
+        self._bt_args = (key, args)
+        return args  # type: ignore[return-value]
+
     def _build_tree_depths(self, trees: Sequence[Any], R: int) -> Tensor:
         td = self._tree_depth[:R].zero_()
         for r, tree in enumerate(trees):
@@ -741,6 +783,8 @@ class Df2tKVCompaction:
         num_computed: Tensor,
         block_tables: Sequence[Tensor],
         R: int,
+        tree_batch: Any = None,
+        idx_mapping: Tensor | None = None,
     ) -> None:
         """Relocate one step's accepted chains for ``R`` requests.
 
@@ -757,10 +801,13 @@ class Df2tKVCompaction:
                 chain depth per request (``-1`` = none).
             trees: Per-request ``TreeDraft`` (or ``None``); provides each
                 request's node depths indexed by arena.
-            num_computed: ``[R]`` int32 anchor block-slot ``C`` per request
-                (already gathered by the caller through ``idx_mapping``).
-            block_tables: Per-group block tables ``[R, num_blocks]``.
+            num_computed: int32 anchor block-slot ``C`` per request: ``[R]`` in
+                batch order, or per request state when ``idx_mapping`` is set.
+            block_tables: Per-group int32 block tables ``[R, num_blocks]``.
             R: Number of requests.
+            tree_batch: optional ``TreeBatch`` form of ``trees``; when given,
+                the has-tree flags and depths are read from it in place.
+            idx_mapping: optional ``[R]`` batch -> ``num_computed`` row.
 
         """
         if self._empty or R == 0:
@@ -772,39 +819,50 @@ class Df2tKVCompaction:
             )
         W = self._W
         a = R * W
-        has_tree = self._has_tree[:R].zero_()
-        for r, tree in enumerate(trees[:R]):
-            if tree is not None:
-                has_tree[r] = True
-        depth = self._build_tree_depths(trees, R)
-        astride = accepted_arenas.shape[1]
-        for g, bt in enumerate(block_tables):
-            _plan_group_kernel[(a,)](
-                num_sampled,
-                has_tree,
-                accepted_arenas,
-                depth,
-                num_computed,
-                bt,
-                self._src,
-                self._dst,
-                self._enter,
-                self._stale,
-                a,
-                W,
-                self._arena_w,
-                bt.shape[1],
-                self.block_sizes[g],
-                g,
-                astride,
-                self._g_stride,
-            )
+        if tree_batch is not None:
+            # Read the batch's widths (> 0 = has a tree) and per-arena depths
+            # in place.
+            has_tree = tree_batch.widths
+            depth = tree_batch.depths
+            depth_w = min(depth.shape[1], self._arena_w)
+        else:
+            has_tree = self._has_tree[:R].zero_()
+            for r, tree in enumerate(trees[:R]):
+                if tree is not None:
+                    has_tree[r] = True
+            depth = self._build_tree_depths(trees, R)
+            depth_w = self._arena_w
+        if idx_mapping is None:
+            idx_mapping = torch.arange(R, dtype=torch.int32, device=num_sampled.device)
+        bt_ptrs, bt_strides, bt_nbs, bt_bss = self._block_table_args(block_tables)
+        _plan_kernel[(a, self._G)](
+            num_sampled,
+            has_tree,
+            accepted_arenas,
+            depth,
+            num_computed,
+            idx_mapping,
+            bt_ptrs,
+            bt_strides,
+            bt_nbs,
+            bt_bss,
+            self._src,
+            self._dst,
+            self._enter,
+            self._stale,
+            W,
+            depth.stride(0),
+            depth_w,
+            accepted_arenas.shape[1],
+            self._g_stride,
+            BT_INT64=block_tables[0].dtype == torch.int64,
+        )
 
         g_stride = self._g_stride
         L = self._L
         for so in range(0, a, self._slab):
             a_so = min(a - so, self._slab)
-            grid = (self._slab, L)
+            grid = (a_so, L)
             _gather_all_kernel[grid](
                 self._kv_base,
                 self._layer_off,

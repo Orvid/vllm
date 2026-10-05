@@ -11,25 +11,22 @@ penalty, a bad-word mask or a budget force would count/see sibling tokens and
 the processed distribution diverges from the chain (and non-speculative)
 oracle. These tests pin the tree-correct per-row accepted-chain context
 mechanism: the three triton kernels, fed the chain_ prefix tables the model
-runner now builds, reproduce an independent reference exactly, and seeded per
-step derives independent randomness.
+runner now builds, reproduce an independent reference exactly, and the serving
+draws are seeded per (request seed, position).
 """
 
 import pytest
 import torch
 
-from vllm.v1.worker.gpu.model_runner import (
-    _df2t_chain_context,
-    _df2t_step_seed,
+from tests.v1.worker.gpu.spec_decode.df2t.reference_verifier import (
+    tree_verify_reference,
 )
+from vllm.v1.worker.gpu.model_runner import _df2t_chain_context
 from vllm.v1.worker.gpu.sample.bad_words import apply_bad_words
 from vllm.v1.worker.gpu.sample.penalties import apply_penalties
 from vllm.v1.worker.gpu.sample.thinking_budget import (
     ThinkingBudgetState,
     apply_thinking_budget,
-)
-from tests.v1.worker.gpu.spec_decode.df2t.reference_verifier import (
-    tree_verify_reference,
 )
 from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import TreeVerifier
 
@@ -333,45 +330,51 @@ def test_thinking_budget_tree_context_matches_reference(device):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_df2t_step_seed_independence():
-    """Seeded tree verification must not replay the same stream every step.
+def test_df2t_serving_draws_seeded_per_position():
+    """The serving verify draws every row with the ordinary sampler's
+    Gumbel-max keyed by (request seed, row position): reproducible for a fixed
+    seed, and a later step (anchor further along) draws a fresh stream rather
+    than replaying the previous one."""
+    from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 
-    ``_df2t_step_seed`` keys the raw seed with the anchor position, so
-    successive decode steps draw independently (matching the ordinary sampler's
-    seed + position discipline) while remaining reproducible; unseeded requests
-    in a mixed batch keep the global RNG via the -1 sentinel.
-    """
     device = torch.device("cuda")
     R, B, V = 3, 6, 48
+    rows = 1 + B
     parents = torch.stack(
         [torch.arange(-1, B - 1, dtype=torch.long, device=device)] * R
     )
     token_ids = torch.randint(0, V, (R, B), device=device)
     num_nodes = torch.full((R,), B, dtype=torch.long, device=device)
-    raw = torch.tensor([9000, 9001, 9002], dtype=torch.long, device=device)
-    steps = torch.tensor([10, 20, 30], dtype=torch.long, device=device)
+    seeds = torch.tensor([9000, 9001, 9002], dtype=torch.long, device=device)
+    temperature = torch.ones(R, dtype=torch.float32, device=device)
+    # Near-uniform rows, so any repeated stream would show.
+    logits = torch.randn(R * rows, V, device=device) * 0.15
+    exp_map = torch.arange(R * rows, device=device).div(rows, rounding_mode="floor")
+    exp_map = exp_map.to(torch.int32)
+    depth = torch.arange(rows, device=device)
 
-    s1 = _df2t_step_seed(raw, steps)
-    s2 = _df2t_step_seed(raw, steps + 5)
-    assert torch.equal(_df2t_step_seed(raw, steps), s1)  # derivable
-    assert not torch.equal(s1, s2)  # distinct per step
-
-    # Near-uniform distribution: step-to-step draws are not a repeated stream.
-    target = torch.randn(R, 1 + B, V, device=device) * 0.15
-    first = []
-    for k in (torch.arange(6, device=device) * 7).tolist():
-        sk = _df2t_step_seed(raw, torch.full((R,), k, dtype=torch.long, device=device))
+    def draw(anchor_pos: int) -> torch.Tensor:
+        pos = (anchor_pos + depth).repeat(R)
+        tokens = gumbel_sample(
+            logits, exp_map, temperature, seeds, pos, False, False
+        ).view(R, rows)
         tv = TreeVerifier(R, B, V, device)
-        s, ns = tv(target, token_ids, parents, num_nodes, greedy=False, seeds=sk)
-        first.append([int(s[r, 0]) for r in range(R)])
-    assert any(len({row[i] for row in first}) >= 2 for i in range(R)), first
+        sampled, num_sampled = tv.walk(tokens, token_ids, parents, num_nodes)
+        return sampled[:, 0].clone()
 
-    # Reproducible for a fixed step seed.
+    assert torch.equal(draw(10), draw(10))  # reproducible
+    firsts = [draw(10 + 7 * k).tolist() for k in range(6)]
+    assert any(len({row[i] for row in firsts}) >= 2 for i in range(R)), firsts
+
+    # The reference-oracle verifier's seeded path stays reproducible.
+    target = logits.view(R, rows, V)
+    s1 = seeds * 31 + 5
     tv = TreeVerifier(R, B, V, device)
     s_a, ns_a = tv(target, token_ids, parents, num_nodes, greedy=False, seeds=s1)
     tv_b = TreeVerifier(R, B, V, device)
     s_b, ns_b = tv_b(target, token_ids, parents, num_nodes, greedy=False, seeds=s1)
     assert torch.equal(s_a, s_b) and torch.equal(ns_a, ns_b)
+    raw = seeds
 
     # Mixed batch: the seeded lane is reproducible; -1 lanes draw from the
     # global RNG (advancing between calls) and never crash.

@@ -37,11 +37,7 @@ from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
     get_aux_output_connector,
 )
-from vllm.distributed.parallel_state import (
-    get_dcp_group,
-    get_pp_group,
-    graph_capture,
-)
+from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
@@ -63,6 +59,7 @@ from vllm.multimodal.encoder_budget import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
+from vllm.triton_utils import tl, triton
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
@@ -77,7 +74,6 @@ from vllm.v1.outputs import (
     ECConnectorOutput,
     LogprobsTensors,
     ModelRunnerOutput,
-    StashedTree,
 )
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
@@ -150,6 +146,7 @@ from vllm.v1.worker.gpu.sample.batch_shard import (
     all_to_all_logits,
     gather_sampler_output,
 )
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.sample.logits_processor import build_custom_logits_processors
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
@@ -165,7 +162,10 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
 )
 from vllm.v1.worker.gpu.spec_decode.df2t.budget import BudgetPolicy
 from vllm.v1.worker.gpu.spec_decode.df2t.compaction import Df2tKVCompaction
-from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import TreeDraft
+from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import (
+    TreeBatch,
+    TreeDraft,
+)
 from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import TreeVerifier
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
@@ -194,27 +194,6 @@ from vllm.v1.worker.utils import (
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
-
-
-def _validate_df2t_async_tree_carry(
-    draft_tokens: dict[str, list[int]],
-    spec_tree_draft: dict[str, StashedTree],
-) -> None:
-    """Fail closed when real df2t drafts were scheduled without a stashed tree.
-
-    Async scheduling carries df2t trees beside the draft tokens through the
-    deferred output path (``update_draft_token_ids_in_output``): a request
-    with real draft tokens but no stashed tree means the carry was dropped,
-    which would silently degrade the tree to a chain. A tree-less step (the
-    padding ``-1`` draft placeholders) is legitimate and ignored.
-    """
-    for req_id, tokens in draft_tokens.items():
-        if any(tok != -1 for tok in tokens) and req_id not in spec_tree_draft:
-            raise RuntimeError(
-                "df2t async scheduling dropped the tree for request "
-                f"{req_id}: {len(tokens)} real draft token(s) were scheduled "
-                "with no stashed tree."
-            )
 
 
 def _df2t_ensure_trees_staged(
@@ -342,11 +321,46 @@ def _df2t_tree_logprobs(
     )
 
 
+@triton.jit
+def _df2t_chain_context_kernel(
+    token_ids_ptr,  # [R, W] int64, row stride ``stride``
+    parents_ptr,  # [R, W] int64 (parent arena, -1 = anchor child)
+    num_nodes_ptr,  # [R] live node count
+    cu_ptr,  # [R] first logits row per request
+    chain_len_ptr,  # [num_logits] int32
+    chain_ptr,  # [num_logits, CW] int32
+    W,
+    stride,
+    CW,
+):
+    r = tl.program_id(0).to(tl.int64)
+    a = tl.program_id(1).to(tl.int64)
+    if a >= tl.load(num_nodes_ptr + r):
+        return
+    row = tl.load(cu_ptr + r).to(tl.int64) + 1 + a
+    # Depth = number of hops to the anchor (parents precede children, so the
+    # walk is at most W hops).
+    depth = 0
+    u = a
+    while (u >= 0) & (depth < W):
+        depth += 1
+        u = tl.load(parents_ptr + r * stride + u)
+    tl.store(chain_len_ptr + row, depth)
+    col = depth - 1
+    u = a
+    while (u >= 0) & (col >= 0):
+        tl.store(chain_ptr + row * CW + col, tl.load(token_ids_ptr + r * stride + u))
+        col -= 1
+        u = tl.load(parents_ptr + r * stride + u)
+
+
 def _df2t_chain_context(
     trees: "list[TreeDraft | None]",
     cu_np: list[int],
     b_max: int,
     device: torch.device,
+    tree_batch: "TreeBatch | None" = None,
+    cu: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Tree-correct accepted-chain context for the df2t verify block.
 
@@ -364,6 +378,14 @@ def _df2t_chain_context(
     decoder would have accumulated for that draw. The anchor row (and any
     padding row of a partial tree) has an empty chain.
 
+    Args:
+        trees: ``[num_reqs]`` per-request trees (``None`` = no tree).
+        cu_np: ``[num_reqs + 1]`` host cumulative logits offsets.
+        b_max: chain-prefix table width (widest tree).
+        device: device of the returned tables.
+        tree_batch: optional batched form of ``trees``; packed when omitted.
+        cu: optional device copy of ``cu_np`` (``[>= num_reqs]`` int).
+
     Returns:
         ``(chain_prefix_len, chain_prefix)``: ``chain_prefix_len`` is ``[total
         logits]`` int32, ``chain_prefix`` ``[total logits, b_max]`` int32 with
@@ -376,86 +398,42 @@ def _df2t_chain_context(
     if num_logits == 0:
         return chain_len_t, chain_t
     num_reqs = len(cu_np) - 1
-    widths = [t.token_ids.shape[0] if t is not None else 0 for t in trees]
-    W = max(widths) if widths else 0
-    if W == 0:
-        return chain_len_t, chain_t
-
-    # Pack the per-request tree rows into one [num_reqs, W] batch and track the
-    # per-request live node counts on device, so the per-request ``.tolist()``/
-    # ``.item()`` round-trips of the old numpy walk never gate the per-step path.
-    token_ids = torch.zeros(num_reqs, W, dtype=torch.long, device=device)
-    parents = torch.full((num_reqs, W), -2, dtype=torch.long, device=device)
-    num_nodes = torch.zeros(num_reqs, dtype=torch.long, device=device)
-    for r, tree in enumerate(trees):
-        if tree is None:
-            continue
-        n = widths[r]
-        token_ids[r, :n] = tree.token_ids
-        parents[r, :n] = tree.parents
-        live = getattr(tree, "num_nodes", None)
-        num_nodes[r] = live.clamp(max=W) if live is not None else n
-
-    arange_r = torch.arange(num_reqs, device=device)
-    arange_w = torch.arange(W, device=device)
-    live_mask = arange_w[None, :] < num_nodes[:, None]
-    rows = (
-        torch.tensor(
-            [int(cu_np[r]) for r in range(num_reqs)], dtype=torch.long, device=device
-        )[:, None]
-        + 1
-        + arange_w[None, :]
+    if tree_batch is not None:
+        token_ids = tree_batch.token_ids
+        parents = tree_batch.parents
+        num_nodes = tree_batch.num_nodes
+    else:
+        widths = [t.token_ids.shape[0] if t is not None else 0 for t in trees]
+        W = max(widths, default=0)
+        if W == 0:
+            return chain_len_t, chain_t
+        token_ids = torch.zeros(num_reqs, W, dtype=torch.long, device=device)
+        parents = torch.full((num_reqs, W), -2, dtype=torch.long, device=device)
+        num_nodes = torch.zeros(num_reqs, dtype=torch.long, device=device)
+        for r, tree in enumerate(trees):
+            if tree is None:
+                continue
+            n = widths[r]
+            token_ids[r, :n] = tree.token_ids
+            parents[r, :n] = tree.parents
+            live = getattr(tree, "num_nodes", None)
+            num_nodes[r] = live.clamp(max=n) if live is not None else n
+    W = token_ids.shape[1]
+    if cu is None:
+        cu = async_tensor_h2d(np.asarray(cu_np, dtype=np.int64), device=device)
+    assert token_ids.stride(0) == parents.stride(0)
+    _df2t_chain_context_kernel[(num_reqs, W)](
+        token_ids,
+        parents,
+        num_nodes.contiguous(),
+        cu,
+        chain_len_t,
+        chain_t,
+        W,
+        token_ids.stride(0),
+        b_max,
     )
-
-    # Per-arena tree depth (arena-order parents guarantee parent < child, so one
-    # ascending pass finalizes every row): anchor children have depth 1.
-    depth = torch.zeros(num_reqs, W, dtype=torch.long, device=device)
-    depth = torch.where(
-        (parents == -1) & live_mask, torch.ones_like(depth), depth
-    )
-    for a in range(1, W):
-        safe = parents[:, a].clamp(min=0)
-        parent_depth = torch.gather(depth, 1, safe[:, None]).squeeze(-1)
-        depth[:, a] = torch.where(
-            (parents[:, a] >= 0) & live_mask[:, a],
-            parent_depth + 1,
-            depth[:, a],
-        )
-    chain_len_t[rows[live_mask]] = depth[live_mask].to(torch.int32)
-
-    # Scatter each node's depth-order accepted tokens: after ``step`` parent
-    # follows, the current node sits at chain position ``depth - 1 - step``.
-    u = arange_w[None, :].expand(num_reqs, W)
-    for step in range(W):
-        col = depth - 1 - step
-        valid = (col >= 0) & live_mask
-        vals = token_ids[arange_r[:, None], u][valid].to(torch.int32)
-        chain_t.index_put_((rows[valid], col[valid]), vals)
-        u = parents[arange_r[:, None], u].clamp(min=0)
     return chain_len_t, chain_t
-
-
-def _df2t_step_seed(seed: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
-    """Per-step verifier seed, decorrelated from the raw request seed.
-
-    The ordinary sampler keys its draws on ``seed + position`` so successive
-    steps use independent streams. The tree verifier draws through a per-request
-    ``torch.Generator`` seeded fresh each verify call, which would replay the
-    same stream every step; mixing the raw seed with the request's anchor
-    position ``step`` (its ``num_computed_tokens``, strictly increasing) keys
-    each step's generator independently while remaining reproducible for a
-    fixed seed. The multiplier is odd and under 2**32, so ``step * mult`` stays
-    inside signed int64 for ``step < 2**31``.
-
-    Args:
-        seed: [R] int64 raw per-request seed.
-        step: [R] int64 anchor position (num_computed_tokens) per request.
-
-    Returns:
-        [R] int64 per-step seed.
-
-    """
-    return seed ^ (step * 0x9E3779B1)
 
 
 def _resolve_decode_query_len(
@@ -635,6 +613,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ]
             | None
         ) = None
+        # df2t device-resident tree carry: one packed row per request state
+        # (tokens | depths | parents | words | num_nodes, see TreeBuilder),
+        # written after each draft and gathered by the next step's
+        # prepare_inputs; the host flag marks slots holding a current tree.
+        self._df2t_tree_store: torch.Tensor | None = None
+        self._df2t_tree_valid = np.zeros(self.max_num_reqs, dtype=bool)
         # Persistent CUDA-graph aux pools for the FA4 tree mask (ancestor
         # words ``[max_num_reqs, max_tree_budget]`` int64 and per-request
         # anchor-length ``[max_num_reqs]`` int32). The captured tree-verify
@@ -1470,19 +1454,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Whether a scheduled batch must run eager under df2t CUDA graphs.
 
         df2t captures and replays the target tree-verify decode only as a FULL
-        uniform ``(num_reqs, 1 + B)`` graph (the tree mask's q_idx layout is
-        defined for that verify block alone). Any other batch shape — a
-        co-scheduled prefill chunk, a treeless decode, a shape past the
-        captured uniform sizes — keeps `method="dflash"`-like eager semantics
-        instead of falling into a PIECEWISE graph whose query layout would
-        misapply the baked tree mask.
+        uniform ``(num_reqs, 1 + B)`` graph: the tree mask is baked into FULL
+        captures, whose q_idx layout is that verify block alone. Any other
+        batch shape (a co-scheduled prefill chunk, a treeless decode) must not
+        replay a FULL graph. PIECEWISE graphs are fine: attention runs outside
+        the captured pieces with this step's metadata and attached tree mask,
+        so only a cudagraph mode that serves mixed batches with FULL graphs
+        forces those batches eager.
         """
         if (
             self.speculative_config is None
             or not self.speculative_config.use_df2t_tree()
         ):
             return False
-        return uniform_tok_count != self.decode_query_len
+        mixed_mode = self.compilation_config.cudagraph_mode.mixed_mode()
+        return (
+            uniform_tok_count != self.decode_query_len
+            and mixed_mode == CUDAGraphMode.FULL
+        )
 
     @torch.inference_mode()
     def capture_model(self, *, profile_only: bool = False) -> int:
@@ -1544,35 +1533,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         ),
                         df2t_tree_mask_attach=df2t_capture_mask_attach,
                     )
-                    if (
-                        df2t_capture_mask_attach is not None
-                        and self.tree_verifier is not None
-                    ):
-                        # Capture the all_greedy (T=0) verifier micro-graphs at
-                        # the same decode batch sizes so a serving T=0 step
-                        # replays the whole fixed-shape tree walk as one graph
-                        # (see TreeVerifier.capture_cudagraph). Each capture
-                        # runs on the graph_capture stream, so it never races
-                        # the decode captures. The shared buffer set is sized
-                        # to the largest captured decode batch (~16 reqs), not
-                        # max_num_reqs, so the resident footprint is ~80 MiB.
-                        token_counts = self.cudagraph_manager.captured_token_counts()
-                        reqs = sorted(
-                            {
-                                tok // self.decode_query_len
-                                for tok in token_counts
-                                if tok // self.decode_query_len > 0
-                            }
-                        )
-                        if reqs:
-                            with graph_capture(device=self.device):
-                                self.tree_verifier.ensure_capture_capacity(
-                                    min(max(reqs), self.max_num_reqs)
-                                )
-                                for r in reqs:
-                                    self.tree_verifier.capture_cudagraph(
-                                        min(r, self.max_num_reqs)
-                                    )
                     if self.speculator is not None:
                         with use_workspace_lane(self._draft_workspace_lane):
                             self.speculator.capture()
@@ -1670,6 +1630,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
             )
             req_index = self.req_states.req_id_to_index[req_id]
+            # A reused request-state slot must not serve its previous
+            # occupant's drafted tree.
+            self._df2t_tree_valid[req_index] = False
             if self.adaptive_verification is not None:
                 self.adaptive_verification.add_request(req_index)
 
@@ -1826,21 +1789,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_draft_tokens_per_req = None
         slot_positions = None
         trees = None
-        use_df2t_trees = (
-            bool(scheduler_output.spec_tree_draft)
-            and self.speculative_config is not None
-            and self.speculative_config.use_df2t_tree()
-        )
-        if (
-            draft_tokens
-            and self.speculative_config is not None
-            and self.speculative_config.use_df2t_tree()
-            and self.scheduler_config.async_scheduling
-            and not getattr(self, "_kernel_warmup", False)
-        ):
-            _validate_df2t_async_tree_carry(
-                draft_tokens, scheduler_output.spec_tree_draft
-            )
+        tree_batch = None
         if not draft_tokens and self.model_state.num_new_sampled_tokens_per_step == 1:
             # No draft token scheduled (common case).
             total_num_draft_tokens = 0
@@ -1871,28 +1820,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_num_logits_np[0] = 0
             np.cumsum(num_logits, out=cu_num_logits_np[1:])
             cu_num_logits = async_tensor_h2d(cu_num_logits_np, device=self.device)
-            if use_df2t_trees:
-                # One batched host->device rebuild (single [R, W, 5] transfer)
-                # instead of per-request ``from_lists`` H2D copies.
-                stashed = [
-                    scheduler_output.spec_tree_draft.get(req) for req in req_ids
-                ]
-                trees = TreeDraft.from_lists_batched(stashed, self.device)
-                for req_idx, tree in enumerate(trees):
-                    if tree is not None:
-                        assert (
-                            num_draft_tokens_per_req[req_idx]
-                            == (tree.token_ids.shape[0])
-                        ), (
-                            f"scheduled {num_draft_tokens_per_req[req_idx]} draft "
-                            f"tokens for a {tree.token_ids.shape[0]}-node tree"
-                        )
+            if (
+                self.speculative_config is not None
+                and self.speculative_config.use_df2t_tree()
+            ):
+                # The trees drafted last step stay on device; each scheduled
+                # request's tree is as wide as its scheduled draft count.
+                tree_batch = self._load_df2t_trees(
+                    req_ids, idx_mapping, idx_mapping_np, num_draft_tokens_per_req
+                )
+                if tree_batch is not None:
+                    trees = tree_batch.drafts
+        use_df2t_trees = tree_batch is not None
 
         # df2t flex/fa4 verify: stage the per-request tree mask inputs (context
         # length C per request, ancestor-or-self words) so execute_model can
         # attach them to the Flex/FA4 metadata after prepare_attn.
         self._stage_tree_flex_mask(use_df2t_trees, trees, num_reqs, idx_mapping)
-        self._stage_tree_fa4_mask(use_df2t_trees, trees, num_reqs, idx_mapping)
+        self._stage_tree_fa4_mask(
+            use_df2t_trees, trees, num_reqs, idx_mapping, tree_batch
+        )
 
         # The general branch also serves a no-draft batch with k != 1, and
         # compact_batch's budget is only primed when drafts are scheduled.
@@ -1991,6 +1938,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 cu_num_logits,
                 logits_indices,
                 trees,
+                tree_batch=(
+                    (tree_batch.token_ids, tree_batch.depths, tree_batch.widths)
+                    if tree_batch is not None
+                    else None
+                ),
             )
 
         fast_prefill = None
@@ -2046,6 +1998,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             positions=self.input_buffers.positions[:num_tokens_after_padding],
             slot_positions=slot_positions,
             trees=trees,
+            tree_batch=tree_batch,
             is_padding=is_padding,
             logits_indices=logits_indices,
             cu_num_logits=cu_num_logits,
@@ -2199,12 +2152,60 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.max_num_reqs, width, dtype=torch.int32, device=self.device
         )
 
+    def _store_df2t_trees(
+        self, input_batch: InputBatch, tree_packed: torch.Tensor
+    ) -> None:
+        """Keep this step's drafted trees on device, per request state."""
+        if self._df2t_tree_store is None:
+            self._df2t_tree_store = torch.zeros(
+                self.max_num_reqs,
+                tree_packed.shape[1],
+                dtype=tree_packed.dtype,
+                device=self.device,
+            )
+        self._df2t_tree_store[input_batch.idx_mapping] = tree_packed
+        self._df2t_tree_valid[input_batch.idx_mapping_np] = True
+
+    def _load_df2t_trees(
+        self,
+        req_ids: list[str],
+        idx_mapping: torch.Tensor,
+        idx_mapping_np: np.ndarray,
+        num_draft_tokens_per_req: np.ndarray,
+    ) -> "TreeBatch | None":
+        """Gather the scheduled requests' trees from the device store.
+
+        A request's tree width is its scheduled draft count (the scheduler may
+        trim drafts; arena order is prefix-closed, so the first ``n`` nodes are
+        a valid tree).
+        """
+        scheduled = num_draft_tokens_per_req > 0
+        if not scheduled.any():
+            return None
+        if not getattr(self, "_kernel_warmup", False):
+            missing = scheduled & ~self._df2t_tree_valid[idx_mapping_np]
+            if missing.any():
+                raise RuntimeError(
+                    "df2t decode batch scheduled draft tokens for requests "
+                    f"{[r for r, m in zip(req_ids, missing) if m]} that have no "
+                    "drafted tree; refusing to verify drafts without a tree."
+                )
+        assert self._df2t_tree_store is not None or getattr(
+            self, "_kernel_warmup", False
+        )
+        if self._df2t_tree_store is None:
+            return None
+        return TreeBatch.from_store(
+            self._df2t_tree_store, idx_mapping, num_draft_tokens_per_req
+        )
+
     def _stage_tree_fa4_mask(
         self,
         use_df2t_trees: bool,
         trees: "list[TreeDraft | None] | None",
         num_reqs: int,
         idx_mapping: torch.Tensor,
+        tree_batch: "TreeBatch | None" = None,
     ) -> None:
         """Stage the df2t fa4-tree per-request mask inputs, or clear them.
 
@@ -2223,6 +2224,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return
         from vllm.v1.worker.gpu.spec_decode.df2t.attention import (
             fill_tree_mask_inputs,
+            fill_tree_mask_inputs_batched,
         )
 
         width = spec.max_tree_budget
@@ -2230,16 +2232,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert self._df2t_tree_mask_words is not None
         assert self._df2t_tree_mask_c is not None
         assert self._df2t_tree_mask_depths is not None
-        c_per_req = self.req_states.num_computed_tokens.gpu[idx_mapping]
-        fill_tree_mask_inputs(
-            self._df2t_tree_mask_words,
-            self._df2t_tree_mask_c,
-            trees,
-            num_reqs,
-            width,
-            c_per_req,
-            depths_out=self._df2t_tree_mask_depths,
-        )
+        if tree_batch is not None:
+            fill_tree_mask_inputs_batched(
+                self._df2t_tree_mask_words,
+                self._df2t_tree_mask_c,
+                self._df2t_tree_mask_depths,
+                tree_batch,
+                self.req_states.num_computed_tokens.gpu,
+                idx_mapping,
+            )
+        else:
+            fill_tree_mask_inputs(
+                self._df2t_tree_mask_words,
+                self._df2t_tree_mask_c,
+                trees,
+                num_reqs,
+                width,
+                self.req_states.num_computed_tokens.gpu[idx_mapping],
+                depths_out=self._df2t_tree_mask_depths,
+            )
         # The whole persistent pool is handed to build_fa4_tree_mask (its
         # asserts accept >= num_reqs rows); only rows < num_reqs hold live
         # data. The same pool addresses are baked into the captured graph.
@@ -2697,7 +2708,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 arena_span=verifier.accepted_arenas.shape[1] - 1,
             )
             self._df2t_compaction = compaction
-        num_computed = self.req_states.num_computed_tokens.gpu[input_batch.idx_mapping]
         block_tables = self.block_tables.gather_block_tables(
             input_batch.idx_mapping,
             num_reqs_padded=input_batch.num_reqs_after_padding,
@@ -2706,9 +2716,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_sampled,
             verifier.accepted_arenas,
             trees,
-            num_computed,
+            self.req_states.num_computed_tokens.gpu,
             block_tables,
             input_batch.num_reqs,
+            tree_batch=input_batch.tree_batch,
+            idx_mapping=input_batch.idx_mapping,
         )
 
     def _df2t_tree_verify(
@@ -2759,112 +2771,108 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             needs_processing[input_batch.idx_mapping_np]
         ):
             chain_prefix_len, chain_prefix = _df2t_chain_context(
-                trees, cu, b_max, self.device
+                trees,
+                cu,
+                b_max,
+                self.device,
+                tree_batch=input_batch.tree_batch,
+                cu=input_batch.cu_num_logits,
             )
 
         # The full ordinary-decode logits pipeline (penalties, custom
         # processors, min_p, temperature, top-k/top-p). A df2t request must
         # never silently drop its active sampling/processing configuration.
+        positions = input_batch.positions[input_batch.logits_indices]
         processed = self.sampler.apply_sampling_params(
             logits,
             input_batch.expanded_idx_mapping,
             input_batch.idx_mapping,
             input_batch.idx_mapping_np,
-            input_batch.positions[input_batch.logits_indices],
+            positions,
             input_batch.input_ids[input_batch.logits_indices],
             input_batch.expanded_local_pos,
             input_batch.seq_lens_cpu_upper_bound.numpy(),
             chain_prefix_len=chain_prefix_len,
             chain_prefix=chain_prefix,
         )
-        token_ids = torch.zeros(num_reqs, b_max, dtype=torch.long, device=self.device)
-        parents = torch.full(
-            (num_reqs, b_max), -2, dtype=torch.long, device=self.device
-        )
-        num_nodes = torch.zeros(num_reqs, dtype=torch.long, device=self.device)
+        # Draw one token from every verify row's processed distribution, then
+        # walk the trees (TreeVerifier.walk). The walk visits at most one row
+        # per depth and each row at most once, so drawing all rows up front is
+        # the same as drawing lazily. T=0 rows take the argmax; sampled rows
+        # use the ordinary sampler's Gumbel-max draw keyed by (request seed,
+        # position), so a visited row's draw is independent of every other
+        # visited row (distinct positions along a path) and seeded requests
+        # stay reproducible.
         ss = self.sampler.sampling_states
-        idx = input_batch.idx_mapping
-        all_greedy = ss.all_greedy(input_batch.idx_mapping_np)
-        # Only explicitly-seeded requests get a generator; each seeded request
-        # keys its generator on the raw seed mixed with its anchor position so
-        # successive steps draw independent streams (the ordinary sampler's
-        # seed + position discipline). Other requests always use the global
-        # RNG, so an unseeded request in a mixed batch is never dragged onto a
-        # fixed per-step stream, and the verifier sentinel -1 means "no
-        # generator".
-        seeds = None
-        if ss.any_explicit_seed(input_batch.idx_mapping_np):
-            seeded = torch.from_numpy(ss.seeds_set[input_batch.idx_mapping_np]).to(
-                self.device
+        if ss.all_greedy(input_batch.idx_mapping_np):
+            row_draws = torch.argmax(processed, dim=-1)
+        else:
+            row_draws = gumbel_sample(
+                processed,
+                input_batch.expanded_idx_mapping,
+                ss.temperature.gpu,
+                ss.seeds.gpu,
+                positions,
+                apply_temperature=False,
+                is_drafting=False,
+                use_fp64=self.sampler.use_fp64_gumbel,
             )
-            raw = ss.seeds.gpu[idx].long()
-            steps = self.req_states.num_computed_tokens.gpu[idx].long()
-            derived = _df2t_step_seed(raw, steps)
-            seeds = torch.where(seeded, derived, torch.full_like(raw, -1))
-        # A T=0 all-greedy batch with no explicit seeds can replay the captured
-        # verifier micro-graph: write the gathered verify rows straight into the
-        # graph's shared target buffer, then one graph replay runs the whole
-        # fixed-shape walk (see TreeVerifier.capture_cudagraph). Any other
-        # batch takes the eager verifier.
-        replay = (
-            all_greedy
-            and seeds is None
-            and self.tree_verifier.pick_capture(num_reqs) is not None
+        tree_batch = input_batch.tree_batch
+        uniform_b = tree_batch.uniform_width if tree_batch is not None else None
+        if uniform_b is not None and processed.shape[0] == num_reqs * (1 + uniform_b):
+            # Uniform 1+B decode: the verify rows are already laid out as
+            # [num_reqs, 1 + B].
+            row_tokens = row_draws.view(num_reqs, 1 + uniform_b)
+        else:
+            # Mixed widths (e.g. a request without a tree this step, verified
+            # as an empty tree: a single draw from its anchor row). Padding
+            # columns point at row 0 and are never read (no node at or past
+            # num_nodes is ever matched).
+            rows = np.zeros((num_reqs, 1 + b_max), dtype=np.int64)
+            for r, b in enumerate(b_vals):
+                rows[r, : 1 + b] = np.arange(cu[r], cu[r] + 1 + b)
+            row_tokens = row_draws[async_tensor_h2d(rows, device=self.device)]
+        if tree_batch is not None:
+            token_ids = tree_batch.token_ids
+            parents = tree_batch.parents
+            num_nodes = tree_batch.num_nodes
+        else:
+            token_ids = torch.zeros(
+                num_reqs, b_max, dtype=torch.long, device=self.device
+            )
+            parents = torch.full(
+                (num_reqs, b_max), -2, dtype=torch.long, device=self.device
+            )
+            num_nodes = torch.zeros(num_reqs, dtype=torch.long, device=self.device)
+            for r, (tree, b) in enumerate(zip(trees, b_vals)):
+                if tree is None:
+                    continue
+                token_ids[r, :b] = tree.token_ids
+                parents[r, :b] = tree.parents
+                # Delimit by the LIVE node count, not the buffer width: padding
+                # columns [num_nodes, b) must never be matched.
+                live = getattr(tree, "num_nodes", None)
+                num_nodes[r] = live.clamp(min=0, max=b) if live is not None else b
+        sampled, num_sampled = self.tree_verifier.walk(
+            row_tokens, token_ids, parents, num_nodes
         )
-        if replay:
-            assert self.tree_verifier._cap_target is not None
-            assert self.tree_verifier._cap_target.dtype == processed.dtype, (
-                "df2t verifier micro-graph capture dtype "
-                f"{self.tree_verifier._cap_target.dtype} != processed "
-                f"{processed.dtype}"
-            )
-            target = self.tree_verifier._cap_target[:num_reqs, : 1 + b_max]
-        else:
-            target = torch.zeros(
-                num_reqs,
-                1 + b_max,
-                logits.shape[-1],
-                dtype=processed.dtype,
-                device=self.device,
-            )
-        for r, (tree, b) in enumerate(zip(trees, b_vals)):
-            if tree is None:
-                # Empty tree: a single-token draw from the anchor row.
-                target[r, 0] = processed[cu[r]]
-                continue
-            token_ids[r, :b] = tree.token_ids
-            parents[r, :b] = tree.parents
-            # Delimit by the per-request LIVE node count (the builder's
-            # num_nodes), not the buffer width: a tree whose prefix space is
-            # exhausted (or a narrower per-request width) leaves inert padding
-            # in columns [num_nodes, b) that must never be matched. Clamped on
-            # device, so no per-request scalar round-trip.
-            live = getattr(tree, "num_nodes", None)
-            num_nodes[r] = live.clamp(min=0, max=b) if live is not None else b
-            target[r, : 1 + b] = processed[cu[r] : cu[r + 1]]
+        return self._df2t_finish_verify(
+            logits, processed, input_batch, sampled, num_sampled, cu
+        )
 
-        # temperature/top-k/top-p are already applied by the pipeline above, so
-        # the verifier only softmaxes the processed rows for the draw. When
-        # every request in the batch is greedy (temperature == 0, read from the
-        # host numpy mirror — no device->host read), the verifier takes its
-        # all_greedy fast path: argmax-only, skipping the per-round full-vocab
-        # softmax + batched multinomial entirely.
-        if replay:
-            staged = self.tree_verifier.stage_and_replay(
-                token_ids, parents, num_nodes, num_reqs
-            )
-            assert staged is not None
-            sampled, num_sampled = staged
-        else:
-            sampled, num_sampled = self.tree_verifier(
-                target,
-                token_ids,
-                parents,
-                num_nodes,
-                greedy=ss.temperature.gpu[idx] == 0.0,
-                seeds=seeds,
-                all_greedy=all_greedy,
-            )
+    def _df2t_finish_verify(
+        self,
+        logits: torch.Tensor,
+        processed: torch.Tensor,
+        input_batch: InputBatch,
+        sampled: torch.Tensor,
+        num_sampled: torch.Tensor,
+        cu: np.ndarray,
+    ) -> SamplerOutput:
+        """Shared tail of the df2t verify: rejection counts, logprobs and the
+        accepted-KV compaction."""
+        assert self.sampler is not None
+        ss = self.sampler.sampling_states
         num_sampled, num_rejected = get_num_sampled_and_rejected(
             num_sampled,
             input_batch.seq_lens,
@@ -3490,37 +3498,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
-            # df2t carries the per-request tree beside the draft tokens, read
-            # fresh from the (possibly graph-replayed) TreeBuilder buffers for
-            # exactly this batch; other speculators expose None and keep the
-            # plain-token path.
-            _tensor_getter = getattr(self.speculator, "get_latest_tree_tensors", None)
-            tree_arrays = (
-                _tensor_getter(input_batch.num_reqs)
-                if _tensor_getter is not None
+            # df2t keeps each request's tree on device beside its draft tokens
+            # (read by the next step's prepare_inputs). Like the draft tokens,
+            # the trees reach the scheduler only when structured output needs
+            # them for grammar validation.
+            _packed_getter = getattr(self.speculator, "get_latest_tree_packed", None)
+            tree_packed = (
+                _packed_getter(input_batch.num_reqs)
+                if _packed_getter is not None
                 else None
             )
-            trees = None
-            if tree_arrays is None:
-                _tree_getter = getattr(
-                    self.speculator, "get_latest_tree_drafts", None
-                )
-                trees = (
-                    _tree_getter(input_batch.num_reqs)
-                    if _tree_getter is not None
-                    else None
-                )
+            if tree_packed is not None:
+                self._store_df2t_trees(input_batch, tree_packed)
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
                 self.req_states.draft_tokens[input_batch.idx_mapping],
-                trees=trees,
-                tree_arrays=tree_arrays,
+                tree_packed=(
+                    tree_packed if input_batch.has_structured_output_reqs else None
+                ),
                 # Kernel warmup stages draft trees step after step with no
                 # take_draft_token_ids in between (its drafts are discarded),
                 # so the pending-stash guard must not fire there.
-                allow_pending_overwrite=bool(
-                    getattr(self, "_kernel_warmup", False)
-                ),
+                allow_pending_overwrite=bool(getattr(self, "_kernel_warmup", False)),
             )
             if self.pp_handler is not None:
                 self.pp_handler.broadcast_drafts(

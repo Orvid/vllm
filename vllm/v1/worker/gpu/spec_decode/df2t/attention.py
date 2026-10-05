@@ -16,13 +16,17 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.flex_attention import (
     BlockSparsityHint,
     FlexAttentionMetadata,
 )
 
 if TYPE_CHECKING:
-    from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import TreeDraft
+    from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import (
+        TreeBatch,
+        TreeDraft,
+    )
 
 
 def pack_tree_mask_inputs(
@@ -52,6 +56,69 @@ def pack_tree_mask_inputs(
         if tree is not None:
             words[r, : tree.words.shape[0]] = tree.words
     return words
+
+
+@triton.jit
+def _fill_tree_mask_kernel(
+    words_out_ptr,  # [max_num_reqs, OUT_W] int64
+    c_out_ptr,  # [max_num_reqs] int32
+    depths_out_ptr,  # [max_num_reqs, OUT_W] int32
+    words_ptr,  # [num_reqs, >= width] int64, row stride ``src_stride``
+    depths_ptr,  # [num_reqs, >= width] int64, row stride ``src_stride``
+    src_stride,
+    widths_ptr,  # [num_reqs] tree width per request (0 = no tree)
+    c_ptr,  # anchor context length per request state
+    idx_ptr,  # [num_reqs] batch -> c_ptr row
+    num_reqs,
+    OUT_W,
+    BLOCK: tl.constexpr,
+):
+    r = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    active = r < num_reqs
+    w = tl.load(widths_ptr + r, mask=active, other=0)
+    live = cols < w
+    words = tl.load(words_ptr + r * src_stride + cols, mask=live, other=0)
+    depths = tl.load(depths_ptr + r * src_stride + cols, mask=live, other=0)
+    state = tl.load(idx_ptr + r, mask=active, other=0)
+    c = tl.load(c_ptr + state, mask=active, other=0)
+    out = cols < OUT_W
+    tl.store(words_out_ptr + r * OUT_W + cols, words, mask=out)
+    tl.store(depths_out_ptr + r * OUT_W + cols, depths.to(tl.int32), mask=out)
+    tl.store(c_out_ptr + r, c.to(tl.int32))
+
+
+def fill_tree_mask_inputs_batched(
+    words_out: torch.Tensor,
+    c_per_req_out: torch.Tensor,
+    depths_out: torch.Tensor,
+    tree_batch: "TreeBatch",
+    num_computed: torch.Tensor,
+    idx_mapping: torch.Tensor,
+) -> None:
+    """One-launch :func:`fill_tree_mask_inputs` for a ``TreeBatch``: rows
+    ``< num_reqs`` get each request's words/depths (zero past its width) and
+    its anchor length ``num_computed[idx_mapping[r]]``; every other row of the
+    persistent buffers is zeroed."""
+    num_reqs = idx_mapping.shape[0]
+    out_w = words_out.shape[1]
+    assert words_out.is_contiguous() and depths_out.is_contiguous()
+    assert depths_out.shape == words_out.shape
+    assert tree_batch.words.stride(0) == tree_batch.depths.stride(0)
+    _fill_tree_mask_kernel[(words_out.shape[0],)](
+        words_out,
+        c_per_req_out,
+        depths_out,
+        tree_batch.words,
+        tree_batch.depths,
+        tree_batch.words.stride(0),
+        tree_batch.widths,
+        num_computed,
+        idx_mapping,
+        num_reqs,
+        out_w,
+        BLOCK=triton.next_power_of_2(out_w),
+    )
 
 
 def fill_tree_mask_inputs(

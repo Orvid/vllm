@@ -45,16 +45,15 @@ class DraftTokensHandler:
         # draft-token path. Trees ride along with the token ids into the
         # scheduler for the next-step verify.
         self.trees: list[StashedTree | None] | None = None
-        # Batched worker->scheduler tree carry. ``self._tree_arrays_np`` holds
-        # one step's whole tree batch (5 x [R, W] int64 + [R] int32 num_nodes)
-        # staged by an async host copy on ``self.copy_stream``; the per-request
-        # ``StashedTree`` lists are materialized from it in
-        # ``get_draft_tokens`` after ``self.copy_event``, so the per-request
-        # blocking ``.tolist()``/``.item()`` round-trips stay off the worker's
-        # per-step path. Buffers are pinned and grown to the largest batch seen.
-        self._tree_arrays_np: list[np.ndarray] | None = None
+        # Batched worker->scheduler tree carry. ``self._tree_packed_np`` holds
+        # one step's whole tree batch (packed ``[R, 4 * W + 1]`` int64 rows:
+        # tokens | depths | parents | words | num_nodes) staged by one async
+        # host copy on ``self.copy_stream``; the per-request ``StashedTree``
+        # lists are materialized from it in ``get_draft_tokens`` after
+        # ``self.copy_event``. The pinned buffer grows to the largest batch.
+        self._tree_packed_np: np.ndarray | None = None
         self._tree_arr_w: int = 0
-        self._tree_pinned: list[torch.Tensor] | None = None
+        self._tree_pinned: torch.Tensor | None = None
         # True while a stashed tree batch is awaiting ``get_draft_tokens``. The
         # pinned buffers are single-buffered, so re-stashing before the previous
         # batch was taken would silently serve step N+1's trees for step N; the
@@ -71,13 +70,13 @@ class DraftTokensHandler:
         input_batch: InputBatch,
         draft_tokens: torch.Tensor,
         trees: "list[TreeDraft | None] | None" = None,
-        tree_arrays: tuple[torch.Tensor, ...] | None = None,
+        tree_packed: torch.Tensor | None = None,
         allow_pending_overwrite: bool = False,
     ) -> None:
         self.req_ids = input_batch.req_ids
         self.num_draft_tokens = draft_tokens.shape[1]
         self.trees = None
-        if tree_arrays is not None:
+        if tree_packed is not None:
             if self._tree_pending and not allow_pending_overwrite:
                 # A real serving step staging a second stash before the prior
                 # one was taken would silently serve step N+1's trees for step
@@ -95,9 +94,9 @@ class DraftTokensHandler:
                         "one."
                     )
                 self._tree_pending = False
-                self._tree_arrays_np = None
+                self._tree_packed_np = None
                 self._tree_throwaway = False
-            self._stash_tree_arrays(tree_arrays)
+            self._stash_tree_packed(tree_packed)
             if allow_pending_overwrite:
                 # Warmup/capture re-stash: mark this stash throwaway so any
                 # later real step abandons it rather than failing the guard.
@@ -109,19 +108,17 @@ class DraftTokensHandler:
                     f"({len(self.req_ids)}); per-request trees must be ordered in "
                     "parallel to the batch requests."
                 )
-            self.trees = [
-                t.to_lists() if t is not None else None for t in trees
-            ]
+            self.trees = [t.to_lists() if t is not None else None for t in trees]
             # A direct-list payload has no pending async batch; a leftover stash
             # (step N's trees never taken) is abandoned, never served stale.
             self._tree_pending = False
             self._tree_throwaway = False
-            self._tree_arrays_np = None
+            self._tree_packed_np = None
         else:
-            # Plain (treeless) step: no tree payload this step.
+            # No host tree payload this step.
             self._tree_pending = False
             self._tree_throwaway = False
-            self._tree_arrays_np = None
+            self._tree_packed_np = None
         if not input_batch.has_structured_output_reqs:
             # No draft token validation needs to be performed by
             # the scheduler for this batch.
@@ -140,51 +137,36 @@ class DraftTokensHandler:
             draft_tokens.record_stream(self.copy_stream)
             self.copy_event.record()
 
-    def _stash_tree_arrays(self, tree_arrays: tuple[torch.Tensor, ...]) -> None:
-        """Async-batch the tree-carry D2H and stage it for the next get.
+    def _stash_tree_packed(self, packed: torch.Tensor) -> None:
+        """Async-copy the packed tree batch to the host for the next get.
 
-        The df2t tree batch arrives as one ``[num_reqs, B]`` device tensor per
-        field (views of the builder buffers). All requests' trees are copied in
-        a handful of batched host copies on the side stream (pinned ``H2D``
-        destinations targeting only the live rows), so the per-request
-        ``.tolist()``/``.item()`` round-trips of ``TreeDraft.to_lists`` never
-        block the worker's per-step path; the single event sync happens on the
-        scheduler side inside ``get_draft_tokens``, the async-overlap point.
+        One pinned D2H on the side stream carries every request's tree; the
+        event sync happens on the scheduler side inside ``get_draft_tokens``.
 
         Args:
-            tree_arrays: ``(token_ids, depths, parents, arena, words, num_nodes)``
-                ``[R, B]`` (``[R]`` for num_nodes) device views in batch order.
+            packed: ``[num_reqs, 4 * W + 1]`` int64 rows in batch order
+                (tokens | depths | parents | words | num_nodes).
 
         """
-        token_ids, depths, parents, arena, words, num_nodes = tree_arrays
-        R = token_ids.shape[0]
-        W = token_ids.shape[1]
+        R, cols = packed.shape
         if len(self.req_ids) != R:
             raise ValueError(
-                f"tree_arrays rows ({R}) do not match req_ids ({len(self.req_ids)}); "
+                f"tree rows ({R}) do not match req_ids ({len(self.req_ids)}); "
                 "batched trees must be parallel to the batch requests."
             )
         pinned = self._tree_pinned
-        if pinned is None or pinned[0].shape[0] < R or pinned[0].shape[1] < W:
-            self._tree_pinned = pinned = [
-                torch.empty((R, W), dtype=torch.int64, device="cpu", pin_memory=True)
-                for _ in range(5)
-            ] + [
-                torch.empty((R,), dtype=torch.int32, device="cpu", pin_memory=True)
-            ]
+        if pinned is None or pinned.shape[0] < R or pinned.shape[1] != cols:
+            self._tree_pinned = pinned = torch.empty(
+                (R, cols), dtype=torch.int64, device="cpu", pin_memory=True
+            )
         current_stream = torch.cuda.current_stream(self.device)
         self.copy_stream.wait_stream(current_stream)
         with torch.cuda.stream(self.copy_stream):
-            for src, dst in zip(tree_arrays[:5], pinned[:5]):
-                dst[:R, :W].copy_(src, non_blocking=True)
-            pinned[5][:R].copy_(tree_arrays[5], non_blocking=True)
-            for t in tree_arrays:
-                t.record_stream(self.copy_stream)
+            pinned[:R].copy_(packed, non_blocking=True)
+            packed.record_stream(self.copy_stream)
             self.copy_event.record()
-        self._tree_arrays_np = [p[:R, :W].numpy() for p in pinned[:5]] + [
-            pinned[5][:R].numpy()
-        ]
-        self._tree_arr_w = W
+        self._tree_packed_np = pinned[:R].numpy()
+        self._tree_arr_w = (cols - 1) // 4
         self._tree_pending = True
 
     def _materialize_trees(self) -> list[StashedTree | None] | None:
@@ -196,25 +178,25 @@ class DraftTokensHandler:
         if not self._tree_pending:
             return self.trees
         self.copy_event.synchronize()
-        arrays = self._tree_arrays_np
-        assert arrays is not None, "a pending tree stash must have staged arrays"
-        tok, dep, par, are, wrd, nn = arrays
+        packed = self._tree_packed_np
+        assert packed is not None, "a pending tree stash must have staged rows"
         W = self._tree_arr_w
-        out: list[StashedTree | None] = []
-        for i in range(tok.shape[0]):
-            out.append(
-                StashedTree(
-                    token_ids=tok[i, :W].tolist(),
-                    depths=dep[i, :W].tolist(),
-                    parents=par[i, :W].tolist(),
-                    arena=are[i, :W].tolist(),
-                    words=wrd[i, :W].tolist(),
-                    num_nodes=int(nn[i]),
-                )
+        arena = list(range(W))
+        rows = packed.tolist()
+        out: list[StashedTree | None] = [
+            StashedTree(
+                token_ids=row[:W],
+                depths=row[W : 2 * W],
+                parents=row[2 * W : 3 * W],
+                arena=arena.copy(),
+                words=row[3 * W : 4 * W],
+                num_nodes=row[4 * W],
             )
+            for row in rows
+        ]
         self._tree_pending = False
         self._tree_throwaway = False
-        self._tree_arrays_np = None
+        self._tree_packed_np = None
         self._tree_arr_w = 0
         return out
 
