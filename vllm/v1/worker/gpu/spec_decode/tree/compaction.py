@@ -376,7 +376,7 @@ def _buffer_layout(
 
     Returns a ``{name: (byte_offset, byte_size)}`` map and the total byte size.
     The layout is the single source of truth shared by the profiling-phase
-    reservation (:meth:`Df2tKVCompaction.reserved_bytes`), the fresh
+    reservation (:meth:`TreeKVCompaction.reserved_bytes`), the fresh
     allocations, and the carved-into-storage construction, so the reserved
     size and the runtime buffers can never disagree.
     """
@@ -401,7 +401,7 @@ def _buffer_layout(
     return layout, off
 
 
-class Df2tKVCompaction:
+class TreeKVCompaction:
     """Batched, host-sync-free compaction of one step's accepted chains.
 
     Vectorizes what ``compact_accepted_chain`` does per (request, group,

@@ -23,7 +23,7 @@ import torch
 from torch import Tensor
 
 from vllm.triton_utils import tl, triton
-from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import TreeDraft
+from vllm.v1.worker.gpu.spec_decode.tree.tree_metadata import TreeDraft
 
 
 @triton.jit
@@ -31,6 +31,7 @@ def _tree_builder_kernel(
     scores_ptr,  # [R, S, K, K] transition logits
     cand_ptr,  # [R, S, K] i64 successor token ids
     out_ptr,  # [R, 4 * B + 1] i64 packed tokens|depths|parents|words|num_nodes
+    logp_out_ptr,  # [R, B] f32 node path log-mass (-inf past the node count)
     sorted_logp_ptr,  # [R, L * K, K] f32 best-first per-row logp
     sorted_cand_ptr,  # [R, L * K, K] i64 best-first per-row tokens
     UMSB,  # int64 constant 1 << 63 for unsigned path comparison
@@ -104,6 +105,7 @@ def _tree_builder_kernel(
     dep_acc = tl.zeros([BP], dtype=tl.int64)
     par_acc = tl.zeros([BP], dtype=tl.int64)
     word_acc = tl.zeros([BP], dtype=tl.int64)
+    lp_acc = tl.zeros([BP], dtype=tl.float32)
     neg_inf = float("-inf")
     key_max = 0x7FFFFFFFFFFFFFFF
 
@@ -143,6 +145,7 @@ def _tree_builder_kernel(
         dep_acc = tl.where(at, top_depth.to(tl.int64), dep_acc)
         par_acc = tl.where(at, top_pa.to(tl.int64), par_acc)
         word_acc = tl.where(at, pword | (tl.full((), 1, tl.int64) << emit), word_acc)
+        lp_acc = tl.where(at, top_mass.to(tl.float32), lp_acc)
 
         # Next sibling of the popped node (priced against the parent's mass)
         # takes over its slot; the rank advance is capped by K, not depth.
@@ -176,6 +179,7 @@ def _tree_builder_kernel(
     tl.store(out_ptr + base + 2 * B + ar, tl.where(live, par_acc, -2), mask=in_b)
     tl.store(out_ptr + base + 3 * B + ar, tl.where(live, word_acc, 0), mask=in_b)
     tl.store(out_ptr + base + 4 * B, emit.to(tl.int64))
+    tl.store(logp_out_ptr + row * B + ar, tl.where(live, lp_acc, neg_inf), mask=in_b)
 
 
 class TreeBuilder:
@@ -250,6 +254,11 @@ class TreeBuilder:
         self.parents = self.packed[:, 2 * B : 3 * B]
         self.words = self.packed[:, 3 * B : 4 * B]
         self.num_nodes = self.packed[:, 4 * B]
+        # Each node's drafter path log-probability, best-first (non-increasing
+        # along a row), for adaptive verify-width selection.
+        self.logp = torch.full(
+            (max_num_reqs, B), float("-inf"), dtype=torch.float32, device=dev
+        )
         self.arena = (
             torch.arange(B, dtype=torch.int64, device=dev)
             .expand(max_num_reqs, B)
@@ -276,6 +285,7 @@ class TreeBuilder:
             scores,
             cand,
             self.packed,
+            self.logp,
             self._sorted_logp,
             self._sorted_cand,
             self._umsb,

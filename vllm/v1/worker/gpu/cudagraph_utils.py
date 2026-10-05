@@ -148,6 +148,7 @@ class CudaGraphManager:
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
         ubatch_runner: "UBatchRunner | None" = None,
+        decode_query_lens: list[int] | None = None,
     ):
         self.vllm_config = vllm_config
         self.device = device
@@ -156,6 +157,9 @@ class CudaGraphManager:
         assert self.compilation_config is not None
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
+        # Uniform decode query lengths to capture, when a step may run at
+        # several (adaptive df2t verify widths).
+        self.decode_query_lens = decode_query_lens
         self.varlen_decode = varlen_decode
         # DBO supports FULL CUDA graphs only.
         self.ubatch_runner = ubatch_runner
@@ -266,7 +270,9 @@ class CudaGraphManager:
         # draft tokens. The scheduler might use a smaller number so we need
         # to capture graphs for all possible values during decode.
         speculative_config = self.vllm_config.speculative_config
-        if (
+        if self.decode_query_lens is not None:
+            decode_query_lens = self.decode_query_lens
+        elif (
             speculative_config
             and speculative_config.uses_dynamic_speculative_decoding()
         ):
@@ -568,6 +574,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
         ubatch_runner: "UBatchRunner | None" = None,
+        decode_query_lens: list[int] | None = None,
     ):
         super().__init__(
             vllm_config,
@@ -577,6 +584,7 @@ class ModelCudaGraphManager(CudaGraphManager):
             lora_capture_cases=lora_capture_cases,
             varlen_decode=varlen_decode,
             ubatch_runner=ubatch_runner,
+            decode_query_lens=decode_query_lens,
         )
         self.hidden_states: torch.Tensor | None = None
         self.aux_hidden_states: list[torch.Tensor] = []
@@ -597,9 +605,14 @@ class ModelCudaGraphManager(CudaGraphManager):
         use_aux_hidden_state_outputs: bool = False,
         lora_capture_hook: Callable[[int, int, int], None] | None = None,
         progress_bar_desc: str = "Capturing CUDA graphs",
-        df2t_tree_mask_attach: Callable[[dict[str, Any]], None] | None = None,
+        tree_mask_attach: Callable[[dict[str, Any]], None] | None = None,
+        tree_verify: Any = None,
     ) -> None:
-        """Capture CUDA graphs for model forward pass."""
+        """Capture CUDA graphs for model forward pass.
+
+        ``tree_verify`` (a ``TreeVerifyContext``) is published to FULL
+        captures, the uniform tree-verify decode graphs.
+        """
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
         if self.use_breakable_cg:
             self.init_breakable_cg_runner(model)
@@ -675,7 +688,7 @@ class ModelCudaGraphManager(CudaGraphManager):
             if desc.num_ubatches > 1:
                 # Prepare and park threads before capture; finish runs inside it.
                 assert self.ubatch_runner is not None
-                if df2t_tree_mask_attach is not None:
+                if tree_mask_attach is not None:
                     raise RuntimeError(
                         "df2t CUDA-graph capture does not support "
                         "microbatched (DBO) FULL graphs."
@@ -713,7 +726,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 max_query_len=desc.max_query_len or desc.uniform_token_count,
                 pcp_manager=pcp_manager,
             )
-            if df2t_tree_mask_attach is not None and desc.cg_mode == CUDAGraphMode.FULL:
+            if tree_mask_attach is not None and desc.cg_mode == CUDAGraphMode.FULL:
                 # df2t: bake the tree-verify mask_mod + its persistent aux
                 # pool addresses into FULL (uniform 1+B decode) metadata only.
                 # The tree mask's q_idx layout is defined just for the
@@ -721,7 +734,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 # later replay a mixed/prefill batch at a different query
                 # layout, so it must never bake this mask. df2t mixed batches
                 # run eager instead (see GPUModelRunner dispatch).
-                df2t_tree_mask_attach(attn_metadata)
+                tree_mask_attach(attn_metadata)
 
             # Capture with dummy rows marked as padding.
             input_buffers.is_padding.fill_(True)
@@ -743,6 +756,9 @@ class ModelCudaGraphManager(CudaGraphManager):
                     slot_mapping=slot_mappings,
                     batch_descriptor=batch_descriptor,
                     is_padding=input_buffers.is_padding[:num_tokens],
+                    tree_verify=(
+                        tree_verify if desc.cg_mode == CUDAGraphMode.FULL else None
+                    ),
                 ):
                     if cg_mode == CUDAGraphMode.PIECEWISE:
                         # PIECEWISE graph (compiled PW or breakable, chosen inside

@@ -38,10 +38,10 @@ import numpy as np
 import pytest
 import torch
 
-from tests.v1.worker.gpu.spec_decode.df2t.reference_verifier import _processed
+from tests.v1.worker.gpu.spec_decode.tree.reference_verifier import _processed
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
-from vllm.v1.worker.gpu.spec_decode.df2t.tree_builder import TreeBuilder
-from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import TreeVerifier
+from vllm.v1.worker.gpu.spec_decode.tree.selection.df2t import TreeBuilder
+from vllm.v1.worker.gpu.spec_decode.tree.tree_verifier import TreeVerifier
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.sample.states import SamplingStates
@@ -151,7 +151,7 @@ def _decode(
     apply_top_k_top_p on a per-request SamplingStates), one token is drawn
     per row with the production Gumbel sampler keyed by (request seed, row
     position), and ``TreeVerifier.walk`` traverses the trees — the exact
-    architecture ``_df2t_tree_verify`` uses in serving — instead of the
+    architecture ``_tree_verify`` uses in serving — instead of the
     verifier's reference-convention ``_processed`` and per-round draws. Row
     positions follow serving: anchor at ``C``, node at ``C + depth``, and
     ``C`` advances by the emitted token count each step.

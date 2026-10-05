@@ -18,17 +18,17 @@ draws are seeded per (request seed, position).
 import pytest
 import torch
 
-from tests.v1.worker.gpu.spec_decode.df2t.reference_verifier import (
+from tests.v1.worker.gpu.spec_decode.tree.reference_verifier import (
     tree_verify_reference,
 )
-from vllm.v1.worker.gpu.model_runner import _df2t_chain_context
+from vllm.v1.worker.gpu.model_runner import _tree_chain_context
 from vllm.v1.worker.gpu.sample.bad_words import apply_bad_words
 from vllm.v1.worker.gpu.sample.penalties import apply_penalties
 from vllm.v1.worker.gpu.sample.thinking_budget import (
     ThinkingBudgetState,
     apply_thinking_budget,
 )
-from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import TreeVerifier
+from vllm.v1.worker.gpu.spec_decode.tree.tree_verifier import TreeVerifier
 
 _DEVICES = ["cuda"]
 
@@ -61,7 +61,7 @@ def _chain_fixture(device):
     trees = [
         _make_tree([11, 5, 3, 9], [-1, -1, 0, 1], [1, 1, 2, 2], device, num_nodes=4)
     ]
-    chain_len, chain = _df2t_chain_context(trees, [0, 5], 4, device)
+    chain_len, chain = _tree_chain_context(trees, [0, 5], 4, device)
     return trees, chain_len, chain, 16
 
 

@@ -108,7 +108,7 @@ def _fake_spec_config(df2t: bool, flex: bool = False):
     return types.SimpleNamespace(
         method="df2t" if df2t else "dflash",
         use_df2t=lambda: df2t,
-        use_df2t_tree=lambda: df2t,
+        use_tree=lambda: df2t,
         num_speculative_tokens=5,
         tree_attention_backend="flex" if flex else "fa4",
     )
@@ -131,7 +131,7 @@ def _real_df2t_vllm_config(qwen3_config_path, flash_attn_version=None):
     """A VllmConfig built with a REAL df2t SpeculativeConfig.
 
     Passing a real SpeculativeConfig means ``VllmConfig.__post_init__`` runs
-    the df2t attention cross-validation (``_validate_df2t_attention``) at
+    the df2t attention cross-validation (``_validate_tree_attention``) at
     construction time, exercising the wiring rather than an isolated method.
     """
     from types import SimpleNamespace
@@ -169,7 +169,8 @@ def _real_df2t_vllm_config(qwen3_config_path, flash_attn_version=None):
         compute_hash=lambda: "draft-hash",
     )
     speculative_config = SpeculativeConfig(
-        method="df2t",
+        method="dflash",
+        tree_selection="df2t",
         num_speculative_tokens=15,
         draft_model_config=draft_model_config,
         tree_budget=None,
@@ -222,18 +223,18 @@ def test_df2t_forced_fa2_override_raises(qwen3_config_path):
     SpeculativeConfig, so ``__post_init__`` runs the cross-validation) and at
     runtime selection.
     """
-    with pytest.raises(ValueError, match="df2t"):
+    with pytest.raises(ValueError, match="tree"):
         _real_df2t_vllm_config(qwen3_config_path, flash_attn_version=2)
 
     cfg = _make_cfg(qwen3_config_path, df2t=True, flash_attn_version=2)
-    with set_current_vllm_config(cfg), pytest.raises(RuntimeError, match="df2t"):
+    with set_current_vllm_config(cfg), pytest.raises(RuntimeError, match="tree"):
         get_flash_attn_version(head_size=HEAD_DIM, kv_cache_block_size=BLOCK_SIZE)
 
 
 def _minimal_df2t_validate_config(*, rswa_window=None, is_mm_prefix_lm=False):
-    """A lightweight VllmConfig exercising ``_validate_df2t_attention`` alone.
+    """A lightweight VllmConfig exercising ``_validate_tree_attention`` alone.
 
-    ``_validate_df2t_attention`` only reads the speculative config's
+    ``_validate_tree_attention`` only reads the speculative config's
     ``use_df2t()`` (confirmed df2t) plus the attention/model surface relevant
     to the df2t mask vehicles. This avoids rebuilding a full model just to
     reject an R-SWA or prefix-LM target.
@@ -256,12 +257,12 @@ def _minimal_df2t_validate_config(*, rswa_window=None, is_mm_prefix_lm=False):
 @requires_sm120_fa4
 def test_df2t_validate_rejects_rswa_target(qwen3_config_path):
     """df2t + an R-SWA target must fail closed at config time: the FA4 commit
-    kernel dispatches ``rswa_mask_mod_fn or mm_mask_mod or df2t_tree_mask_mod``,
+    kernel dispatches ``rswa_mask_mod_fn or mm_mask_mod or tree_mask_mod``,
     so an R-SWA target (causal already False on R-SWA layers) would silently
     drop the tree mask and let tree siblings attend each other."""
     cfg = _minimal_df2t_validate_config(rswa_window=128)
     with pytest.raises(ValueError, match="R-SWA"):
-        cfg._validate_df2t_attention()
+        cfg._validate_tree_attention()
 
 
 @requires_sm120_fa4
@@ -271,7 +272,7 @@ def test_df2t_validate_rejects_mm_prefix_target(qwen3_config_path):
     dispatch, so an mm-prefix target would silently drop the tree mask."""
     cfg = _minimal_df2t_validate_config(is_mm_prefix_lm=True)
     with pytest.raises(ValueError, match="mm-prefix"):
-        cfg._validate_df2t_attention()
+        cfg._validate_tree_attention()
 
 
 @requires_sm120_fa4
@@ -279,7 +280,7 @@ def test_df2t_validate_accepts_plain_target(qwen3_config_path):
     """A plain (non-R-SWA, non-mm-prefix) df2t target passes the df2t attention
     validation unchanged."""
     cfg = _minimal_df2t_validate_config()
-    cfg._validate_df2t_attention()  # no raise
+    cfg._validate_tree_attention()  # no raise
 
     # FA4 is accepted by both seams.
     _real_df2t_vllm_config(qwen3_config_path, flash_attn_version=4)
@@ -311,14 +312,14 @@ def test_df2t_forced_fa3_override_raises_on_major10(monkeypatch, qwen3_config_pa
     )
     monkeypatch.setattr(fai, "_is_fa4_supported", lambda: (True, None))
 
-    with pytest.raises(ValueError, match="df2t"):
+    with pytest.raises(ValueError, match="tree"):
         _real_df2t_vllm_config(qwen3_config_path, flash_attn_version=3)
 
     with (
         set_current_vllm_config(
             _make_cfg(qwen3_config_path, df2t=True, flash_attn_version=3)
         ),
-        pytest.raises(RuntimeError, match="df2t"),
+        pytest.raises(RuntimeError, match="tree"),
     ):
         get_flash_attn_version(head_size=HEAD_DIM, kv_cache_block_size=BLOCK_SIZE)
 
@@ -373,7 +374,7 @@ def test_df2t_force_fa4_spans_other_majors(monkeypatch, qwen3_config_path):
     monkeypatch.setattr(fai, "_is_fa4_supported", lambda: (False, "not supported"))
     with (
         set_current_vllm_config(_make_cfg(qwen3_config_path, df2t=True)),
-        pytest.raises(RuntimeError, match="df2t"),
+        pytest.raises(RuntimeError, match="tree"),
     ):
         get_flash_attn_version(head_size=HEAD_DIM, kv_cache_block_size=BLOCK_SIZE)
     # ...while the flex vehicle stays a valid fa4-less handle.

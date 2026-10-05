@@ -15,7 +15,7 @@ from vllm.utils.torch_utils import async_tensor_h2d
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.attn_utils import FastPrefillBatchMetadata
     from vllm.v1.worker.gpu.block_table import BlockTables
-    from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import (
+    from vllm.v1.worker.gpu.spec_decode.tree.tree_metadata import (
         TreeBatch,
         TreeDraft,
     )

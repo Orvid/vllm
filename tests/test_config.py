@@ -1263,7 +1263,10 @@ def test_df2t_forces_v2_model_runner(monkeypatch):
         verify_with_parallel_config=lambda *_: None,
     )
     spec = SpeculativeConfig(
-        method="df2t", num_speculative_tokens=15, draft_model_config=draft
+        method="dflash",
+        tree_selection="df2t",
+        num_speculative_tokens=15,
+        draft_model_config=draft,
     )
     config = object.__new__(VllmConfig)
     config.attention_config = AttentionConfig()
@@ -1279,10 +1282,10 @@ def test_df2t_forces_v2_model_runner(monkeypatch):
         config._get_v2_model_runner_unsupported_features()
     )
     assert (
-        "df2t speculative decoding"
+        "tree speculative verification"
         in config._get_v1_model_runner_unsupported_features()
     )
-    with pytest.raises(ValueError, match="df2t"):
+    with pytest.raises(ValueError, match="tree"):
         VllmConfig._validate_v1_model_runner(config)
 
 
@@ -1930,7 +1933,8 @@ def _df2t_speculative_config(tmp_path: Path, parallel_config) -> SpeculativeConf
         model=str(target_path), tokenizer_mode="skip", max_model_len=2048
     )
     return SpeculativeConfig(
-        method="df2t",
+        method="dflash",
+        tree_selection="df2t",
         model=str(draft_path),
         num_speculative_tokens=3,
         target_model_config=model_config,

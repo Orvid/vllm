@@ -201,7 +201,8 @@ def _df2t_speculative_config(tmp_path: Path) -> SpeculativeConfig:
         model=str(target_path), tokenizer_mode="skip", max_model_len=2048
     )
     return SpeculativeConfig(
-        method="df2t",
+        method="dflash",
+        tree_selection="df2t",
         model=str(draft_path),
         num_speculative_tokens=3,
         target_model_config=model_config,
@@ -291,7 +292,7 @@ def test_validate_tokens_skips_chain_check_for_df2t(tmp_path, tokenizer, letters
         speculative_config=_df2t_speculative_config(tmp_path),
     )
     manager = StructuredOutputManager(vllm_config)
-    assert manager._is_df2t()
+    assert manager._is_tree()
     request = _init_request(manager, tokenizer, "df2t-validate")
     drafts = [letters["a"], letters["1"], letters["c"]]
     assert manager.validate_tokens(request, drafts) == drafts

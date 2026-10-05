@@ -11,7 +11,7 @@ Two independently-reviewed defects are pinned here.
    first branch: valid tokens were masked out and invalid ones let through. A
    grammar/JSON-schema df2t request therefore diverged from the non-spec target
    (or emitted schema-invalid output).
-2. **Logprobs crashed the engine.** ``_df2t_verify_rejects_logprobs`` raised
+2. **Logprobs crashed the engine.** ``_tree_verify_rejects_logprobs`` raised
    NotImplementedError inside the worker on the first df2t verify step, so a
    single ``logprobs`` request killed the server.
 

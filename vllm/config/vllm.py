@@ -640,19 +640,16 @@ class VllmConfig:
         speculative_config = self.speculative_config
         if speculative_config is None:
             return 0
-        if speculative_config.use_dflash() or speculative_config.use_df2t():
-            # DFlash (and df2t, which drafts with the DFlash drafter) requires an
-            # extra lookahead slot since it uses in-fill-style decoding instead
-            # of standard next-token sampling, so it has a query for the last
-            # sampled token plus queries for each draft token. DF2T with the
-            # tree enabled reserves the tree budget ceiling (``1 +
-            # max_tree_budget``), so a tree wider than the drafter block depth
-            # stays expressible; it never derives from
-            # ``num_speculative_tokens``. With ``enable_tree=False`` df2t
-            # serves the DFlash2 chain and keeps dflash's ``num_speculative_tokens
-            # + 1``.
-            if speculative_config.use_df2t_tree():
-                return speculative_config.tree_lookahead
+        if speculative_config.use_tree():
+            # Tree verification reserves the tree budget ceiling (``1 +
+            # max_tree_budget``), so a tree wider than the drafter depth stays
+            # expressible.
+            return speculative_config.tree_lookahead
+        if speculative_config.use_dflash():
+            # DFlash requires an extra lookahead slot since it uses
+            # in-fill-style decoding instead of standard next-token sampling,
+            # so it has a query for the last sampled token plus queries for
+            # each draft token.
             return self.num_speculative_tokens + 1
         if speculative_config.use_eagle() or speculative_config.uses_draft_model():
             # DSpark (covered by use_eagle) drafts a block of num_speculative_tokens
@@ -704,18 +701,12 @@ class VllmConfig:
         from the other would under-size EAGLE by a full request width, which is
         the failure this property exists to prevent.
 
-        DF2T is the exception: its decode graph is the uniform STATIC tree
-        width ``1 + nodes_max`` (``tree_decode_width``), never the drafter
-        block depth. The graph may be captured up to the reservation ceiling
-        ``1 + max_tree_budget`` (``tree_lookahead``); that ceiling is a buffer,
-        not the query width. With ``enable_tree=False`` df2t falls back to the
-        dflash ``1 + num_speculative_tokens`` chain width.
+        Tree verification is the exception: its decode graph is the uniform
+        static tree width ``1 + nodes_max`` (``tree_decode_width``), never the
+        drafter depth.
         """
         speculative_config = self.speculative_config
-        if (
-            speculative_config is not None
-            and getattr(speculative_config, "use_df2t_tree", lambda: False)()
-        ):
+        if speculative_config is not None and speculative_config.use_tree():
             return speculative_config.tree_decode_width
         return 1 + self.num_speculative_tokens
 
@@ -1447,7 +1438,7 @@ class VllmConfig:
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)
 
         self.try_verify_and_update_config()
-        self._validate_df2t_attention()
+        self._validate_tree_attention()
         self._resolve_and_verify_engram_config()
 
         self._check_watermarking_unsupported()
@@ -1574,11 +1565,10 @@ class VllmConfig:
                     and self.speculative_config.method != "draft_model"
                     and self.speculative_config.method != "dspark"
                     and self.speculative_config.method != "dflash"
-                    and not self.speculative_config.use_df2t()
                 ):
                     raise ValueError(
                         "Currently, async scheduling is only supported "
-                        "with EAGLE/MTP/Draft Model/NGram GPU/DSpark/DFlash/DF2T "
+                        "with EAGLE/MTP/Draft Model/NGram GPU/DSpark/DFlash "
                         "kind of speculative decoding"
                     )
                 if self.speculative_config.disable_padded_drafter_batch:
@@ -1609,7 +1599,6 @@ class VllmConfig:
                 and self.speculative_config.method != "draft_model"
                 and self.speculative_config.method != "dspark"
                 and self.speculative_config.method != "dflash"
-                and not self.speculative_config.use_df2t()
             ):
                 logger.warning_once(
                     "Async scheduling not supported with %s-based "
@@ -2483,7 +2472,17 @@ class VllmConfig:
                     # built from 17 stop covering at 227 of 256 requests.
                     decode_tiers = [(decode_query_len, max_num_seqs)]
                     speculative_config = self.speculative_config
-                    if (
+                    if speculative_config is not None and (
+                        speculative_config.adaptive_tree_width
+                        and speculative_config.use_tree()
+                    ):
+                        # Adaptive tree verification runs one of several uniform
+                        # widths per step, at any batch size.
+                        decode_tiers = [
+                            (1 + w, max_num_seqs)
+                            for w in speculative_config.tree_verify_width_ladder
+                        ]
+                    elif (
                         speculative_config is not None
                         and speculative_config.uses_dynamic_speculative_decoding()
                     ):
@@ -3075,11 +3074,11 @@ class VllmConfig:
                 unsupported.append(f"speculative method '{speculative_config.method}'")
 
             # V2 EagleSpeculator does not support parallel_drafting (for P-Eagle).
-            # DFlash, DSpark, and df2t use parallel drafting natively in V2 via
+            # DFlash and DSpark use parallel drafting natively in V2 via
             # their own speculators.
             if (
                 speculative_config.parallel_drafting
-                and speculative_config.method not in ("dflash", "dspark", "df2t")
+                and speculative_config.method not in ("dflash", "dspark")
             ):
                 unsupported.append("parallel drafting for EAGLE speculative decoding")
 
@@ -3115,12 +3114,13 @@ class VllmConfig:
         ):
             unsupported.append("pipeline parallelism with async scheduling")
 
-        # DSpark and df2t are implemented only by the V2 GPU model runner.
+        # DSpark and tree verification are implemented only by the V2 GPU model
+        # runner.
         if self.speculative_config:
             if self.speculative_config.method == "dspark":
                 unsupported.append("dspark speculative decoding")
-            if self.speculative_config.use_df2t():
-                unsupported.append("df2t speculative decoding")
+            if self.speculative_config.use_tree():
+                unsupported.append("tree speculative verification")
             if self.speculative_config.enable_adaptive_verification:
                 unsupported.append("adaptive draft verification")
 
@@ -3142,31 +3142,27 @@ class VllmConfig:
 
         return unsupported
 
-    def _validate_df2t_attention(self) -> None:
-        """df2t tree verify requires FA4 or Flex attention on every arch.
+    def _validate_tree_attention(self) -> None:
+        """Tree verification requires FA4 or Flex attention on every arch.
 
         The per-query tree mask is only expressible by FlashAttention-4 (the
         default ``tree_attention_backend="fa4"``) or FlexAttention
         (``tree_attention_backend="flex"``). An explicit override to FA2/FA3
-        or to a non-{fa4, flex} attention backend cannot run the df2t verify
+        or to a non-{fa4, flex} attention backend cannot run the tree verify
         pass correctly, so reject it here rather than silently falling back.
-        Speculative decoding with the df2t TREE enabled requires FA4 or Flex
-        attention on every arch; a tree-off df2t serves the plain DFlash2
-        chain and needs no tree-mask backend. Non-df2t-tree configs are
-        untouched.
         """
         spec_config = self.speculative_config
-        if spec_config is None or not spec_config.use_df2t_tree():
+        if spec_config is None or not spec_config.use_tree():
             return
 
-        from vllm.v1.attention.backends.fa_utils import DF2T_TREE_ATTN_REQUIRED
+        from vllm.v1.attention.backends.fa_utils import TREE_ATTN_REQUIRED
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
         fa_version = self.attention_config.flash_attn_version
         if fa_version not in (None, 4):
             raise ValueError(
-                f"{DF2T_TREE_ATTN_REQUIRED}, but attention_config."
-                f"flash_attn_version is {fa_version}. df2t's per-query tree "
+                f"{TREE_ATTN_REQUIRED}, but attention_config."
+                f"flash_attn_version is {fa_version}. the per-query tree "
                 "mask is only supported by FA4 or Flex attention; refusing to "
                 "run it on FA2/FA3."
             )
@@ -3178,7 +3174,7 @@ class VllmConfig:
         backend = self.attention_config.backend
         if backend is not None and backend not in allowed_backends:
             raise ValueError(
-                "df2t speculative decoding requires FlashAttention-4 (fa4) "
+                "tree speculative verification requires FlashAttention-4 (fa4) "
                 f"or Flex attention on the target, but attention_config."
                 f"backend is {backend}. Refusing a backend that cannot "
                 "express the per-query tree mask."
@@ -3190,14 +3186,14 @@ class VllmConfig:
         ]
         if bad_kinds:
             raise ValueError(
-                "df2t speculative decoding requires FA4 or Flex attention on "
+                "tree speculative verification requires FA4 or Flex attention on "
                 "the target, but attention_config.backend_per_kind overrides "
                 f"{bad_kinds} are outside {{fa4, flex}}."
             )
 
         # Fail closed on targets whose mask the FA4 commit kernel would drop
         # before the tree mask: the kernel dispatches ``mask_mod = rswa_mask_mod
-        # _fn or mm_mask_mod or df2t_tree_mask_mod``, so an R-SWA or mm-prefix
+        # _fn or mm_mask_mod or tree_mask_mod``, so an R-SWA or mm-prefix
         # (prefix-LM) target would silently run the verify WITHOUT the tree
         # mask while causal is already False (tree siblings attend each other).
         model_config = self.model_config
@@ -3206,19 +3202,19 @@ class VllmConfig:
             and getattr(model_config, "rswa_window", None) is not None
         ):
             raise ValueError(
-                "df2t speculative decoding is not supported on an R-SWA "
+                "tree speculative verification is not supported on an R-SWA "
                 "attention target (rswa_window is set): the FA4 commit kernel "
-                "dispatches the R-SWA mask before the df2t tree mask, so the "
+                "dispatches the R-SWA mask before the tree mask, so the "
                 "tree mask would be silently dropped while causal is already "
-                "False. Disable R-SWA for the df2t target."
+                "False. Disable R-SWA for the tree-verified target."
             )
         if model_config is not None and getattr(model_config, "is_mm_prefix_lm", False):
             raise ValueError(
-                "df2t speculative decoding is not supported on an mm-prefix "
+                "tree speculative verification is not supported on an mm-prefix "
                 "(prefix-LM) multimodal target: the FA4 commit kernel "
-                "dispatches the mm-prefix mask before the df2t tree mask, so "
+                "dispatches the mm-prefix mask before the tree mask, so "
                 "the tree mask would be silently dropped. Disable mm-prefix "
-                "attention for the df2t target."
+                "attention for the tree-verified target."
             )
 
     def _validate_adaptive_verification(self) -> None:

@@ -212,6 +212,51 @@ class DFlash2Speculator(DFlashSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> None:
+        candidate_ids, scores = self._draft_tree_candidates(
+            num_reqs,
+            num_tokens_padded,
+            attn_metadata,
+            slot_mappings,
+            num_tokens_across_dp,
+            cudagraph_runtime_mode,
+        )
+        num_sample = num_reqs * self.num_speculative_steps
+        self.candidate_sampler.sample(
+            candidate_ids,
+            scores,
+            num_reqs,
+            self.sample_pos,
+            self.sample_idx_mapping,
+            self.temperature,
+            self.seeds,
+            self.draft_tokens,
+            self.draft_logits,
+            self.use_fp64_gumbel,
+        )
+        if self.enable_adaptive_verification:
+            self._maybe_predict_acceptance(
+                self.candidate_sampler.scores[:num_reqs].flatten(0, 1),
+                self.sample_idx_mapping[:num_sample],
+                self.sample_col[:num_sample],
+            )
+
+    def _draft_tree_candidates(
+        self,
+        num_reqs: int,
+        num_tokens_padded: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the drafter and return its per-position candidates.
+
+        Returns:
+            ``candidate_ids [R, S, K]`` (top-K tokens per draft position) and
+            ``scores [R, S, K, K]`` (predecessor-to-successor transition
+            logits), the input both the chain walk and tree selection consume.
+
+        """
         last_hidden_states = self._run_model(
             num_tokens_padded,
             attn_metadata,
@@ -231,24 +276,7 @@ class DFlash2Speculator(DFlashSpeculator):
         )
         unary_logits = unary_logits.view_as(candidate_ids)
         scores = self._score_candidates(candidate_ids, unary_logits, hidden_states)
-        self.candidate_sampler.sample(
-            candidate_ids,
-            scores,
-            num_reqs,
-            self.sample_pos,
-            self.sample_idx_mapping,
-            self.temperature,
-            self.seeds,
-            self.draft_tokens,
-            self.draft_logits,
-            self.use_fp64_gumbel,
-        )
-        if self.enable_adaptive_verification:
-            self._maybe_predict_acceptance(
-                self.candidate_sampler.scores[:num_reqs].flatten(0, 1),
-                self.sample_idx_mapping[:num_sample],
-                self.sample_col[:num_sample],
-            )
+        return candidate_ids, scores
 
     def _score_candidates(
         self,

@@ -15,13 +15,13 @@ import numpy as np
 import pytest
 import torch
 
-from tests.v1.worker.gpu.spec_decode.df2t.reference_verifier import (
+from tests.v1.worker.gpu.spec_decode.tree.reference_verifier import (
     _processed as _ref_processed,
 )
-from tests.v1.worker.gpu.spec_decode.df2t.reference_verifier import (
+from tests.v1.worker.gpu.spec_decode.tree.reference_verifier import (
     tree_verify_reference,
 )
-from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import (
+from vllm.v1.worker.gpu.spec_decode.tree.tree_verifier import (
     TreeVerifier,
 )
 
@@ -75,14 +75,14 @@ def _compute_tree_depths(parents: torch.Tensor) -> torch.Tensor:
 def test_df2t_verify_supports_logprobs():
     """The df2t verify path no longer rejects ``logprobs`` requests.
 
-    The old fail-closed raise (``_df2t_verify_rejects_logprobs``) is gone: a
+    The old fail-closed raise (``_tree_verify_rejects_logprobs``) is gone: a
     df2t request that asks for logprobs gets real per-token logprobs and one
     that does not asks for none. The draw-row mapping, logprob values and
     per-request CSR layout are pinned in ``test_df2t_tree_logprobs.py``.
     """
     import numpy as np
 
-    from vllm.v1.worker.gpu.model_runner import _df2t_tree_logprobs
+    from vllm.v1.worker.gpu.model_runner import _tree_logprobs
     from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 
     device = torch.device("cuda")
@@ -101,7 +101,7 @@ def test_df2t_verify_supports_logprobs():
     state_np = np.zeros(R, dtype=np.intp)
     # Unrequested -> None (never empty, never a crash).
     assert (
-        _df2t_tree_logprobs(
+        _tree_logprobs(
             processed,
             sampled,
             ns,
@@ -116,7 +116,7 @@ def test_df2t_verify_supports_logprobs():
         is None
     )
     # Requested -> a real, non-empty per-token LogprobsTensors.
-    lp = _df2t_tree_logprobs(
+    lp = _tree_logprobs(
         processed,
         sampled,
         ns,
@@ -220,7 +220,7 @@ def test_builder_partial_tree_wide_buffer_verifies_losslessly():
     matched). This is the per-request-width-below-ceiling decoupling: a
     request whose B_i is below the step's graph width lays out fewer nodes and
     the padding is inert."""
-    from vllm.v1.worker.gpu.spec_decode.df2t.tree_builder import TreeBuilder
+    from vllm.v1.worker.gpu.spec_decode.tree.selection.df2t import TreeBuilder
 
     torch.manual_seed(0)
     R, L, K, B, vocab = 2, 2, 2, 30, 128
@@ -460,7 +460,7 @@ def test_tree_verifier_stops_and_masks_early_done_requests(device):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_model_runner_df2t_tree_verify_output_contract():
-    """The runner wiring (_df2t_tree_verify) gathers each request's target
+    """The runner wiring (_tree_verify) gathers each request's target
     rows, verifies with the TreeVerifier, and emits the exact rejection-sampler
     contract: sampled [R, 1+B] int64 + num_sampled [R] int32, with
     num_rejected == num_logits - num_sampled so the existing postprocess
@@ -534,6 +534,8 @@ def test_model_runner_df2t_tree_verify_output_contract():
 
     fake_self = SimpleNamespace(
         tree_verifier=tree_verifier,
+        _tree_width_ctl=None,
+        _tree_recurrent=None,
         sampler=SimpleNamespace(
             sampling_states=ss,
             req_states=SimpleNamespace(prefill_len=prefill_len),
@@ -557,17 +559,17 @@ def test_model_runner_df2t_tree_verify_output_contract():
             )
         ),
     )
-    fake_self._compact_df2t_accepted_kv = MethodType(
-        GPUModelRunner._compact_df2t_accepted_kv, fake_self
+    fake_self._compact_tree_accepted_kv = MethodType(
+        GPUModelRunner._compact_tree_accepted_kv, fake_self
     )
-    fake_self._df2t_chain_width = MethodType(
-        GPUModelRunner._df2t_chain_width, fake_self
+    fake_self._tree_chain_width = MethodType(
+        GPUModelRunner._tree_chain_width, fake_self
     )
-    fake_self._df2t_finish_verify = MethodType(
-        GPUModelRunner._df2t_finish_verify, fake_self
+    fake_self._tree_finish_verify = MethodType(
+        GPUModelRunner._tree_finish_verify, fake_self
     )
 
-    out = GPUModelRunner._df2t_tree_verify(fake_self, logits, ib)
+    out = GPUModelRunner._tree_verify(fake_self, logits, ib)
     sampled, num_sampled = out.sampled_token_ids, out.num_sampled
 
     assert pipeline_calls, "df2t must route logits through the sampling pipeline"
@@ -649,6 +651,8 @@ def test_model_runner_df2t_tree_verify_mixed_batch():
 
     fake_self = SimpleNamespace(
         tree_verifier=TreeVerifier(num_reqs, B, vocab, device),
+        _tree_width_ctl=None,
+        _tree_recurrent=None,
         sampler=SimpleNamespace(
             sampling_states=ss,
             req_states=SimpleNamespace(prefill_len=prefill_len),
@@ -672,17 +676,17 @@ def test_model_runner_df2t_tree_verify_mixed_batch():
             )
         ),
     )
-    fake_self._compact_df2t_accepted_kv = MethodType(
-        GPUModelRunner._compact_df2t_accepted_kv, fake_self
+    fake_self._compact_tree_accepted_kv = MethodType(
+        GPUModelRunner._compact_tree_accepted_kv, fake_self
     )
-    fake_self._df2t_chain_width = MethodType(
-        GPUModelRunner._df2t_chain_width, fake_self
+    fake_self._tree_chain_width = MethodType(
+        GPUModelRunner._tree_chain_width, fake_self
     )
-    fake_self._df2t_finish_verify = MethodType(
-        GPUModelRunner._df2t_finish_verify, fake_self
+    fake_self._tree_finish_verify = MethodType(
+        GPUModelRunner._tree_finish_verify, fake_self
     )
 
-    out = GPUModelRunner._df2t_tree_verify(fake_self, logits, ib)
+    out = GPUModelRunner._tree_verify(fake_self, logits, ib)
     sampled, num_sampled = out.sampled_token_ids, out.num_sampled
 
     assert sampled.shape == (num_reqs, 1 + 2)  # 1 + batch b_max (request 0)
@@ -788,7 +792,7 @@ def test_df2t_production_pipeline_matches_reference():
         assert max_diff < 1e-5, f"row {r}: probability diff {max_diff}"
 
 
-def _df2t_compaction_ib(num_reqs, trees):
+def _tree_compaction_ib(num_reqs, trees):
     """An InputBatch-shaped stand-in exposing the fields the compaction wiring
     reads (num_reqs, padding, trees, idx_mapping, idx_mapping_np)."""
     from types import SimpleNamespace
@@ -803,7 +807,7 @@ def _df2t_compaction_ib(num_reqs, trees):
     )
 
 
-def _df2t_compaction_phys(req_bt, c, max_delta, block_size):
+def _tree_compaction_phys(req_bt, c, max_delta, block_size):
     """The runner's block-slot -> physical mapping: ``phys[i]`` is the physical
     slot for block-slot ``c + i``."""
     slots = c + torch.arange(max_delta + 1, device="cuda")
@@ -812,7 +816,7 @@ def _df2t_compaction_phys(req_bt, c, max_delta, block_size):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_model_runner_df2t_compaction_wiring_moves_per_group():
-    """``_compact_df2t_accepted_kv`` (the real runner method) relocates each
+    """``_compact_tree_accepted_kv`` (the real runner method) relocates each
     accepted node's KV from its scattered ``C + 1 + arena`` block-slot to the
     canonical ``C + depth`` block-slot, through the per-group block tables,
     and zeroes the stale scattered slots.
@@ -900,13 +904,13 @@ def test_model_runner_df2t_compaction_wiring_moves_per_group():
 
     # Request 0 scattered sources (per group) hold the accepted nodes' KV; the
     # request 1 canonical slot holds KV that must be left untouched.
-    r0_g0 = _df2t_compaction_phys(block_tables[0][0], 6, 4, block_size)
+    r0_g0 = _tree_compaction_phys(block_tables[0][0], 6, 4, block_size)
     # slots 6..10 -> phys [122, 123, 160, 161, 162]
     assert r0_g0.tolist() == [122, 123, 160, 161, 162]
-    r0_g1 = _df2t_compaction_phys(block_tables[1][0], 6, 4, block_size)
+    r0_g1 = _tree_compaction_phys(block_tables[1][0], 6, 4, block_size)
     assert r0_g1.tolist() == [10, 11, 12, 13, 14]
-    r1_g0 = _df2t_compaction_phys(block_tables[0][1], 2, 3, block_size)
-    r1_g1 = _df2t_compaction_phys(block_tables[1][1], 2, 3, block_size)
+    r1_g0 = _tree_compaction_phys(block_tables[0][1], 2, 3, block_size)
+    r1_g1 = _tree_compaction_phys(block_tables[1][1], 2, 3, block_size)
     # Request 1 canonical slot is the phys index for depth 3 (index 3).
     canon0 = int(r1_g0[3].item())
     canon1 = int(r1_g1[3].item())
@@ -922,7 +926,7 @@ def test_model_runner_df2t_compaction_wiring_moves_per_group():
 
     fake_self = SimpleNamespace(
         max_num_reqs=num_reqs,
-        _df2t_compaction_storage=None,
+        _tree_compaction_storage=None,
         tree_verifier=SimpleNamespace(
             num_sampled=num_sampled, accepted_arenas=accepted_arenas
         ),
@@ -934,10 +938,10 @@ def test_model_runner_df2t_compaction_wiring_moves_per_group():
         ),
         device=device,
     )
-    ib = _df2t_compaction_ib(num_reqs, trees)
+    ib = _tree_compaction_ib(num_reqs, trees)
 
-    fake_self._df2t_chain_width = GPUModelRunner._df2t_chain_width.__get__(fake_self)
-    GPUModelRunner._compact_df2t_accepted_kv(fake_self, ib)
+    fake_self._tree_chain_width = GPUModelRunner._tree_chain_width.__get__(fake_self)
+    GPUModelRunner._compact_tree_accepted_kv(fake_self, ib)
 
     # Request 0 / group 0: node1 scatter 160 -> canonical 123 and node2 scatter
     # 161 -> canonical 162; both scattered slots come back zeroed.
@@ -991,7 +995,7 @@ def test_model_runner_df2t_compaction_wiring_noop_cases():
     def _run(verifier, trees):
         fake_self = SimpleNamespace(
             max_num_reqs=num_reqs,
-            _df2t_compaction_storage=None,
+            _tree_compaction_storage=None,
             tree_verifier=verifier,
             _kv_cache_views_by_name={"layer.0": view},
             kv_cache_config=SimpleNamespace(
@@ -1010,11 +1014,11 @@ def test_model_runner_df2t_compaction_wiring_noop_cases():
             ),
             device=device,
         )
-        ib = _df2t_compaction_ib(num_reqs, trees)
-        fake_self._df2t_chain_width = GPUModelRunner._df2t_chain_width.__get__(
+        ib = _tree_compaction_ib(num_reqs, trees)
+        fake_self._tree_chain_width = GPUModelRunner._tree_chain_width.__get__(
             fake_self
         )
-        GPUModelRunner._compact_df2t_accepted_kv(fake_self, ib)
+        GPUModelRunner._compact_tree_accepted_kv(fake_self, ib)
 
     # Zero-accepted: num_sampled all <= 1 -> nothing written.
     _run(
@@ -1052,10 +1056,10 @@ def test_model_runner_df2t_compaction_wiring_noop_cases():
         ),
         device=device,
     )
-    ib_no_attrs = _df2t_compaction_ib(num_reqs, [None, None])
+    ib_no_attrs = _tree_compaction_ib(num_reqs, [None, None])
     ib_no_attrs.trees = [
         SimpleNamespace(depths=torch.zeros(4, dtype=torch.long, device=device))
     ] * num_reqs
-    fake_self._df2t_chain_width = GPUModelRunner._df2t_chain_width.__get__(fake_self)
-    GPUModelRunner._compact_df2t_accepted_kv(fake_self, ib_no_attrs)
+    fake_self._tree_chain_width = GPUModelRunner._tree_chain_width.__get__(fake_self)
+    GPUModelRunner._compact_tree_accepted_kv(fake_self, ib_no_attrs)
     assert torch.equal(storage, snapshot)

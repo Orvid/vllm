@@ -16,6 +16,7 @@ hidden. Prefer utility functions defined elsewhere and call them from here,
 instead of embedding feature-specific logic directly.
 """
 
+import dataclasses
 import functools
 import gc
 import time
@@ -41,6 +42,7 @@ from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -160,13 +162,6 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
 )
-from vllm.v1.worker.gpu.spec_decode.df2t.budget import BudgetPolicy
-from vllm.v1.worker.gpu.spec_decode.df2t.compaction import Df2tKVCompaction
-from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import (
-    TreeBatch,
-    TreeDraft,
-)
-from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import TreeVerifier
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
     verify_supports_aux_hidden_states_over_pp,
@@ -176,6 +171,20 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     get_max_chunk_logits,
 )
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.spec_decode.tree.adaptive_width import (
+    TreeWidthController,
+    build_cost_table,
+    default_profile_request_counts,
+)
+from vllm.v1.worker.gpu.spec_decode.tree.budget import BudgetPolicy
+from vllm.v1.worker.gpu.spec_decode.tree.compaction import TreeKVCompaction
+from vllm.v1.worker.gpu.spec_decode.tree.context import TreeVerifyContext
+from vllm.v1.worker.gpu.spec_decode.tree.mixers import TreeRecurrentLayers
+from vllm.v1.worker.gpu.spec_decode.tree.tree_metadata import (
+    TreeBatch,
+    TreeDraft,
+)
+from vllm.v1.worker.gpu.spec_decode.tree.tree_verifier import TreeVerifier
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
@@ -196,7 +205,7 @@ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 logger = init_logger(__name__)
 
 
-def _df2t_ensure_trees_staged(
+def _tree_ensure_staged(
     *,
     use_df2t: bool,
     num_draft_tokens: int,
@@ -206,14 +215,14 @@ def _df2t_ensure_trees_staged(
     """Fail closed when a df2t decode batch schedules drafts without trees.
 
     The sampler dispatch branches on ``input_batch.trees``: a df2t batch whose
-    drafts arrived without any stashed tree (``use_df2t_trees`` False) would
+    drafts arrived without any stashed tree (``use_trees`` False) would
     otherwise fall through to the chain ``RejectionSampler``. DF2T never
     populates ``draft_logits`` on the real tree path, so at T>0 a chain
     rejection is against a meaningless ``q``. A df2t decode batch must always
     carry its trees; a batch that legitimately has none this step is the
     treeless/prefill path, which schedules no drafts (``num_draft_tokens ==
     0``) and takes the sampler path before this guard. The header guard only
-    fires for a TREE-enabled df2t (``use_df2t_tree()``), so chain methods
+    fires for a TREE-enabled df2t (``use_tree()``), so chain methods
     (eagle/dflash, and tree-off df2t) that reject with real draft_logits are
     untouched.
 
@@ -230,7 +239,7 @@ def _df2t_ensure_trees_staged(
         )
 
 
-def _df2t_tree_logprobs(
+def _tree_logprobs(
     processed: torch.Tensor,
     sampled: torch.Tensor,
     num_sampled: torch.Tensor,
@@ -322,7 +331,7 @@ def _df2t_tree_logprobs(
 
 
 @triton.jit
-def _df2t_chain_context_kernel(
+def _tree_chain_context_kernel(
     token_ids_ptr,  # [R, W] int64, row stride ``stride``
     parents_ptr,  # [R, W] int64 (parent arena, -1 = anchor child)
     num_nodes_ptr,  # [R] live node count
@@ -354,7 +363,7 @@ def _df2t_chain_context_kernel(
         u = tl.load(parents_ptr + r * stride + u)
 
 
-def _df2t_chain_context(
+def _tree_chain_context(
     trees: "list[TreeDraft | None]",
     cu_np: list[int],
     b_max: int,
@@ -422,7 +431,7 @@ def _df2t_chain_context(
     if cu is None:
         cu = async_tensor_h2d(np.asarray(cu_np, dtype=np.int64), device=device)
     assert token_ids.stride(0) == parents.stride(0)
-    _df2t_chain_context_kernel[(num_reqs, W)](
+    _tree_chain_context_kernel[(num_reqs, W)](
         token_ids,
         parents,
         num_nodes.contiguous(),
@@ -450,7 +459,7 @@ def _resolve_decode_query_len(
     never the query width. Every other speculative method verifies
     ``num_speculative_steps + num_new_sampled_per_step``.
     """
-    if speculative_config is not None and speculative_config.use_df2t_tree():
+    if speculative_config is not None and speculative_config.use_tree():
         return speculative_config.tree_decode_width
     return num_speculative_steps + num_new_sampled_per_step
 
@@ -617,16 +626,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # (tokens | depths | parents | words | num_nodes, see TreeBuilder),
         # written after each draft and gathered by the next step's
         # prepare_inputs; the host flag marks slots holding a current tree.
-        self._df2t_tree_store: torch.Tensor | None = None
-        self._df2t_tree_valid = np.zeros(self.max_num_reqs, dtype=bool)
+        self._tree_store: torch.Tensor | None = None
+        self._tree_step_attn_metadata: Any = None
+        self._tree_valid = np.zeros(self.max_num_reqs, dtype=bool)
         # Persistent CUDA-graph aux pools for the FA4 tree mask (ancestor
         # words ``[max_num_reqs, max_tree_budget]`` int64 and per-request
         # anchor-length ``[max_num_reqs]`` int32). The captured tree-verify
         # graph reads these at fixed addresses, so each step's values are
         # written in place (``fill_tree_mask_inputs``) between replays.
-        self._df2t_tree_mask_words: torch.Tensor | None = None
-        self._df2t_tree_mask_c: torch.Tensor | None = None
-        self._df2t_tree_mask_depths: torch.Tensor | None = None
+        self._tree_mask_words: torch.Tensor | None = None
+        self._tree_mask_c: torch.Tensor | None = None
+        self._tree_mask_depths: torch.Tensor | None = None
         # Set by the kernel-warmup path (gpu/warmup.py) for the duration of its
         # mock prefill/decode steps: those schedule draft tokens without any
         # stashed df2t tree, so df2t guards that would otherwise fire on a real
@@ -653,12 +663,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # sibling of RejectionSampler with the same output contract.
         self.tree_verifier: TreeVerifier | None = None
         # df2t accepted-KV compactor and its memory-profiling reservation (see
-        # ``_reserve_df2t_compaction`` / ``_init_df2t_compaction``). The
+        # ``_reserve_tree_compaction`` / ``_init_tree_compaction``). The
         # reservation is allocated during the profiling phase so the compactor
         # buffers are inside the GPU reservation; the compactor itself reuses
         # that storage once the real KV caches exist.
-        self._df2t_compaction: Df2tKVCompaction | None = None
-        self._df2t_compaction_storage: torch.Tensor | None = None
+        self._tree_compaction: TreeKVCompaction | None = None
+        self._tree_compaction_storage: torch.Tensor | None = None
         self.batch_sharder: BatchSharder | None = None
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
@@ -696,10 +706,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         exceed the drafter block depth); other speculative methods carry
         ``num_speculative_steps``.
         """
-        if (
-            self.speculative_config is not None
-            and self.speculative_config.use_df2t_tree()
-        ):
+        if self.speculative_config is not None and self.speculative_config.use_tree():
             return self.speculative_config.num_draft_rows_per_req
         return self.num_speculative_steps
 
@@ -770,6 +777,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.num_speculative_steps,
             self.model_state.num_new_sampled_tokens_per_step,
         )
+        # Adaptive df2t verify width (``adaptive_tree_width``): the uniform
+        # decode query lengths a step may run at, and the width chooser.
+        self._tree_width_ctl: TreeWidthController | None = None
+        self._decode_query_lens = {self.decode_query_len}
+        spec = self.speculative_config
+        if spec is not None and spec.use_tree() and spec.adaptive_tree_width:
+            ladder = spec.tree_verify_width_ladder
+            self._decode_query_lens = {1 + w for w in ladder}
+            if len(ladder) > 1:
+                self._tree_width_ctl = TreeWidthController(
+                    ladder, self.max_num_reqs, self.device
+                )
+        # Tree verification: the verify batch's per-row tree structure, and
+        # the target's stateful mixers, which commit accepted paths themselves.
+        self._tree_ctx: TreeVerifyContext | None = None
+        self._tree_recurrent: TreeRecurrentLayers | None = None
+        if spec is not None and spec.use_tree():
+            assert spec.max_tree_depth is not None
+            self._tree_ctx = TreeVerifyContext(
+                self.max_num_tokens, self.max_num_reqs, spec.max_tree_depth, self.device
+            )
+            draft_layers: set[str] = getattr(
+                self.speculator, "draft_attn_layer_names", set()
+            )
+            recurrent = {
+                name: layer
+                for name, layer in (
+                    self.compilation_config.static_forward_context.items()
+                )
+                if isinstance(layer, MambaBase) and name not in draft_layers
+            }
+            if recurrent:
+                self._tree_recurrent = TreeRecurrentLayers(
+                    recurrent,
+                    min(
+                        self.max_num_tokens, self.max_num_reqs * spec.tree_decode_width
+                    ),
+                    self.device,
+                )
 
         if self.parallel_config.enable_batch_sharded_sampling:
             if hasattr(self.model, "compute_logits_local"):
@@ -844,7 +890,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.vllm_config.watermark_config
                     ),
                 )
-                if self.speculative_config.use_df2t_tree():
+                if self.speculative_config.use_tree():
                     # DF2T verifies with tree traversal, not rejection. The
                     # TreeVerifier is sized by the operative df2t node budget
                     # (BudgetPolicy.resolve_nodes_max, clamped to
@@ -1099,6 +1145,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             lora_capture_cases=self.lora_capture_cases,
             varlen_decode=self.adaptive_verification is not None,
             ubatch_runner=self.ubatch_runner,
+            decode_query_lens=(
+                sorted(self._decode_query_lens)
+                if len(self._decode_query_lens) > 1
+                else None
+            ),
         )
         if self.cache_config.kv_sharing_fast_prefill and self.pcp_manager is None:
             self.fast_prefill = FastPrefillHelper(
@@ -1141,9 +1192,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if (
             not is_profiling
             and self.speculative_config is not None
-            and self.speculative_config.use_df2t_tree()
+            and self.speculative_config.use_tree()
         ):
-            self._init_df2t_compaction()
+            self._init_tree_compaction()
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
@@ -1177,6 +1228,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_eplb: bool = False,
         is_profile: bool = False,
         valid_dummy_state_slots: bool = False,
+        uniform_query_len: int | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if skip_attn and not is_profile:
@@ -1186,7 +1238,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Create a dummy scheduler output.
         num_reqs = min(num_tokens, self.max_num_reqs)
-        if uniform_decode:
+        if uniform_query_len is not None:
+            # A uniform decode at a query length other than decode_query_len
+            # (an adaptive df2t verify width).
+            assert num_tokens % uniform_query_len == 0
+            num_reqs = num_tokens // uniform_query_len
+        elif uniform_decode:
             # HACK(lucas): for now since the worker is shared between MRV1 and MRV2,
             # and for spec-decode with MTP we want to make sure the dummy runs use
             # 1+num_speculative_tokens we use max here, this will likely be eventually
@@ -1331,7 +1388,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def profile_run(self) -> None:
-        self._reserve_df2t_compaction()
+        self._reserve_tree_compaction()
         if self.supports_mm_inputs and self.is_first_pp_rank:
             mm_config = self.model_config.multimodal_config
             if mm_config is not None and not mm_config.skip_mm_profiling:
@@ -1386,7 +1443,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
     @torch.inference_mode()
-    def _make_df2t_capture_mask_attach(self) -> Callable[[dict[str, Any]], None]:
+    def _make_tree_capture_mask_attach(self) -> Callable[[dict[str, Any]], None]:
         """Return a hook attaching the FA4 tree mask to captured metadata.
 
         The static df2t path captures its ``1 + B`` uniform tree-verify decode
@@ -1422,18 +1479,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "cudagraph mode or cudagraph_mode=none (eager)."
             )
         width = spec.max_tree_budget
-        self._ensure_df2t_tree_mask_buffers(width)
+        self._ensure_tree_mask_buffers(width)
         # Pre-fill the pools so the captured descriptor sees a valid (treeless)
         # mask; real steps refresh them before replay.
-        assert self._df2t_tree_mask_words is not None
-        assert self._df2t_tree_mask_c is not None
-        assert self._df2t_tree_mask_depths is not None
-        self._df2t_tree_mask_words.zero_()
-        self._df2t_tree_mask_c.zero_()
-        self._df2t_tree_mask_depths.zero_()
+        assert self._tree_mask_words is not None
+        assert self._tree_mask_c is not None
+        assert self._tree_mask_depths is not None
+        self._tree_mask_words.zero_()
+        self._tree_mask_c.zero_()
+        self._tree_mask_depths.zero_()
         # The window is a fixed engine-run property (kv cache group spec), so
         # bake the per-layer window map into the captured attach hook.
-        window_layer = self._df2t_tree_window(self._fa4_tree_verify_layer_names())
+        window_layer = self._tree_window(self._fa4_tree_verify_layer_names())
 
         def attach(attn_metadata: dict[str, Any] | None) -> None:
             # The pools are sized max_num_reqs; a captured descriptor uses at
@@ -1441,16 +1498,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._attach_fa4_tree_mask_impl(
                 attn_metadata,
                 self.max_num_reqs,
-                self._df2t_tree_mask_c,
-                self._df2t_tree_mask_words,
+                self._tree_mask_c,
+                self._tree_mask_words,
                 width,
                 window_layer,
-                self._df2t_tree_mask_depths,
+                self._tree_mask_depths,
             )
 
         return attach
 
-    def _df2t_force_eager(self, uniform_tok_count: int | None) -> bool:
+    def _tree_force_eager(self, uniform_tok_count: int | None) -> bool:
         """Whether a scheduled batch must run eager under df2t CUDA graphs.
 
         df2t captures and replays the target tree-verify decode only as a FULL
@@ -1462,16 +1519,159 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         so only a cudagraph mode that serves mixed batches with FULL graphs
         forces those batches eager.
         """
-        if (
-            self.speculative_config is None
-            or not self.speculative_config.use_df2t_tree()
-        ):
+        if self.speculative_config is None or not self.speculative_config.use_tree():
             return False
         mixed_mode = self.compilation_config.cudagraph_mode.mixed_mode()
         return (
-            uniform_tok_count != self.decode_query_len
+            uniform_tok_count not in self._decode_query_lens
             and mixed_mode == CUDAGraphMode.FULL
         )
+
+    def _tree_trim_verify_width(
+        self, scheduler_output: SchedulerOutput
+    ) -> SchedulerOutput:
+        """Verify only each tree's first ``w`` nodes this step.
+
+        ``w`` comes from the adaptive width controller. Trees are best-first,
+        so any prefix is a valid tree. The scheduler's own output is left
+        untouched: it rolls back the trimmed drafts as rejected ones.
+        Structured-output batches keep the full width, since their grammar
+        bitmask rows were built for every scheduled draft.
+        """
+        ctl = self._tree_width_ctl
+        draft_tokens = scheduler_output.scheduled_spec_decode_tokens
+        if (
+            ctl is None
+            or not draft_tokens
+            or scheduler_output.has_structured_output_requests
+        ):
+            return scheduler_output
+        slots = np.fromiter(
+            map(self.req_states.req_id_to_index.__getitem__, draft_tokens),
+            dtype=np.int64,
+            count=len(draft_tokens),
+        )
+        width = ctl.select(slots)
+        if all(len(drafts) <= width for drafts in draft_tokens.values()):
+            return scheduler_output
+        num_scheduled_tokens = dict(scheduler_output.num_scheduled_tokens)
+        trimmed: dict[str, list[int]] = {}
+        num_cut = 0
+        for req_id, drafts in draft_tokens.items():
+            cut = max(len(drafts) - width, 0)
+            trimmed[req_id] = drafts[:width] if cut else drafts
+            num_scheduled_tokens[req_id] -= cut
+            num_cut += cut
+        return dataclasses.replace(
+            scheduler_output,
+            num_scheduled_tokens=num_scheduled_tokens,
+            scheduled_spec_decode_tokens=trimmed,
+            total_num_scheduled_tokens=(
+                scheduler_output.total_num_scheduled_tokens - num_cut
+            ),
+        )
+
+    @torch.inference_mode()
+    def _profile_tree_width_costs(self, ctl: TreeWidthController) -> None:
+        """Profile a uniform decode step's GPU time per verify width and
+        request count: target verify forward, every verify row's logits and
+        draw, and the drafter.
+
+        Captured graphs are timed by back-to-back replays, so host launch
+        overhead (hidden behind the GPU while serving) stays out of the cost.
+        Shapes without a graph are timed as whole dummy steps.
+        """
+        num_reps = 5
+        # Sample a little past the captured sizes (where steps lose their
+        # graphs); the table extrapolates linearly beyond.
+        max_tokens = min(
+            self.max_num_tokens,
+            2 * (self.compilation_config.max_cudagraph_capture_size or 0),
+        )
+
+        def gpu_ms(fn: Callable[[], Any]) -> float:
+            fn()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(num_reps):
+                fn()
+            end.record()
+            end.synchronize()
+            return start.elapsed_time(end) / num_reps
+
+        def logits_argmax(rows: torch.Tensor) -> torch.Tensor:
+            return self.model.compute_logits(rows).argmax(dim=-1)
+
+        manager = self.cudagraph_manager
+        assert manager is not None
+        draft_ms: dict[int, float] = {}
+        samples: dict[tuple[int, int], float] = {}
+        for width in ctl.widths:
+            query_len = 1 + width
+            context_len = max(
+                0,
+                min(
+                    envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN,
+                    self.max_model_len - query_len - 1,
+                ),
+            )
+            for num_reqs in default_profile_request_counts(self.max_num_reqs):
+                num_tokens = num_reqs * query_len
+                if num_tokens > max_tokens and num_reqs > 1:
+                    break
+                step = functools.partial(
+                    self._dummy_run,
+                    num_tokens,
+                    uniform_query_len=query_len,
+                    context_len=context_len,
+                )
+                hidden_states = step()[0]
+                desc = manager.dispatch(
+                    num_reqs, num_tokens, query_len, num_active_loras=0
+                )
+                if desc.cg_mode != CUDAGraphMode.FULL:
+                    samples[(width, num_reqs)] = gpu_ms(step)
+                    continue
+                if num_reqs not in draft_ms:
+                    draft_ms[num_reqs] = self._profile_draft_graph_ms(num_reqs, gpu_ms)
+                assert hidden_states is not None
+                target_ms = gpu_ms(functools.partial(manager.run_fullgraph, desc))
+                logits_ms = gpu_ms(
+                    functools.partial(logits_argmax, hidden_states[:num_tokens])
+                )
+                logger.debug(
+                    "tree width %d, %d reqs: target %.3f ms, logits %.3f ms, "
+                    "draft %.3f ms",
+                    width,
+                    num_reqs,
+                    target_ms,
+                    logits_ms,
+                    draft_ms[num_reqs],
+                )
+                samples[(width, num_reqs)] = target_ms + logits_ms + draft_ms[num_reqs]
+        ctl.set_cost_table(build_cost_table(samples, ctl.widths, self.max_num_reqs))
+        logger.info(
+            "Adaptive tree verify widths %s, profiled step ms: %s",
+            ctl.widths,
+            {k: round(v, 3) for k, v in sorted(samples.items())},
+        )
+
+    def _profile_draft_graph_ms(
+        self, num_reqs: int, gpu_ms: Callable[[Callable[[], Any]], float]
+    ) -> float:
+        """GPU time of the drafter's FULL graph for ``num_reqs`` (0 if the
+        drafter has no graph at that size)."""
+        manager = getattr(self.speculator, "query_cudagraph_manager", None)
+        if manager is None:
+            return 0.0
+        query_len = self.speculator.num_query_per_req  # type: ignore[union-attr]
+        desc = manager.dispatch(
+            num_reqs, num_reqs * query_len, query_len, num_active_loras=0
+        )
+        if desc.cg_mode != CUDAGraphMode.FULL:
+            return 0.0
+        return gpu_ms(lambda: manager.run_fullgraph(desc))
 
     @torch.inference_mode()
     def capture_model(self, *, profile_only: bool = False) -> int:
@@ -1481,19 +1681,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and self.model_state.encoder_runner.has_cudagraph()
         )
         capture_decoder = self.cudagraph_manager.needs_capture()
-        df2t_capture_mask_attach: Callable[[dict[str, Any]], None] | None = None
+        tree_capture_mask_attach: Callable[[dict[str, Any]], None] | None = None
         if (
             capture_decoder
             and self.speculative_config is not None
-            and (self.speculative_config.use_df2t_tree())
+            and (self.speculative_config.use_tree())
         ):
             # df2t captures its uniform 1+B target tree-verify decode through
             # the V2 uniform FULL-graph machinery, with the FA4 tree mask
             # baked into the captured metadata (see
-            # _make_df2t_capture_mask_attach). Configs the capture cannot yet
+            # _make_tree_capture_mask_attach). Configs the capture cannot yet
             # support (flex, or a cudagraph mode without FULL) fail closed
             # here rather than replaying the tree batch with the wrong mask.
-            df2t_capture_mask_attach = self._make_df2t_capture_mask_attach()
+            tree_capture_mask_attach = self._make_tree_capture_mask_attach()
         if not capture_encoder and not capture_decoder:
             logger.warning(
                 "Skipping encoder and decoder CUDA graph capture. To enable "
@@ -1531,7 +1731,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         lora_capture_hook=create_lora_capture_hook(
                             self.lora_config, self
                         ),
-                        df2t_tree_mask_attach=df2t_capture_mask_attach,
+                        tree_mask_attach=tree_capture_mask_attach,
+                        tree_verify=self._tree_ctx,
                     )
                     if self.speculator is not None:
                         with use_workspace_lane(self._draft_workspace_lane):
@@ -1543,6 +1744,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             ):
                                 self._dummy_run(**batch)
                         self.adaptive_verification.set_initial_cost_curves(timings)
+                    if self._tree_width_ctl is not None and not profile_only:
+                        self._profile_tree_width_costs(self._tree_width_ctl)
                     self.kv_connector.reset_capture_state()
 
             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
@@ -1632,7 +1835,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_index = self.req_states.req_id_to_index[req_id]
             # A reused request-state slot must not serve its previous
             # occupant's drafted tree.
-            self._df2t_tree_valid[req_index] = False
+            self._tree_valid[req_index] = False
+            if self._tree_width_ctl is not None:
+                self._tree_width_ctl.add_request(req_index)
             if self.adaptive_verification is not None:
                 self.adaptive_verification.add_request(req_index)
 
@@ -1822,24 +2027,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_num_logits = async_tensor_h2d(cu_num_logits_np, device=self.device)
             if (
                 self.speculative_config is not None
-                and self.speculative_config.use_df2t_tree()
+                and self.speculative_config.use_tree()
             ):
                 # The trees drafted last step stay on device; each scheduled
                 # request's tree is as wide as its scheduled draft count.
-                tree_batch = self._load_df2t_trees(
+                tree_batch = self._load_trees(
                     req_ids, idx_mapping, idx_mapping_np, num_draft_tokens_per_req
                 )
                 if tree_batch is not None:
                     trees = tree_batch.drafts
-        use_df2t_trees = tree_batch is not None
+        use_trees = tree_batch is not None
 
         # df2t flex/fa4 verify: stage the per-request tree mask inputs (context
         # length C per request, ancestor-or-self words) so execute_model can
         # attach them to the Flex/FA4 metadata after prepare_attn.
-        self._stage_tree_flex_mask(use_df2t_trees, trees, num_reqs, idx_mapping)
-        self._stage_tree_fa4_mask(
-            use_df2t_trees, trees, num_reqs, idx_mapping, tree_batch
-        )
+        self._stage_tree_flex_mask(use_trees, trees, num_reqs, idx_mapping)
+        self._stage_tree_fa4_mask(use_trees, trees, num_reqs, idx_mapping, tree_batch)
 
         # The general branch also serves a no-draft batch with k != 1, and
         # compact_batch's budget is only primed when drafts are scheduled.
@@ -1944,6 +2147,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     else None
                 ),
             )
+            if self._tree_ctx is not None and tree_batch is not None:
+                self._tree_ctx.fill(
+                    query_start_loc, num_reqs, tree_batch.parents, tree_batch.widths
+                )
 
         fast_prefill = None
         if self.fast_prefill is not None:
@@ -2018,7 +2225,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def _stage_tree_flex_mask(
         self,
-        use_df2t_trees: bool,
+        use_trees: bool,
         trees: "list[TreeDraft | None] | None",
         num_reqs: int,
         idx_mapping: torch.Tensor,
@@ -2033,12 +2240,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         spec = self.speculative_config
         self._pending_tree_flex_mask = None
         if not (
-            use_df2t_trees
-            and spec is not None
-            and spec.tree_attention_backend == "flex"
+            use_trees and spec is not None and spec.tree_attention_backend == "flex"
         ):
             return
-        from vllm.v1.worker.gpu.spec_decode.df2t.attention import (
+        from vllm.v1.worker.gpu.spec_decode.tree.attention import (
             pack_tree_mask_inputs,
         )
 
@@ -2051,7 +2256,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         # Per-layer sliding windows (positional-window term of the attached
         # flex mask) and the per-request node depths backing it.
-        window_map = self._df2t_tree_window(self._tree_verify_layer_names())
+        window_map = self._tree_window(self._tree_verify_layer_names())
         depths = None
         if trees is not None:
             depths = torch.zeros(
@@ -2099,7 +2304,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         from vllm.v1.attention.backends.flex_attention import (
             FlexAttentionMetadata,
         )
-        from vllm.v1.worker.gpu.spec_decode.df2t.attention import (
+        from vllm.v1.worker.gpu.spec_decode.tree.attention import (
             attach_tree_flex_mask,
         )
 
@@ -2130,7 +2335,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "for the target (or set tree_attention_backend='fa4')."
             )
 
-    def _ensure_df2t_tree_mask_buffers(self, width: int) -> None:
+    def _ensure_tree_mask_buffers(self, width: int) -> None:
         """Allocate the persistent FA4 tree-mask aux pools (once).
 
         ``width`` is the target attention mask arena width (``max_tree_budget``).
@@ -2140,33 +2345,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         allocated for every run so the aux-array addresses a captured windowed
         graph bakes stay stable.
         """
-        if self._df2t_tree_mask_words is not None:
+        if self._tree_mask_words is not None:
             return
-        self._df2t_tree_mask_words = torch.zeros(
+        self._tree_mask_words = torch.zeros(
             self.max_num_reqs, width, dtype=torch.long, device=self.device
         )
-        self._df2t_tree_mask_c = torch.zeros(
+        self._tree_mask_c = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
-        self._df2t_tree_mask_depths = torch.zeros(
+        self._tree_mask_depths = torch.zeros(
             self.max_num_reqs, width, dtype=torch.int32, device=self.device
         )
 
-    def _store_df2t_trees(
-        self, input_batch: InputBatch, tree_packed: torch.Tensor
-    ) -> None:
+    def _store_trees(self, input_batch: InputBatch, tree_packed: torch.Tensor) -> None:
         """Keep this step's drafted trees on device, per request state."""
-        if self._df2t_tree_store is None:
-            self._df2t_tree_store = torch.zeros(
+        if self._tree_store is None:
+            self._tree_store = torch.zeros(
                 self.max_num_reqs,
                 tree_packed.shape[1],
                 dtype=tree_packed.dtype,
                 device=self.device,
             )
-        self._df2t_tree_store[input_batch.idx_mapping] = tree_packed
-        self._df2t_tree_valid[input_batch.idx_mapping_np] = True
+        self._tree_store[input_batch.idx_mapping] = tree_packed
+        self._tree_valid[input_batch.idx_mapping_np] = True
+        if self._tree_width_ctl is not None and not getattr(
+            self, "_kernel_warmup", False
+        ):
+            selector = self.speculator.tree_selector  # type: ignore[union-attr]
+            self._tree_width_ctl.record_trees(
+                input_batch.idx_mapping,
+                input_batch.idx_mapping_np,
+                selector.logp[: input_batch.num_reqs],
+            )
 
-    def _load_df2t_trees(
+    def _load_trees(
         self,
         req_ids: list[str],
         idx_mapping: torch.Tensor,
@@ -2183,25 +2395,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not scheduled.any():
             return None
         if not getattr(self, "_kernel_warmup", False):
-            missing = scheduled & ~self._df2t_tree_valid[idx_mapping_np]
+            missing = scheduled & ~self._tree_valid[idx_mapping_np]
             if missing.any():
                 raise RuntimeError(
                     "df2t decode batch scheduled draft tokens for requests "
                     f"{[r for r, m in zip(req_ids, missing) if m]} that have no "
                     "drafted tree; refusing to verify drafts without a tree."
                 )
-        assert self._df2t_tree_store is not None or getattr(
-            self, "_kernel_warmup", False
-        )
-        if self._df2t_tree_store is None:
+        assert self._tree_store is not None or getattr(self, "_kernel_warmup", False)
+        if self._tree_store is None:
             return None
         return TreeBatch.from_store(
-            self._df2t_tree_store, idx_mapping, num_draft_tokens_per_req
+            self._tree_store, idx_mapping, num_draft_tokens_per_req
         )
 
     def _stage_tree_fa4_mask(
         self,
-        use_df2t_trees: bool,
+        use_trees: bool,
         trees: "list[TreeDraft | None] | None",
         num_reqs: int,
         idx_mapping: torch.Tensor,
@@ -2219,37 +2429,37 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         spec = self.speculative_config
         self._pending_tree_fa4_mask = None
         if not (
-            use_df2t_trees and spec is not None and spec.tree_attention_backend == "fa4"
+            use_trees and spec is not None and spec.tree_attention_backend == "fa4"
         ):
             return
-        from vllm.v1.worker.gpu.spec_decode.df2t.attention import (
+        from vllm.v1.worker.gpu.spec_decode.tree.attention import (
             fill_tree_mask_inputs,
             fill_tree_mask_inputs_batched,
         )
 
         width = spec.max_tree_budget
-        self._ensure_df2t_tree_mask_buffers(width)
-        assert self._df2t_tree_mask_words is not None
-        assert self._df2t_tree_mask_c is not None
-        assert self._df2t_tree_mask_depths is not None
+        self._ensure_tree_mask_buffers(width)
+        assert self._tree_mask_words is not None
+        assert self._tree_mask_c is not None
+        assert self._tree_mask_depths is not None
         if tree_batch is not None:
             fill_tree_mask_inputs_batched(
-                self._df2t_tree_mask_words,
-                self._df2t_tree_mask_c,
-                self._df2t_tree_mask_depths,
+                self._tree_mask_words,
+                self._tree_mask_c,
+                self._tree_mask_depths,
                 tree_batch,
                 self.req_states.num_computed_tokens.gpu,
                 idx_mapping,
             )
         else:
             fill_tree_mask_inputs(
-                self._df2t_tree_mask_words,
-                self._df2t_tree_mask_c,
+                self._tree_mask_words,
+                self._tree_mask_c,
                 trees,
                 num_reqs,
                 width,
                 self.req_states.num_computed_tokens.gpu[idx_mapping],
-                depths_out=self._df2t_tree_mask_depths,
+                depths_out=self._tree_mask_depths,
             )
         # The whole persistent pool is handed to build_fa4_tree_mask (its
         # asserts accept >= num_reqs rows); only rows < num_reqs hold live
@@ -2259,14 +2469,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # stable across replays.
         self._pending_tree_fa4_mask = (
             num_reqs,
-            self._df2t_tree_mask_c,
-            self._df2t_tree_mask_words,
+            self._tree_mask_c,
+            self._tree_mask_words,
             spec.max_tree_budget,
-            self._df2t_tree_window(self._fa4_tree_verify_layer_names()),
-            self._df2t_tree_mask_depths,
+            self._tree_window(self._fa4_tree_verify_layer_names()),
+            self._tree_mask_depths,
         )
 
-    def _df2t_tree_window(self, target_layers: set[str]) -> dict[str, int | None]:
+    def _tree_window(self, target_layers: set[str]) -> dict[str, int | None]:
         """Per-layer sliding window for the tree-verify layers.
 
         Maps each tree-verify layer name to its KV cache group's sliding window
@@ -2375,7 +2585,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         from vllm.v1.attention.backends.flash_attn import (
             FlashAttentionMetadata,
         )
-        from vllm.v1.worker.gpu.spec_decode.df2t.attention import (
+        from vllm.v1.worker.gpu.spec_decode.tree.attention import (
             build_fa4_tree_mask,
         )
 
@@ -2396,7 +2606,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if window_layer is None:
             window_layer = {layer: None for layer in target_layers}
         if depths is None:
-            depths = getattr(self, "_df2t_tree_mask_depths", None)
+            depths = getattr(self, "_tree_mask_depths", None)
 
         masks: dict[int | None, tuple[Any, list[torch.Tensor]]] = {}
 
@@ -2418,8 +2628,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 continue
             seen_metadata.add(id(metadata))
             mask_mod, aux = mask_for(window_layer.get(layer_name))
-            metadata.df2t_tree_mask_mod = mask_mod
-            metadata.df2t_tree_aux_tensors = aux
+            metadata.tree_mask_mod = mask_mod
+            metadata.tree_aux_tensors = aux
             attached = True
         if not attached:
             raise ValueError(
@@ -2525,16 +2735,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # verifier reads only the target logits rows, never any drafter
             # probability buffer.
             assert self.speculative_config is not None
-            assert self.speculative_config.use_df2t_tree()
+            assert self.speculative_config.use_tree()
             assert self.tree_verifier is not None
-            sampler_output = self._df2t_tree_verify(logits, input_batch)
+            sampler_output = self._tree_verify(logits, input_batch)
         else:
             # Rejection sampling for spec decoding. A df2t batch must always
             # carry its tree: drafts without a stashed tree would reject
             # against meaningless draft_logits (df2t never writes them).
             assert self.speculative_config is not None
-            _df2t_ensure_trees_staged(
-                use_df2t=self.speculative_config.use_df2t_tree(),
+            _tree_ensure_staged(
+                use_df2t=self.speculative_config.use_tree(),
                 num_draft_tokens=input_batch.num_draft_tokens,
                 trees_staged=input_batch.trees is not None,
                 in_kernel_warmup=getattr(self, "_kernel_warmup", False),
@@ -2572,7 +2782,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert sampler_output is not None
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
 
-    def _df2t_chain_width(self) -> int:
+    def _tree_chain_width(self) -> int:
         """Real accepted-chain width: ``min(nodes_max, max_tree_depth)``.
 
         An accepted chain follows tree depth, so it can never be longer than
@@ -2592,26 +2802,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         nodes_max = BudgetPolicy.from_config(spec).resolve_nodes_max()
         return min(nodes_max, spec.max_tree_depth)
 
-    def _reserve_df2t_compaction(self) -> None:
+    def _reserve_tree_compaction(self) -> None:
         """Reserve the df2t compaction buffers inside the memory-profiling pass.
 
-        ``Df2tKVCompaction`` holds a persistent plan + scratch whose size is
+        ``TreeKVCompaction`` holds a persistent plan + scratch whose size is
         bounded only by the tree budget and ``max_num_reqs``; created lazily on
         the first accepted step it would OOM a high-utilization deployment
         (memory profiling never saw it). This allocates exactly
-        :meth:`Df2tKVCompaction.reserved_bytes` right inside ``profile_run``
+        :meth:`TreeKVCompaction.reserved_bytes` right inside ``profile_run``
         (which runs inside ``memory_profiling``), so the reservation becomes
         part of the profiled non-KV memory and the KV cache is shrunk
         accordingly. The real compactor reuses this storage (see
-        ``_init_df2t_compaction``), so no post-profile allocation ever happens.
+        ``_init_tree_compaction``), so no post-profile allocation ever happens.
         Sizing comes from the KV cache group specs (no KV tensors exist yet),
-        mirrored exactly by :meth:`Df2tKVCompaction.__init__`'s view-derived
+        mirrored exactly by :meth:`TreeKVCompaction.__init__`'s view-derived
         layout.
         """
-        if self._df2t_compaction_storage is not None:
+        if self._tree_compaction_storage is not None:
             return
         spec = self.speculative_config
-        if spec is None or not spec.use_df2t_tree():
+        if spec is None or not spec.use_tree():
             return
         from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 
@@ -2619,13 +2829,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config, self.get_kv_cache_spec()
         )
         nodes_max = BudgetPolicy.from_config(spec).resolve_nodes_max()
-        nbytes = Df2tKVCompaction.reserved_bytes(
+        nbytes = TreeKVCompaction.reserved_bytes(
             max_num_reqs=self.max_num_reqs,
             nodes_max=nodes_max,
-            chain_w=self._df2t_chain_width(),
+            chain_w=self._tree_chain_width(),
             kv_cache_groups=kv_cache_groups,
         )
-        self._df2t_compaction_storage = torch.empty(
+        self._tree_compaction_storage = torch.empty(
             nbytes, dtype=torch.uint8, device=self.device
         )
         logger.info(
@@ -2634,27 +2844,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             nbytes / (1 << 20),
         )
 
-    def _init_df2t_compaction(self) -> None:
+    def _init_tree_compaction(self) -> None:
         """Build the accepted-KV compactor once the real KV caches exist.
 
         Runs at the end of ``initialize_kv_cache`` (the real KV cache, not the
         minimal profiling one), carving the persistent buffers out of the
-        profiling-phase reservation (``_df2t_compaction_storage``) so the
+        profiling-phase reservation (``_tree_compaction_storage``) so the
         compactor's GPU footprint is exactly the reserved bytes and serving
         start performs no post-profile allocation.
         """
-        storage = self._df2t_compaction_storage
+        storage = self._tree_compaction_storage
         spec = self.speculative_config
-        assert spec is not None and spec.use_df2t_tree()
+        assert spec is not None and spec.use_tree()
         assert self._kv_cache_views_by_name is not None
         if storage is None:
             raise RuntimeError(
                 "df2t compaction has no profiling-phase reservation: the "
                 "memory-profiling pass must run before the KV cache is built"
             )
-        self._df2t_compaction = Df2tKVCompaction(
+        self._tree_compaction = TreeKVCompaction(
             self.max_num_reqs,
-            self._df2t_chain_width(),
+            self._tree_chain_width(),
             self._kv_cache_views_by_name,
             self.kv_cache_config.kv_cache_groups,
             self.device,
@@ -2662,14 +2872,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             arena_span=BudgetPolicy.from_config(spec).resolve_nodes_max(),
         )
 
-    def _compact_df2t_accepted_kv(self, input_batch: InputBatch) -> None:
+    def _compact_tree_accepted_kv(self, input_batch: InputBatch) -> None:
         """Relocate accepted-tree KV to canonical slots (df2t KV compaction).
 
         The tree verify writes each accepted node's K/V at its scattered
         tree-block slot ``C + 1 + arena`` (Task 6 layout); inference reads
         context by ``position -> slot`` (``C + depth``), so without compaction
         the accepted chain's K/V is unreachable and the next step attends
-        garbage. ``Df2tKVCompaction`` relocates every accepted node's K/V to
+        garbage. ``TreeKVCompaction`` relocates every accepted node's K/V to
         the canonical slot and zeroes the stale scattered slot, in a single
         fixed-shape per-step plan and two launches (gather, then fused
         scatter + stale-zero) covering all requests, groups and layers with no
@@ -2689,25 +2899,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         trees = input_batch.trees
         if not trees:
             return
-        compaction = getattr(self, "_df2t_compaction", None)
+        compaction = getattr(self, "_tree_compaction", None)
         if compaction is None:
             # Defensive only: the real compactor is built inside
             # ``initialize_kv_cache`` from the profiling-phase reservation. If
             # a code path reached compaction without it, that is the exact OOM
             # the reservation prevents.
-            compaction = Df2tKVCompaction(
+            compaction = TreeKVCompaction(
                 max(
                     getattr(self, "max_num_reqs", input_batch.num_reqs),
                     input_batch.num_reqs,
                 ),
-                self._df2t_chain_width(),
+                self._tree_chain_width(),
                 self._kv_cache_views_by_name,
                 self.kv_cache_config.kv_cache_groups,
                 self.device,
-                storage=getattr(self, "_df2t_compaction_storage", None),
+                storage=getattr(self, "_tree_compaction_storage", None),
                 arena_span=verifier.accepted_arenas.shape[1] - 1,
             )
-            self._df2t_compaction = compaction
+            self._tree_compaction = compaction
         block_tables = self.block_tables.gather_block_tables(
             input_batch.idx_mapping,
             num_reqs_padded=input_batch.num_reqs_after_padding,
@@ -2723,7 +2933,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             idx_mapping=input_batch.idx_mapping,
         )
 
-    def _df2t_tree_verify(
+    def _tree_verify(
         self,
         logits: torch.Tensor,
         input_batch: InputBatch,
@@ -2770,7 +2980,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if needs_processing is None or np.any(
             needs_processing[input_batch.idx_mapping_np]
         ):
-            chain_prefix_len, chain_prefix = _df2t_chain_context(
+            chain_prefix_len, chain_prefix = _tree_chain_context(
                 trees,
                 cu,
                 b_max,
@@ -2856,11 +3066,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampled, num_sampled = self.tree_verifier.walk(
             row_tokens, token_ids, parents, num_nodes
         )
-        return self._df2t_finish_verify(
+        if (
+            self._tree_width_ctl is not None
+            and tree_batch is not None
+            and not getattr(self, "_kernel_warmup", False)
+        ):
+            self._tree_width_ctl.observe(
+                input_batch.idx_mapping,
+                num_nodes,
+                self.tree_verifier.accepted_arenas[:num_reqs],
+            )
+        return self._tree_finish_verify(
             logits, processed, input_batch, sampled, num_sampled, cu
         )
 
-    def _df2t_finish_verify(
+    def _tree_finish_verify(
         self,
         logits: torch.Tensor,
         processed: torch.Tensor,
@@ -2889,7 +3109,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         logprobs_tensors = None
         if max_logprobs > NO_LOGPROBS:
             assert self.tree_verifier is not None
-            logprobs_tensors = _df2t_tree_logprobs(
+            logprobs_tensors = _tree_logprobs(
                 processed,
                 sampled,
                 num_sampled,
@@ -2904,7 +3124,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Accepted-tree KV lives at scattered C+1+arena slots; move it to the
         # canonical C+depth slots so the next step's position-addressed attention
         # reads the accepted chain (not garbage).
-        self._compact_df2t_accepted_kv(input_batch)
+        self._compact_tree_accepted_kv(input_batch)
+        if self._tree_recurrent is not None:
+            # Stateful mixers left tree requests' state untouched in the
+            # forward; advance it over each committed path now.
+            assert self._tree_ctx is not None and self.tree_verifier is not None
+            commit = self._tree_ctx.build_commit(
+                self.tree_verifier.accepted_arenas, input_batch.query_start_loc
+            )
+            self._tree_recurrent.commit(commit, self._tree_step_attn_metadata)
         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
         return SamplerOutput(
             sampled_token_ids=sampled,
@@ -2984,6 +3212,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     scheduler_output, empty_output
                 )
 
+        if not dummy_run:
+            scheduler_output = self._tree_trim_verify_width(scheduler_output)
+
         # Get batch descriptor and sync across DP ranks.
         num_reqs = len(scheduler_output.num_scheduled_tokens)
         num_toks = scheduler_output.total_num_scheduled_tokens
@@ -3017,7 +3248,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # a non-uniform (mixed/prefill) batch must run eager rather than
         # dispatch to a PIECEWISE graph, whose query layout is not the verify
         # block the tree mask is defined for.
-        force_eager = self._df2t_force_eager(uniform_tok_count)
+        force_eager = self._tree_force_eager(uniform_tok_count)
 
         batch_desc, dp_sync = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
@@ -3033,7 +3264,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             allow_ubatching=(
                 self.ubatch_runner is not None and not skip_attn_for_dummy_run
             ),
-            uniform_decode=uniform_tok_count == self.decode_query_len,
+            uniform_decode=uniform_tok_count in self._decode_query_lens,
         )
 
         if batch_desc.num_tokens == 0:
@@ -3269,6 +3500,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
+                tree_verify=(
+                    self._tree_ctx if input_batch.tree_batch is not None else None
+                ),
             ):
                 self.kv_connector.pre_forward(**connector_kwargs)
                 if ubatch_state is not None:
@@ -3370,6 +3604,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Last rank: sample tokens
         assert hidden_states is not None
         draft_hidden_states = hidden_states
+        # The tree commit locates each stateful layer's state slots here.
+        self._tree_step_attn_metadata = attn_metadata
         if self.pcp_manager is not None:
             hidden_states, aux_hidden_states, input_batch = (
                 self.pcp_manager.restore_for_sampling(hidden_states, aux_hidden_states)
@@ -3509,7 +3745,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else None
             )
             if tree_packed is not None:
-                self._store_df2t_trees(input_batch, tree_packed)
+                self._store_trees(input_batch, tree_packed)
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
                 self.req_states.draft_tokens[input_batch.idx_mapping],

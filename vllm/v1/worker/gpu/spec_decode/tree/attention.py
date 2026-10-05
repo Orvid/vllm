@@ -23,7 +23,7 @@ from vllm.v1.attention.backends.flex_attention import (
 )
 
 if TYPE_CHECKING:
-    from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import (
+    from vllm.v1.worker.gpu.spec_decode.tree.tree_metadata import (
         TreeBatch,
         TreeDraft,
     )

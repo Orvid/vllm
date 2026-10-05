@@ -10,8 +10,8 @@ per-predecessor orders differ. ``torch.equal`` is the bit-identical gate.
 import pytest
 import torch
 
-from vllm.v1.worker.gpu.spec_decode.df2t.tree_builder import TreeBuilder
-from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import build_tree_naive
+from vllm.v1.worker.gpu.spec_decode.tree.selection.df2t import TreeBuilder
+from vllm.v1.worker.gpu.spec_decode.tree.tree_metadata import build_tree_naive
 
 
 def _raw_inputs(R, L, K, B, seed):

@@ -30,8 +30,8 @@ from vllm.v1.worker.gpu.input_batch import (
 )
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.sample.states import SamplingStates
-from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import TreeBatch, TreeDraft
-from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import TreeVerifier
+from vllm.v1.worker.gpu.spec_decode.tree.tree_metadata import TreeBatch, TreeDraft
+from vllm.v1.worker.gpu.spec_decode.tree.tree_verifier import TreeVerifier
 
 
 def _tree_on(tokens, parents, depths, device) -> TreeDraft:
@@ -139,7 +139,7 @@ class _FakeBlockTables:
 
 
 def _fake_runner(device, tree_verifier, batch_size, vocab):
-    """Minimal runner surface driving ``_df2t_tree_verify`` AND the real
+    """Minimal runner surface driving ``_tree_verify`` AND the real
     accepted-KV compactor (single LBNHC group) so both device paths run under
     the host-sync counter."""
     ss = SamplingStates(batch_size, vocab)
@@ -155,6 +155,8 @@ def _fake_runner(device, tree_verifier, batch_size, vocab):
     block_table = torch.zeros(batch_size, num_blocks, dtype=torch.long, device=device)
     fake = SimpleNamespace(
         tree_verifier=tree_verifier,
+        _tree_width_ctl=None,
+        _tree_recurrent=None,
         sampler=SimpleNamespace(
             sampling_states=ss,
             req_states=SimpleNamespace(
@@ -183,11 +185,11 @@ def _fake_runner(device, tree_verifier, batch_size, vocab):
             )
         ),
     )
-    fake._compact_df2t_accepted_kv = MethodType(
-        GPUModelRunner._compact_df2t_accepted_kv, fake
+    fake._compact_tree_accepted_kv = MethodType(
+        GPUModelRunner._compact_tree_accepted_kv, fake
     )
-    fake._df2t_chain_width = MethodType(GPUModelRunner._df2t_chain_width, fake)
-    fake._df2t_finish_verify = MethodType(GPUModelRunner._df2t_finish_verify, fake)
+    fake._tree_chain_width = MethodType(GPUModelRunner._tree_chain_width, fake)
+    fake._tree_finish_verify = MethodType(GPUModelRunner._tree_finish_verify, fake)
     return fake
 
 
@@ -198,7 +200,7 @@ def test_df2t_per_step_verify_path_is_host_sync_free(uniform):
     verifier-output assembly) makes no CUDA scalar reads or synchronize calls.
 
     The runtime path this exercises is exactly what a decode step runs
-    (`make_input_batch`'s ``prepare_tree_inputs`` and ``_df2t_tree_verify``);
+    (`make_input_batch`'s ``prepare_tree_inputs`` and ``_tree_verify``);
     the instrumentation fail-closes if any ``.item()``/``.tolist()`` on a CUDA
     tensor, an explicit synchronize, or any other synchronizing CUDA op (e.g. a
     blocking scalar host->device write) reappears on that path. ``uniform``
@@ -279,7 +281,7 @@ def test_df2t_per_step_verify_path_is_host_sync_free(uniform):
         )
         ib.trees = tree_batch.drafts
         ib.tree_batch = tree_batch
-        return GPUModelRunner._df2t_tree_verify(fake, logits, ib)
+        return GPUModelRunner._tree_verify(fake, logits, ib)
 
     # One warm-up step builds the compactor (a one-time init), so the counted
     # step below is the steady-state per-step path.
@@ -309,7 +311,7 @@ def test_df2t_per_step_verify_path_is_host_sync_free(uniform):
     # The accepted-KV compactor's device path actually ran under the counter
     # (built by the fallback; not skipped for lack of KV views), so its
     # host-sync-freeness is part of this contract.
-    assert getattr(fake, "_df2t_compaction", None) is not None
+    assert getattr(fake, "_tree_compaction", None) is not None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

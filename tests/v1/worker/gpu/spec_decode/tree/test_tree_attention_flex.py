@@ -41,7 +41,7 @@ from vllm.v1.attention.backends.flex_attention import (
     FlexAttentionMetadataBuilder,
 )
 from vllm.v1.kv_cache_interface import KVCacheLayout
-from vllm.v1.worker.gpu.spec_decode.df2t.attention import (
+from vllm.v1.worker.gpu.spec_decode.tree.attention import (
     attach_tree_flex_mask,
     build_flex_tree_mask,
 )
@@ -559,7 +559,7 @@ def _fake_runner(spec, req_states, device, attn_groups, kv_cache_config=None):
     for name in (
         "_stage_tree_flex_mask",
         "_tree_verify_layer_names",
-        "_df2t_tree_window",
+        "_tree_window",
         "_attach_tree_flex_mask",
     ):
         setattr(runner, name, types.MethodType(getattr(GPUModelRunner, name), runner))
@@ -749,7 +749,7 @@ def test_df2t_flex_selector_forces_flex_backend(qwen3_config_path):
     def spec_obj(tree_attention_backend):
         return SimpleNamespace(
             use_df2t=lambda: True,
-            use_df2t_tree=lambda: True,
+            use_tree=lambda: True,
             tree_attention_backend=tree_attention_backend,
             enable_adaptive_verification=False,
             num_speculative_tokens=0,

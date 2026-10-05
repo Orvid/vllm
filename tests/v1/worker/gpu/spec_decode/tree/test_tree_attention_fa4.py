@@ -42,7 +42,7 @@ from vllm.config import set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionType
-from vllm.v1.worker.gpu.spec_decode.df2t.attention import (
+from vllm.v1.worker.gpu.spec_decode.tree.attention import (
     build_fa4_tree_mask,
     build_flex_tree_mask,
     pack_tree_mask_inputs,
@@ -239,9 +239,10 @@ def _df2t_spec_config():
     import types
 
     return types.SimpleNamespace(
-        method="df2t",
+        method="dflash",
+        tree_selection="df2t",
         use_df2t=lambda: True,
-        use_df2t_tree=lambda: True,
+        use_tree=lambda: True,
         max_tree_budget=64,
         tree_attention_backend="fa4",
         num_speculative_tokens=5,
@@ -1239,8 +1240,8 @@ def test_fa4_tree_mask_gates_attention(qwen3_config_path):
         )
         attn_metadata = builder.build(common_prefix_len=0, common_attn_metadata=common)
         mask_mod, aux = build_fa4_tree_mask(num_reqs, c_per_req, words, max_b)
-        attn_metadata.df2t_tree_mask_mod = mask_mod
-        attn_metadata.df2t_tree_aux_tensors = aux
+        attn_metadata.tree_mask_mod = mask_mod
+        attn_metadata.tree_aux_tensors = aux
         impl = FlashAttentionImpl(
             num_heads=num_heads,
             head_size=head_size,
@@ -1266,11 +1267,11 @@ def test_fa4_tree_mask_gates_attention(qwen3_config_path):
 
 def test_df2t_mask_composition_guard_rswa_mm_prefix_fail_closed():
     """The df2t tree mask must never be silently dropped by the FA4 commit
-    kernel's ``rswa_mask_mod_fn or mm_mask_mod or df2t_tree_mask_mod`` dispatch:
+    kernel's ``rswa_mask_mod_fn or mm_mask_mod or tree_mask_mod`` dispatch:
     a tree metadata carrying R-SWA or mm-prefix state fails closed with a clear
     error, while a plain tree metadata passes."""
     from vllm.v1.attention.backends.flash_attn import (
-        _df2t_tree_mask_composition_guard,
+        _tree_mask_composition_guard,
     )
 
     mask_mod, aux = build_fa4_tree_mask(
@@ -1283,34 +1284,34 @@ def test_df2t_mask_composition_guard_rswa_mm_prefix_fail_closed():
     )
 
     plain = _fake_fa4_metadata()
-    plain.df2t_tree_mask_mod = mask_mod
-    plain.df2t_tree_aux_tensors = aux
-    _df2t_tree_mask_composition_guard(plain)  # no conflict
+    plain.tree_mask_mod = mask_mod
+    plain.tree_aux_tensors = aux
+    _tree_mask_composition_guard(plain)  # no conflict
 
     rswa = _fake_fa4_metadata()
-    rswa.df2t_tree_mask_mod = mask_mod
-    rswa.df2t_tree_aux_tensors = aux
+    rswa.tree_mask_mod = mask_mod
+    rswa.tree_aux_tensors = aux
     rswa.rswa_prefix_lens = torch.tensor([4], dtype=torch.int32)
     with pytest.raises(RuntimeError, match="R-SWA"):
-        _df2t_tree_mask_composition_guard(rswa)
+        _tree_mask_composition_guard(rswa)
 
     mm = _fake_fa4_metadata()
-    mm.df2t_tree_mask_mod = mask_mod
-    mm.df2t_tree_aux_tensors = aux
+    mm.tree_mask_mod = mask_mod
+    mm.tree_aux_tensors = aux
     mm.mm_prefix_query_range_tensor = torch.tensor([[0, 10]], dtype=torch.int32)
     with pytest.raises(RuntimeError, match="mm-prefix"):
-        _df2t_tree_mask_composition_guard(mm)
+        _tree_mask_composition_guard(mm)
 
     bare = _fake_fa4_metadata()
-    _df2t_tree_mask_composition_guard(bare)  # no tree mask, untouched
+    _tree_mask_composition_guard(bare)  # no tree mask, untouched
 
 
 def _fake_fa4_metadata():
     from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 
     meta = object.__new__(FlashAttentionMetadata)
-    meta.df2t_tree_mask_mod = None
-    meta.df2t_tree_aux_tensors = None
+    meta.tree_mask_mod = None
+    meta.tree_aux_tensors = None
     return meta
 
 
@@ -1361,8 +1362,8 @@ def _fake_runner(spec, req_states, device, attn_groups, kv_cache_config=None):
         max_num_reqs=4,
         _pending_tree_flex_mask=None,
         _pending_tree_fa4_mask=None,
-        _df2t_tree_mask_words=None,
-        _df2t_tree_mask_c=None,
+        _tree_mask_words=None,
+        _tree_mask_c=None,
         attn_groups=attn_groups,
         kv_cache_config=kv_cache_config,
     )
@@ -1370,10 +1371,10 @@ def _fake_runner(spec, req_states, device, attn_groups, kv_cache_config=None):
         "_stage_tree_fa4_mask",
         "_fa4_tree_verify_layer_names",
         "_fa4_tree_page_sizes",
-        "_df2t_tree_window",
+        "_tree_window",
         "_attach_tree_fa4_mask",
         "_attach_fa4_tree_mask_impl",
-        "_ensure_df2t_tree_mask_buffers",
+        "_ensure_tree_mask_buffers",
     ):
         setattr(runner, name, types.MethodType(getattr(GPUModelRunner, name), runner))
     return runner
@@ -1415,16 +1416,16 @@ def test_runner_stage_attach_fa4_tree_mask_windowed():
     )
     runner._stage_tree_fa4_mask(True, trees, 2, idx_mapping)
     assert runner._pending_tree_fa4_mask is not None
-    assert runner._df2t_tree_mask_depths is not None
-    assert runner._df2t_tree_mask_depths[0][:3].tolist() == [0, 1, 2]
-    assert runner._df2t_tree_mask_depths[1][:2].tolist() == [0, 1]
+    assert runner._tree_mask_depths is not None
+    assert runner._tree_mask_depths[0][:3].tolist() == [0, 1, 2]
+    assert runner._tree_mask_depths[1][:2].tolist() == [0, 1]
 
     target_meta = _fake_fa4_metadata()
     runner._attach_tree_fa4_mask(
         {"target.attn": target_meta, "target.attn2": target_meta}
     )
-    _, c_per_req, words = target_meta.df2t_tree_aux_tensors[:3]
-    assert len(target_meta.df2t_tree_aux_tensors) == 3
+    _, c_per_req, words = target_meta.tree_aux_tensors[:3]
+    assert len(target_meta.tree_aux_tensors) == 3
     assert c_per_req[:2].tolist() == [4, 2]
 
     non_windowed = _fake_runner(
@@ -1437,7 +1438,7 @@ def test_runner_stage_attach_fa4_tree_mask_windowed():
     non_windowed._stage_tree_fa4_mask(True, trees, 2, idx_mapping)
     other_meta = _fake_fa4_metadata()
     non_windowed._attach_tree_fa4_mask({"target.attn": other_meta})
-    assert len(other_meta.df2t_tree_aux_tensors) == 2
+    assert len(other_meta.tree_aux_tensors) == 2
 
 
 def test_runner_stage_attach_fa4_tree_mask():
@@ -1485,17 +1486,17 @@ def test_runner_stage_attach_fa4_tree_mask():
     other_meta = _fake_fa4_metadata()
     runner._attach_tree_fa4_mask({"target.attn": target_meta, "other.attn": other_meta})
     assert runner._pending_tree_fa4_mask is None
-    assert target_meta.df2t_tree_mask_mod is not None
-    assert target_meta.df2t_tree_aux_tensors is not None
+    assert target_meta.tree_mask_mod is not None
+    assert target_meta.tree_aux_tensors is not None
     # The aux tensors are the persistent pools: only the first num_reqs rows
     # carry live values (rows/cols beyond hold zeros).
-    words, c_per_req = target_meta.df2t_tree_aux_tensors
+    words, c_per_req = target_meta.tree_aux_tensors
     assert words.shape == (4, 64)
     assert c_per_req.shape == (4,)
     assert c_per_req[:2].tolist() == [4, 2]
     assert c_per_req[2:].tolist() == [0, 0]
-    assert other_meta.df2t_tree_mask_mod is None
-    assert other_meta.df2t_tree_aux_tensors is None
+    assert other_meta.tree_mask_mod is None
+    assert other_meta.tree_aux_tensors is None
 
 
 def test_runner_stage_fa4_scopes_zero_context():
@@ -1672,15 +1673,16 @@ def test_runner_df2t_force_eager_only_when_non_uniform(
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
     df2t_spec = type(
-        "Spec", (), {"use_df2t": lambda self: True, "use_df2t_tree": lambda self: True}
+        "Spec", (), {"use_df2t": lambda self: True, "use_tree": lambda self: True}
     )()
     compilation_config = types.SimpleNamespace(cudagraph_mode=cudagraph_mode)
     r = types.SimpleNamespace(
         speculative_config=df2t_spec,
         decode_query_len=16,
+        _decode_query_lens={16},
         compilation_config=compilation_config,
     )
-    _force = GPUModelRunner._df2t_force_eager
+    _force = GPUModelRunner._tree_force_eager
     # Uniform 1+B decode may use the FULL graph.
     assert not _force(r, 16)
     # Non-uniform / mixed / prefill batches.
@@ -1693,9 +1695,10 @@ def test_runner_df2t_force_eager_only_when_non_uniform(
         speculative_config=type(
             "S",
             (),
-            {"use_df2t": lambda self: False, "use_df2t_tree": lambda self: False},
+            {"use_df2t": lambda self: False, "use_tree": lambda self: False},
         )(),
         decode_query_len=16,
+        _decode_query_lens={16},
         compilation_config=compilation_config,
     )
     assert not _force(plain, 1)
@@ -1713,7 +1716,7 @@ def test_runner_df2t_capture_mode_fails_closed():
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
     fa4_spec = type("Spec", (), {"tree_attention_backend": "fa4"})()
-    _make = GPUModelRunner._make_df2t_capture_mask_attach
+    _make = GPUModelRunner._make_tree_capture_mask_attach
     for bad_mode in (None, CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE):
         runner = types.SimpleNamespace(
             speculative_config=fa4_spec,

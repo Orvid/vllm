@@ -15,7 +15,7 @@ import torch
 
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import prepare_tree_inputs
-from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import TreeDraft
+from vllm.v1.worker.gpu.spec_decode.tree.tree_metadata import TreeDraft
 
 
 def _tree(depths: list[int], token_ids: list[int], device: str) -> TreeDraft:

@@ -326,15 +326,14 @@ class StructuredOutputManager:
                 return i + 1
         return 1
 
-    def _is_df2t(self) -> bool:
-        """Whether the operative speculative config drafts df2t TREES.
+    def _is_tree(self) -> bool:
+        """Whether drafts are verified as trees.
 
-        df2t drafts are arena-ordered tree tokens, so the linear-chain grammar
-        checks below must not treat them as a sequence. A tree-off df2t serves
-        the DFlash2 chain and needs no tree-aware grammar.
+        Tree drafts are arena-ordered tree tokens, so the linear-chain grammar
+        checks below must not treat them as a sequence.
         """
         spec_config = getattr(self.vllm_config, "speculative_config", None)
-        return spec_config is not None and spec_config.use_df2t_tree()
+        return spec_config is not None and spec_config.use_tree()
 
     def validate_tokens(self, request: "Request", spec_tokens: list[int]) -> list[int]:
         """Return the longest unconstrained or grammar-valid prefix of `spec_tokens`."""
@@ -342,12 +341,12 @@ class StructuredOutputManager:
             return spec_tokens
 
         spec_tokens = strip_speculative_padding(spec_tokens)
-        # df2t drafts are arena-ordered tree tokens, not a chain: advancing the
+        # tree drafts are arena-ordered tree tokens, not a chain: advancing the
         # grammar through arena order validates siblings as a sequence and can
         # drop valid on-chain tokens past a branch. The tree-aware bitmask
         # enforces the grammar per accepted-chain position, so the chain check
-        # is skipped entirely for df2t (see `grammar_bitmask`).
-        if self._is_df2t():
+        # is skipped entirely for tree verification (see `grammar_bitmask`).
+        if self._is_tree():
             return spec_tokens
 
         constraint_start = self._get_constraint_start(request, spec_tokens)
@@ -447,7 +446,7 @@ class StructuredOutputManager:
                     else None
                 )
                 if tree is not None:
-                    # df2t tree: mask each verify row against the grammar
+                    # tree: mask each verify row against the grammar
                     # advanced through that node's ACCEPTED CHAIN. Row 0 is the
                     # anchor (the current grammar); row ``1 + a`` is node
                     # ``a``'s target row, drawn after the accepted chain of its

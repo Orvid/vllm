@@ -15,7 +15,7 @@ Exact token parity is only a valid oracle in fp32 (in bf16 the target's own
 decoder flips on one-ulp logit ties with batch shape), so the parity runs use
 the fp32 flex vehicle. T=0 removes the RNG from the comparison; T>0
 distribution-parity of the processed rows is pinned at the kernel level in
-``tests/v1/worker/gpu/spec_decode/df2t/test_df2t_tree_sampling.py``.
+``tests/v1/worker/gpu/spec_decode/tree/test_df2t_tree_sampling.py``.
 """
 
 import gc

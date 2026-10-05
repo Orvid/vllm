@@ -50,7 +50,8 @@ def _run_engine(*, tree_budget: int) -> tuple[list[list[int]], list[dict]]:
     from vllm import LLM, SamplingParams
 
     speculative_config = {
-        "method": "df2t",
+        "method": "dflash",
+        "tree_selection": "df2t",
         "model": _DRAFT,
         "num_speculative_tokens": 15,
         "tree_attention_backend": "flex",

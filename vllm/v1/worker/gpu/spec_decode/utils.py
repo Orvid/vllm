@@ -13,7 +13,7 @@ from vllm.v1.worker.gpu.async_utils import async_copy_to_np
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 if TYPE_CHECKING:
-    from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import TreeDraft
+    from vllm.v1.worker.gpu.spec_decode.tree.tree_metadata import TreeDraft
 
 logger = init_logger(__name__)
 

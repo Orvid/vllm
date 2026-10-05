@@ -30,7 +30,7 @@ from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 from vllm.v1.worker.utils import AttentionGroup
 
 if TYPE_CHECKING:
-    from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import TreeVerifier
+    from vllm.v1.worker.gpu.spec_decode.tree.tree_verifier import TreeVerifier
 
 logger = init_logger(__name__)
 
@@ -339,12 +339,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         """Attach the df2t accepted-chain source (runner's TreeVerifier).
 
         Non-df2t speculators keep ``None`` and never build the accepted-chain
-        context; df2t overrides :meth:`_df2t_accepted_arenas` to expose
+        context; df2t overrides :meth:`_tree_accepted_arenas` to expose
         ``verifier.accepted_arenas``.
         """
         self.tree_verifier = verifier
 
-    def _df2t_accepted_arenas(self) -> torch.Tensor | None:
+    def _tree_accepted_arenas(self) -> torch.Tensor | None:
         """The df2t accepted arena per chain depth (``[R, 1 + nodes_max]``,
         ``-1`` = none) for the draft input prep, or None.
 
@@ -433,7 +433,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         assert self.draft_kv_cache_group_id >= 0
         # df2t: the accepted arena per chain depth (None keeps the linear
         # dflash input prep untouched).
-        accepted_arenas = self._df2t_accepted_arenas()
+        accepted_arenas = self._tree_accepted_arenas()
         # Support multiple draft KV cache groups by preparing inputs once for each
         for i, gid in enumerate(self.draft_kv_cache_group_ids):
             prepare_dflash_inputs(
@@ -586,7 +586,7 @@ def _prepare_dflash_inputs_kernel(
     # Block table for slot mapping lookup.
     block_table_ptr,
     block_table_stride,
-    # df2t accepted-chain context (only when USE_DF2T_TREE): the verifier's
+    # df2t accepted-chain context (only when USE_TREE): the verifier's
     # accepted arena per chain depth, [R, 1 + nodes_max] (-1 = none).
     accepted_arenas_ptr,
     accepted_arenas_stride,
@@ -605,7 +605,7 @@ def _prepare_dflash_inputs_kernel(
     CP_SIZE: tl.constexpr,
     CP_INTERLEAVE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    USE_DF2T_TREE: tl.constexpr,
+    USE_TREE: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     block_idx = tl.program_id(1)
@@ -628,7 +628,7 @@ def _prepare_dflash_inputs_kernel(
     j = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     is_ctx = j < num_ctx
 
-    if USE_DF2T_TREE:
+    if USE_TREE:
         # The df2t verify block is in TREE-ARENA order (siblings adjacent), so
         # the accepted chain is NOT the leading rows of the span and a blind
         # "last num_rejected rows were rejected" cut picks the wrong context.
@@ -681,7 +681,7 @@ def _prepare_dflash_inputs_kernel(
         last_valid_pos = tl.load(target_positions_ptr + valid_ctx_end - 1)
 
     ctx_pos_idx = ctx_start + tl.where(is_ctx, j, 0)
-    if not USE_DF2T_TREE:
+    if not USE_TREE:
         is_valid_ctx = j < num_valid_ctx
         ctx_pos = tl.load(
             target_positions_ptr + ctx_pos_idx, mask=is_valid_ctx, other=0
@@ -890,7 +890,7 @@ def prepare_dflash_inputs(
         input_seeds,
         block_table,
         block_table.stride(0),
-        # Never dereferenced when USE_DF2T_TREE is False; a placeholder then.
+        # Never dereferenced when USE_TREE is False; a placeholder then.
         accepted_arenas if accepted_arenas is not None else context_positions,
         accepted_arenas.stride(0) if accepted_arenas is not None else 0,
         parallel_drafting_token_id,
@@ -907,5 +907,5 @@ def prepare_dflash_inputs(
         CP_SIZE=cp_size,
         CP_INTERLEAVE=cp_interleave,
         BLOCK_SIZE=BLOCK_SIZE,
-        USE_DF2T_TREE=use_df2t,
+        USE_TREE=use_df2t,
     )

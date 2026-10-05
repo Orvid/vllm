@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import (
+from vllm.v1.worker.gpu.spec_decode.tree.tree_metadata import (
     TreeDraft,
     build_tree_naive,
 )

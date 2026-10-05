@@ -42,8 +42,10 @@ PROMPTS: dict[str, list[str]] = {
         "Solve for x: 3x + 7 = 22.",
         "What is the sum of the first ten prime numbers?",
         "A rectangle has length 8 and width 5. What is its area?",
-        ("If 5 machines produce 40 items in 4 hours, how many items do "
-         "3 machines produce in 4 hours?"),
+        (
+            "If 5 machines produce 40 items in 4 hours, how many items do "
+            "3 machines produce in 4 hours?"
+        ),
     ],
     "code": [
         "def is_palindrome(s):",
@@ -77,24 +79,29 @@ def load_corpus(n: int, seed: int) -> dict[str, list[str]]:
     rng = random.Random(seed)
     out: dict[str, list[str]] = {}
     try:
-        math = datasets.load_dataset("openai/gsm8k", "main", split="test",
-                                     cache_dir=cache_dir)
-        out["math"] = [row["question"] for row in
-                       rng.sample(list(math), min(n, len(math)))]
+        math = datasets.load_dataset(
+            "openai/gsm8k", "main", split="test", cache_dir=cache_dir
+        )
+        out["math"] = [
+            row["question"] for row in rng.sample(list(math), min(n, len(math)))
+        ]
     except Exception as e:  # noqa: BLE001  (fall back to the hand set)
         print(f"  [corpus] math fallback: {e}")
         out["math"] = PROMPTS["math"]
     try:
-        code = datasets.load_dataset("openai/openai_humaneval", split="test",
-                                     cache_dir=cache_dir)
-        out["code"] = [row["prompt"] for row in
-                       rng.sample(list(code), min(n, len(code)))]
+        code = datasets.load_dataset(
+            "openai/openai_humaneval", split="test", cache_dir=cache_dir
+        )
+        out["code"] = [
+            row["prompt"] for row in rng.sample(list(code), min(n, len(code)))
+        ]
     except Exception as e:  # noqa: BLE001
         print(f"  [corpus] code fallback: {e}")
         out["code"] = PROMPTS["code"]
     try:
-        chat = datasets.load_dataset("Aeala/ShareGPT_Vicuna_unfiltered",
-                                     split="train", cache_dir=cache_dir)
+        chat = datasets.load_dataset(
+            "Aeala/ShareGPT_Vicuna_unfiltered", split="train", cache_dir=cache_dir
+        )
 
         def _first_user(row: dict) -> str:
             conv = row.get("conversations") or []
@@ -103,13 +110,15 @@ def load_corpus(n: int, seed: int) -> dict[str, list[str]]:
                     return str(turn["value"])[:200]
             return ""
 
-        out["chat"] = [_first_user(row) for row in
-                       rng.sample(list(chat), min(n, len(chat)))]
+        out["chat"] = [
+            _first_user(row) for row in rng.sample(list(chat), min(n, len(chat)))
+        ]
         out["chat"] = [p for p in out["chat"] if p]
     except Exception as e:  # noqa: BLE001
         print(f"  [corpus] chat fallback: {e}")
         out["chat"] = PROMPTS["chat"]
     return out
+
 
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "64"))
 
@@ -125,19 +134,33 @@ def _counters(port: int) -> dict:
             out["draft_tokens"] = float(line.split("} ")[-1])
         elif line.startswith("vllm:spec_decode_num_accepted_tokens_total{"):
             out["accepted"] = float(line.split("} ")[-1])
-        elif line.startswith(
-            "vllm:spec_decode_num_accepted_tokens_per_pos_total{"
-        ) and "position=" in line:
+        elif (
+            line.startswith("vllm:spec_decode_num_accepted_tokens_per_pos_total{")
+            and "position=" in line
+        ):
             pos = line.split('position="')[1].split('"')[0]
             out[f"pos_{pos}"] = float(line.split("} ")[-1])
     return out
 
 
-def _boot(port: int, method: str, tree_budget: int | None, max_tree_depth: int | None,
-          spec_tokens: int = 15, tree_s: float | None = None,
-          eager: bool = True, spec_extra: dict | None = None) -> subprocess.Popen:
-    spec = {"method": method, "model": DRAFT, "num_speculative_tokens": spec_tokens}
+def _boot(
+    port: int,
+    method: str,
+    tree_budget: int | None,
+    max_tree_depth: int | None,
+    spec_tokens: int = 15,
+    tree_s: float | None = None,
+    eager: bool = True,
+    spec_extra: dict | None = None,
+) -> subprocess.Popen:
+    # ``method="df2t"`` here means the dflash drafter with df2t tree selection.
+    spec = {
+        "method": "dflash" if method == "df2t" else method,
+        "model": DRAFT,
+        "num_speculative_tokens": spec_tokens,
+    }
     if method == "df2t":
+        spec["tree_selection"] = "df2t"
         if tree_budget is not None:
             spec["tree_budget"] = tree_budget
         if max_tree_depth is not None:
@@ -147,17 +170,26 @@ def _boot(port: int, method: str, tree_budget: int | None, max_tree_depth: int |
     if spec_extra:
         spec.update(spec_extra)
     cmd = [
-        VENV_PY, "-m", "vllm.entrypoints.openai.api_server",
-        "--model", TARGET,
-        "--speculative-config", json.dumps(spec),
-        "--gpu-memory-utilization", "0.3",
-        "--port", str(port), "--host", "127.0.0.1",
-        "--max-model-len", "512",
+        VENV_PY,
+        "-m",
+        "vllm.entrypoints.openai.api_server",
+        "--model",
+        TARGET,
+        "--speculative-config",
+        json.dumps(spec),
+        "--gpu-memory-utilization",
+        "0.3",
+        "--port",
+        str(port),
+        "--host",
+        "127.0.0.1",
+        "--max-model-len",
+        "512",
     ]
     if eager:
         # Acceptance is call-count based and timing-free, so eager is fine and
         # fastest. The TIMING harness passes eager=False to measure the real
-        # production path (FULL CUDA graphs + the df2t verifier micro-graph).
+        # production path (FULL CUDA graphs).
         cmd.append("--enforce-eager")
     env = dict(os.environ, HF_HOME=HF_HOME, CUDA_VISIBLE_DEVICES="0")
     log_path = f"/tmp/df2t_eval_{method}_{tree_budget or 0}_{max_tree_depth or 0}.log"
@@ -176,15 +208,19 @@ def _boot(port: int, method: str, tree_budget: int | None, max_tree_depth: int |
     proc.terminate()
     raise RuntimeError(f"server failed to start ({method=} {tree_budget=})")
 
+
 def _drive(port: int, prompts: list[str], concurrency: int = 1) -> None:
     import concurrent.futures
 
     def _one(p: str) -> None:
-        body = json.dumps({"model": TARGET, "prompt": p,
-                           "max_tokens": MAX_TOKENS, "temperature": 0.0}).encode()
-        req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/completions",
-                                     data=body,
-                                     headers={"Content-Type": "application/json"})
+        body = json.dumps(
+            {"model": TARGET, "prompt": p, "max_tokens": MAX_TOKENS, "temperature": 0.0}
+        ).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/completions",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
         with urllib.request.urlopen(req, timeout=180) as r:
             r.read()
 
@@ -199,12 +235,17 @@ def _acceptance_metrics(before: dict, after: dict) -> dict:
     ea = (accepted + drafts) / drafts if drafts > 0 else float("nan")
     pos = sorted(int(k[4:]) for k in after if k.startswith("pos_"))
     surv = {
-        d: (after.get(f"pos_{d}", 0) - before.get(f"pos_{d}", 0)) / drafts
-        for d in pos
+        d: (after.get(f"pos_{d}", 0) - before.get(f"pos_{d}", 0)) / drafts for d in pos
     }
     sum_surv = sum(surv.values())
-    return {"drafts": drafts, "draft_tokens": d0("draft_tokens"), "accepted": accepted,
-            "E[A]": ea, "survival": surv, "sum_survival": sum_surv}
+    return {
+        "drafts": drafts,
+        "draft_tokens": d0("draft_tokens"),
+        "accepted": accepted,
+        "E[A]": ea,
+        "survival": surv,
+        "sum_survival": sum_surv,
+    }
 
 
 def _report(port: int, name: str, prompts: list[str], concurrency: int = 1) -> dict:
@@ -225,9 +266,7 @@ def main() -> None:
     torch.cuda.empty_cache()
     port = int(os.environ.get("PORT", "8006"))
     method = (
-        sys.argv[sys.argv.index("--method") + 1]
-        if "--method" in sys.argv
-        else "df2t"
+        sys.argv[sys.argv.index("--method") + 1] if "--method" in sys.argv else "df2t"
     )
     budget = (
         sys.argv[sys.argv.index("--tree-budget") + 1]
@@ -245,30 +284,36 @@ def main() -> None:
     n = int(os.environ.get("CORPUS_N", "40"))
     concurrency = int(os.environ.get("CONCURRENCY", "1"))
     corpus = load_corpus(n, seed)
-    print(f"corpus: { {d: len(p) for d, p in corpus.items()} } "
-          f"(seed={seed}, n_per_domain={n})")
+    print(
+        f"corpus: { {d: len(p) for d, p in corpus.items()} } "
+        f"(seed={seed}, n_per_domain={n})"
+    )
 
-    print(f"=== {method}  tree_budget={budget}  max_tree_depth={depth}  "
-          f"max_tokens={MAX_TOKENS}  (T=0, concurrency={concurrency}) ===")
+    print(
+        f"=== {method}  tree_budget={budget}  max_tree_depth={depth}  "
+        f"max_tokens={MAX_TOKENS}  (T=0, concurrency={concurrency}) ==="
+    )
     proc = _boot(port, method, budget, depth)
     try:
         rows = []
         for domain, plist in corpus.items():
-            rows.append(_report(port, f"{method}/B={budget}/{domain}",
-                                plist, concurrency))
+            rows.append(
+                _report(port, f"{method}/B={budget}/{domain}", plist, concurrency)
+            )
         for row in rows:
             sv = row["survival"]
             tail = ""
             if sv:
                 last = max(sv)
                 tail = (
-                    f"surv0={sv.get(0, 0):.3f}  "
-                    f"last_depth={last}@{sv.get(last, 0):.3f}"
+                    f"surv0={sv.get(0, 0):.3f}  last_depth={last}@{sv.get(last, 0):.3f}"
                 )
             else:
                 tail = "(no per-position counters)"
-            print(f"  {row['name']:<28} drafts={row['drafts']:>6.0f} "
-                  f"E[A]={row['E[A]']:.3f}  sum_surv={row['sum_survival']:.3f}  {tail}")
+            print(
+                f"  {row['name']:<28} drafts={row['drafts']:>6.0f} "
+                f"E[A]={row['E[A]']:.3f}  sum_surv={row['sum_survival']:.3f}  {tail}"
+            )
         # pooled invariant check across domains
         print("  (invariant: sum_d survival_d == E[A] per domain — asserted above)")
     finally:

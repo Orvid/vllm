@@ -189,14 +189,14 @@ def get_attn_backend(
         )
         backend = attention_config.backend_per_kind.get(kind.value, backend)
 
-    # df2t tree verify runs the target verify forward on FlexAttention (the
+    # tree verify runs the target verify forward on FlexAttention (the
     # correctness vehicle the FA4 swap is tested against). Force the plain
     # decoder full-attention layers -- including windowed ones, whose tree mask
     # composes the positional sliding-window term -- to flex; drafters pass
     # their own backend explicitly, and MLA kinds never carry a tree.
     if (
         speculative_config is not None
-        and speculative_config.use_df2t_tree()
+        and speculative_config.use_tree()
         and speculative_config.tree_attention_backend == "flex"
         and not use_mla
         and attn_type == AttentionType.DECODER

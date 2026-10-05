@@ -14,10 +14,10 @@ import importlib.util
 
 import torch
 
-from tests.v1.worker.gpu.spec_decode.df2t.reference_verifier import (
+from tests.v1.worker.gpu.spec_decode.tree.reference_verifier import (
     tree_verify_reference,
 )
-from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import build_tree_naive
+from vllm.v1.worker.gpu.spec_decode.tree.tree_metadata import build_tree_naive
 
 
 def test_reference_verifier_not_in_runtime_package():
@@ -26,7 +26,7 @@ def test_reference_verifier_not_in_runtime_package():
     above is what resolves it."""
     assert (
         importlib.util.find_spec(
-            "vllm.v1.worker.gpu.spec_decode.df2t.reference_verifier"
+            "vllm.v1.worker.gpu.spec_decode.tree.reference_verifier"
         )
         is None
     )

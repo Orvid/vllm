@@ -83,7 +83,8 @@ def _make_vllm_config(model_path: str, enable_confidence_head: bool) -> VllmConf
     )
     vllm_config.model_config.model_arch_config.architectures = ["DFlash2DraftModel"]
     vllm_config.speculative_config = SpeculativeConfig(
-        method="df2t",
+        method="dflash",
+        tree_selection="df2t",
         num_speculative_tokens=15,
         draft_model_config=vllm_config.model_config,
         draft_parallel_config=vllm_config.parallel_config,

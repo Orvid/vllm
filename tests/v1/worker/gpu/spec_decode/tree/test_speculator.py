@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for the DF2T speculator dispatch in ``init_speculator``."""
+"""Tests for tree drafting composed onto a drafter in ``init_speculator``."""
 
 from types import SimpleNamespace
 from typing import Any
@@ -40,9 +40,10 @@ def _fake_draft_model_config() -> SimpleNamespace:
 
 
 def _fake_vllm_config(tree_budget: int | None = None, tree_s: float = 1.0) -> Any:
-    """Minimal config that lets the DF2T speculator ``__init__`` run on CPU."""
+    """Minimal config that lets the tree speculator ``__init__`` run on CPU."""
     speculative_config = SpeculativeConfig(
-        method="df2t",
+        method="dflash",
+        tree_selection="df2t",
         num_speculative_tokens=15,
         draft_model_config=_fake_draft_model_config(),
         tree_budget=tree_budget,
@@ -71,15 +72,19 @@ def _fake_vllm_config(tree_budget: int | None = None, tree_s: float = 1.0) -> An
     )
 
 
-def test_init_speculator_routes_df2t() -> None:
-    from vllm.v1.worker.gpu.spec_decode.df2t.speculator import DF2TSpeculator
+def test_init_speculator_composes_tree_onto_drafter() -> None:
+    from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
+        DFlash2Speculator,
+    )
+    from vllm.v1.worker.gpu.spec_decode.tree.speculator import TreeSpeculatorMixin
 
     spec = init_speculator(_fake_vllm_config(), torch.device("cpu"))
 
-    assert isinstance(spec, DF2TSpeculator)
+    assert isinstance(spec, TreeSpeculatorMixin)
+    assert isinstance(spec, DFlash2Speculator)
     assert spec.num_query_per_req == 1 + 15
     # The drafter forward shape stays num_spec (the block depth)...
-    assert spec.drafter_block_depth == 15
+    assert spec.num_speculative_steps == 15
     # ...but the draft-carry width is the tree budget, so a tree wider than the
     # drafter block depth is expressible.
     assert spec.nodes_max == 64
@@ -101,12 +106,12 @@ def test_generate_draft_builds_tree_and_draft_tokens() -> None:
     """
     from types import SimpleNamespace
 
-    from vllm.v1.worker.gpu.spec_decode.df2t.speculator import DF2TSpeculator
-    from vllm.v1.worker.gpu.spec_decode.df2t.tree_metadata import build_tree_naive
+    from vllm.v1.worker.gpu.spec_decode.tree.speculator import TreeSpeculatorMixin
+    from vllm.v1.worker.gpu.spec_decode.tree.tree_metadata import build_tree_naive
 
     torch.manual_seed(0)
     spec = init_speculator(_fake_vllm_config(), torch.device("cuda"))
-    assert isinstance(spec, DF2TSpeculator)
+    assert isinstance(spec, TreeSpeculatorMixin)
     num_reqs, steps = 3, spec.num_speculative_steps
     K = spec.top_k
     hidden = 64
@@ -169,66 +174,20 @@ def test_generate_draft_builds_tree_and_draft_tokens() -> None:
         assert torch.equal(spec.draft_tokens[r], drafts[r].token_ids[:width])
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_tree_off_serves_dflash_chain_identical() -> None:
-    """``enable_tree=False`` must serve the DFlash2 greedy CHAIN from the same
-    drafter: a DF2TSpeculator with the tree off and a plain DFlash2Speculator
-    produce BIT-IDENTICAL draft_tokens on the same candidate transition scores,
-    and no tree is ever staged. This is the runtime half of the 'tree disabled
-    reproduces DFlash2' invariant."""
-    from types import SimpleNamespace
-
-    from vllm.v1.worker.gpu.spec_decode.df2t.speculator import DF2TSpeculator
+def test_chain_config_builds_the_plain_drafter() -> None:
+    """Without tree selection the same drafter verifies its chain: no tree
+    machinery is composed in and the draft carry is the drafter depth."""
     from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
         DFlash2Speculator,
     )
-
-    torch.manual_seed(7)
-    num_reqs, steps, K, hidden = 3, 15, 3, 64
-
-    def drive(spec, captured) -> None:
-        def fake_run_model(*_a, **_k):
-            return torch.randn(num_reqs * steps, hidden, device="cuda")
-
-        def fake_compute_candidates(h):
-            cand = torch.randint(0, 512, (h.shape[0], K), device="cuda")
-            unary = torch.randn(h.shape[0], K, device="cuda")
-            captured["cand_flat"] = cand
-            return cand, unary
-
-        def fake_score_candidates(cand, unary, hidden):
-            scores = torch.randn(cand.shape[0], cand.shape[1], K, K, device="cuda")
-            captured["scores"] = scores
-            return scores
-
-        spec._run_model = fake_run_model
-        spec.model = SimpleNamespace(compute_candidates=fake_compute_candidates)
-        spec._score_candidates = fake_score_candidates
-        spec.sample_indices[: num_reqs * steps] = torch.arange(
-            num_reqs * steps, device="cuda"
-        )
-        spec._generate_draft(num_reqs, num_reqs * steps, None, None, None)
-        return captured
+    from vllm.v1.worker.gpu.spec_decode.tree.speculator import TreeSpeculatorMixin
 
     cfg = _fake_vllm_config()
-    cfg.speculative_config.enable_tree = False
-    df2t_off = init_speculator(cfg, torch.device("cuda"))
-    assert isinstance(df2t_off, DF2TSpeculator)
-    assert df2t_off.draft_tokens.shape[1] == steps  # chain carry width, not tree
-    assert df2t_off.latest_tree_drafts is None
-    assert df2t_off.get_latest_tree_drafts(num_reqs) is None
-
-    cfg2 = _fake_vllm_config()
-    cfg2.speculative_config.method = "dflash"
-    dflash = init_speculator(cfg2, torch.device("cuda"))
-    assert isinstance(dflash, DFlash2Speculator)
-
-    torch.manual_seed(99)
-    drive(df2t_off, {})
-    torch.manual_seed(99)
-    drive(dflash, {})
-    assert torch.equal(df2t_off.draft_tokens[:num_reqs], dflash.draft_tokens[:num_reqs])
-    assert df2t_off.latest_tree_drafts is None
+    cfg.speculative_config.tree_selection = None
+    spec = init_speculator(cfg, torch.device("cpu"))
+    assert type(spec) is DFlash2Speculator
+    assert not isinstance(spec, TreeSpeculatorMixin)
+    assert spec.draft_tokens.shape[1] == 15
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -239,13 +198,13 @@ def test_generate_draft_budget_below_num_spec_degrades_not_crashes() -> None:
     buffer. With tree_budget=16, tree_s=0.5 -> nodes_max=8 < num_spec=15, the
     build writes an 8-wide chain and the draft carry pads it to the tree-budget
     width."""
-    from vllm.v1.worker.gpu.spec_decode.df2t.speculator import DF2TSpeculator
+    from vllm.v1.worker.gpu.spec_decode.tree.speculator import TreeSpeculatorMixin
 
     torch.manual_seed(0)
     spec = init_speculator(
         _fake_vllm_config(tree_budget=16, tree_s=0.5), torch.device("cuda")
     )
-    assert isinstance(spec, DF2TSpeculator)
+    assert isinstance(spec, TreeSpeculatorMixin)
     assert spec.nodes_max == 8
     assert spec.num_speculative_steps == 15
     assert spec.draft_tokens.shape[1] == spec.nodes_max
@@ -292,11 +251,11 @@ def test_get_latest_tree_drafts_fails_closed_on_over_read() -> None:
     both the eager build (``_generate_draft``) and a replayed drafter graph
     (``_mark_draft_graph_built``) width sources.
     """
-    from vllm.v1.worker.gpu.spec_decode.df2t.speculator import DF2TSpeculator
+    from vllm.v1.worker.gpu.spec_decode.tree.speculator import TreeSpeculatorMixin
 
     torch.manual_seed(0)
     spec = init_speculator(_fake_vllm_config(), torch.device("cuda"))
-    assert isinstance(spec, DF2TSpeculator)
+    assert isinstance(spec, TreeSpeculatorMixin)
     num_reqs, steps = 2, spec.num_speculative_steps
     K = spec.top_k
 
@@ -328,41 +287,3 @@ def test_get_latest_tree_drafts_fails_closed_on_over_read() -> None:
     assert spec._last_built_rows == 1
     with pytest.raises(RuntimeError, match="over-read"):
         spec.get_latest_tree_drafts(num_reqs)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_generate_draft_fails_closed_on_width_below_carry():
-    """A per-request verify width B_i below the full carry width must fail
-    loudly, not silently leave the previous step's branches stale in the
-    drained columns: the scheduler drains ``num_draft_rows_per_req ==
-    nodes_max`` slots unconditionally, so a partial overwrite would carry stale
-    tree nodes into the next verify (the seam the confidence-head per-request
-    width will hit first). The static path asserts width == the carry width."""
-    from vllm.v1.worker.gpu.spec_decode.df2t.speculator import DF2TSpeculator
-
-    torch.manual_seed(0)
-    spec = init_speculator(_fake_vllm_config(), torch.device("cuda"))
-    assert isinstance(spec, DF2TSpeculator)
-    num_reqs, steps = 2, spec.num_speculative_steps
-    K = spec.top_k
-    assert spec.draft_tokens.shape[1] == spec.nodes_max == 64
-
-    spec._run_model = lambda *_a, **_k: torch.randn(num_reqs * steps, 64, device="cuda")
-    spec.model = SimpleNamespace(
-        compute_candidates=lambda h: (
-            torch.randint(0, 512, (h.shape[0], K), device="cuda"),
-            torch.randn(h.shape[0], K, device="cuda"),
-        )
-    )
-    spec._score_candidates = lambda cand, unary, hidden: torch.randn(
-        cand.shape[0], cand.shape[1], K, K, device="cuda"
-    )
-    spec.sample_indices[: num_reqs * steps] = torch.arange(
-        num_reqs * steps, device="cuda"
-    )
-
-    # A narrower per-request width (e.g. a degraded/head budget) below the
-    # carry width must raise at the width guard, never write a partial row.
-    spec.budget = SimpleNamespace(shape=lambda *_: (spec.max_depth, spec.nodes_max - 1))
-    with pytest.raises(AssertionError, match="carry width"):
-        spec._generate_draft(num_reqs, num_reqs * steps, None, None, None)

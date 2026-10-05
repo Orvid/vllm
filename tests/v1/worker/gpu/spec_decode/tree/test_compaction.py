@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.v1.worker.gpu.spec_decode.df2t.compaction import compact_accepted_chain
+from vllm.v1.worker.gpu.spec_decode.tree.compaction import compact_accepted_chain
 
 
 def _make_layer(num_slots, num_heads, head_dim):
@@ -467,13 +467,13 @@ def _old_compact_reference(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_batched_compaction_matches_reference_bit_identical():
-    """``Df2tKVCompaction.compact`` (two fixed-shape all-layer launches) is
+    """``TreeKVCompaction.compact`` (two fixed-shape all-layer launches) is
     bit-identical to the per-(request, group, layer) ``compact_accepted_chain``
     reference on a multi-group / multi-layer LBNHC cache, across randomized
     batches that exercise relocation, the already-canonical skip, and the
     aliasing protection."""
-    from vllm.v1.worker.gpu.spec_decode.df2t.compaction import (
-        Df2tKVCompaction,
+    from vllm.v1.worker.gpu.spec_decode.tree.compaction import (
+        TreeKVCompaction,
     )
 
     R, W = 5, 7
@@ -514,7 +514,7 @@ def test_batched_compaction_matches_reference_bit_identical():
         reference = buf.clone()
         buf.copy_(initial)
         torch.cuda.synchronize()
-        compactor = Df2tKVCompaction(R, W, views, groups, torch.device("cuda"))
+        compactor = TreeKVCompaction(R, W, views, groups, torch.device("cuda"))
         compactor.compact(
             num_sampled,
             accepted_arenas,
@@ -535,8 +535,8 @@ def test_batched_compaction_matches_reference_bit_identical():
 def test_batched_compaction_treeless_requests_untouched():
     """Requests without a tree (or with no accepted chain) must leave their KV
     byte-for-byte untouched even when the batch otherwise compacts."""
-    from vllm.v1.worker.gpu.spec_decode.df2t.compaction import (
-        Df2tKVCompaction,
+    from vllm.v1.worker.gpu.spec_decode.tree.compaction import (
+        TreeKVCompaction,
     )
 
     R, W = 4, 6
@@ -563,7 +563,7 @@ def test_batched_compaction_treeless_requests_untouched():
         None,
         None,
     ]
-    compactor = Df2tKVCompaction(R, W, views, groups, torch.device("cuda"))
+    compactor = TreeKVCompaction(R, W, views, groups, torch.device("cuda"))
     compactor.compact(
         num_sampled,
         accepted_arenas,
@@ -577,21 +577,21 @@ def test_batched_compaction_treeless_requests_untouched():
 
 
 def _force_slab_budget(budget: int):
-    """Context manager overriding Df2tKVCompaction's scratch-budget class attr."""
+    """Context manager overriding TreeKVCompaction's scratch-budget class attr."""
     from contextlib import contextmanager
 
-    from vllm.v1.worker.gpu.spec_decode.df2t.compaction import (
-        Df2tKVCompaction,
+    from vllm.v1.worker.gpu.spec_decode.tree.compaction import (
+        TreeKVCompaction,
     )
 
     @contextmanager
     def _cm():
-        prev = Df2tKVCompaction._ScratchBudgetBytes
-        Df2tKVCompaction._ScratchBudgetBytes = budget
+        prev = TreeKVCompaction._ScratchBudgetBytes
+        TreeKVCompaction._ScratchBudgetBytes = budget
         try:
             yield
         finally:
-            Df2tKVCompaction._ScratchBudgetBytes = prev
+            TreeKVCompaction._ScratchBudgetBytes = prev
 
     return _cm()
 
@@ -606,8 +606,8 @@ def test_batched_compaction_multi_slab_aliasing_at_boundary():
     boundaries, so each aliased pair stays in one slab and the gather ->
     scatter ordering holds; the result must be byte-for-byte the per-request
     reference."""
-    from vllm.v1.worker.gpu.spec_decode.df2t.compaction import (
-        Df2tKVCompaction,
+    from vllm.v1.worker.gpu.spec_decode.tree.compaction import (
+        TreeKVCompaction,
     )
 
     R, W = 24, 4
@@ -682,7 +682,7 @@ def test_batched_compaction_multi_slab_aliasing_at_boundary():
     # L=2, max_el=4, itemsize=4 -> row_bytes=32; budget=26*32 -> raw slab 26
     # (< a=96, multi-slab) and NOT a W-multiple pre-fix.
     with _force_slab_budget(26 * 32):
-        compactor = Df2tKVCompaction(R, W, views, groups, torch.device("cuda"))
+        compactor = TreeKVCompaction(R, W, views, groups, torch.device("cuda"))
         assert compactor._slab < R * W  # the batch really spans slabs
         assert compactor._slab % W == 0  # and tiles at request boundaries
         compactor.compact(
@@ -703,8 +703,8 @@ def test_batched_compaction_multi_slab_random_stress():
     slabs must stay byte-for-byte identical to the per-request reference
     across seeds (relocation, already-canonical, and same-request aliasing
     included)."""
-    from vllm.v1.worker.gpu.spec_decode.df2t.compaction import (
-        Df2tKVCompaction,
+    from vllm.v1.worker.gpu.spec_decode.tree.compaction import (
+        TreeKVCompaction,
     )
 
     R, W = 40, 5
@@ -768,7 +768,7 @@ def test_batched_compaction_multi_slab_random_stress():
         # L=2, max_el=4, itemsize=4 -> row_bytes=32; budget=17*32=544 ->
         # raw slab 17, W-aligned to 15 (multiple of 5) < a=200 (multi-slab).
         with _force_slab_budget(17 * 32):
-            compactor = Df2tKVCompaction(R, W, views, groups, torch.device("cuda"))
+            compactor = TreeKVCompaction(R, W, views, groups, torch.device("cuda"))
             assert compactor._slab < R * W
             assert compactor._slab % W == 0
             compactor.compact(
@@ -785,7 +785,7 @@ def test_batched_compaction_multi_slab_random_stress():
 
 def _spec_groups(group_specs: list[list[tuple[str, int, int]]], block_size: int):
     """``kv_cache_groups`` stand-ins carrying the spec surface
-    ``Df2tKVCompaction.reserved_bytes`` reads, mirroring the fake views the
+    ``TreeKVCompaction.reserved_bytes`` reads, mirroring the fake views the
     tests build (per-group uniform ``num_heads``/``content``, float32)."""
     groups = []
     for grp in group_specs:
@@ -811,8 +811,8 @@ def test_compaction_scratch_sized_precisely_one_shot():
     typical batch the scratch covers the WHOLE max batch in one slab (``_slab
     == max_a``, a single ``(slab, L)`` gather -> scatter pair), and its element
     count equals ``slab * L * max_el``."""
-    from vllm.v1.worker.gpu.spec_decode.df2t.compaction import (
-        Df2tKVCompaction,
+    from vllm.v1.worker.gpu.spec_decode.tree.compaction import (
+        TreeKVCompaction,
     )
 
     R, W = 8, 4
@@ -831,7 +831,7 @@ def test_compaction_scratch_sized_precisely_one_shot():
         )
         for grp in group_specs
     ]
-    compactor = Df2tKVCompaction(R, W, views, groups, torch.device("cuda"))
+    compactor = TreeKVCompaction(R, W, views, groups, torch.device("cuda"))
     max_a = R * W
     assert compactor._slab == max_a
     assert compactor._scratch.numel() == max_a * compactor._L * compactor._max_el
@@ -842,12 +842,12 @@ def test_compaction_scratch_sized_precisely_one_shot():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_compaction_reserved_bytes_matches_actual():
-    """The profiling reservation (:meth:`Df2tKVCompaction.reserved_bytes`,
+    """The profiling reservation (:meth:`TreeKVCompaction.reserved_bytes`,
     computed from KV cache group specs BEFORE any KV tensor exists) must equal
     exactly what :meth:`__init__` carves/allocs for the equivalent views — the
     memory-profiling pass and the runtime compactor can never disagree."""
-    from vllm.v1.worker.gpu.spec_decode.df2t.compaction import (
-        Df2tKVCompaction,
+    from vllm.v1.worker.gpu.spec_decode.tree.compaction import (
+        TreeKVCompaction,
     )
 
     R, W = 16, 5
@@ -866,9 +866,9 @@ def test_compaction_reserved_bytes_matches_actual():
         )
         for grp in group_specs
     ]
-    compactor = Df2tKVCompaction(R, W, views, groups, torch.device("cuda"))
+    compactor = TreeKVCompaction(R, W, views, groups, torch.device("cuda"))
     # The spec-derived reservation (the "before the KV cache exists" number).
-    spec_reserved = Df2tKVCompaction.reserved_bytes(
+    spec_reserved = TreeKVCompaction.reserved_bytes(
         max_num_reqs=R,
         nodes_max=W,
         kv_cache_groups=_spec_groups(group_specs, block_size),
@@ -884,8 +884,8 @@ def test_compaction_storage_carving_bit_identical():
     profiling-phase storage (the serving path) is byte-for-byte identical to
     the per-(request, group, layer) reference, and every carved tensor lives
     inside that storage (zero net GPU memory beyond the reservation)."""
-    from vllm.v1.worker.gpu.spec_decode.df2t.compaction import (
-        Df2tKVCompaction,
+    from vllm.v1.worker.gpu.spec_decode.tree.compaction import (
+        TreeKVCompaction,
     )
 
     R, W = 5, 7
@@ -928,7 +928,7 @@ def test_compaction_storage_carving_bit_identical():
     torch.cuda.synchronize()
 
     storage = torch.empty(
-        Df2tKVCompaction.reserved_bytes(
+        TreeKVCompaction.reserved_bytes(
             max_num_reqs=R,
             nodes_max=W,
             kv_cache_groups=_spec_groups(group_specs, block_size),
@@ -936,7 +936,7 @@ def test_compaction_storage_carving_bit_identical():
         dtype=torch.uint8,
         device=torch.device("cuda"),
     )
-    compactor = Df2tKVCompaction(
+    compactor = TreeKVCompaction(
         R, W, views, groups, torch.device("cuda"), storage=storage
     )
     # Every persistent buffer is a view into the reservation, at its layout
@@ -970,7 +970,7 @@ def test_compaction_storage_carving_bit_identical():
     torch.cuda.synchronize()
     assert torch.equal(buf, reference), "carved compactor diverged from reference"
     with pytest.raises(ValueError, match="reservation is too small"):
-        Df2tKVCompaction(
+        TreeKVCompaction(
             R,
             W,
             views,
@@ -995,8 +995,8 @@ def test_batched_compaction_chain_width_vs_arena_span():
     a chain-width stride (r*W + arena) would read another request's row for
     r >= 1 and misjudge the alias as stale, zeroing relocated KV.
     """
-    from vllm.v1.worker.gpu.spec_decode.df2t.compaction import (
-        Df2tKVCompaction,
+    from vllm.v1.worker.gpu.spec_decode.tree.compaction import (
+        TreeKVCompaction,
     )
 
     R, W, arena_span = 2, 2, 8
@@ -1051,7 +1051,7 @@ def test_batched_compaction_chain_width_vs_arena_span():
     buf.copy_(initial)
     torch.cuda.synchronize()
 
-    compactor = Df2tKVCompaction(
+    compactor = TreeKVCompaction(
         R, W, views, groups, torch.device("cuda"), arena_span=arena_span
     )
     assert compactor._tree_depth.shape == (R, arena_span)
@@ -1068,7 +1068,7 @@ def test_batched_compaction_chain_width_vs_arena_span():
     assert torch.equal(buf, reference), "deep-arena accepted nodes diverged"
     # The reservation must agree with the split sizing.
     assert (
-        Df2tKVCompaction.reserved_bytes(
+        TreeKVCompaction.reserved_bytes(
             max_num_reqs=R,
             nodes_max=arena_span,
             chain_w=W,

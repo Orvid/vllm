@@ -196,6 +196,10 @@ class ForwardContext:
 
     additional_kwargs: dict[str, Any] = field(default_factory=dict)
 
+    # Tree speculative verification: the verify batch's per-row tree
+    # structure (a ``TreeVerifyContext``), or None for a chain/plain batch.
+    tree_verify: Any = None
+
     def __post_init__(self):
         assert self.cudagraph_runtime_mode.is_valid_runtime_mode(), (
             f"Invalid cudagraph runtime mode: {self.cudagraph_runtime_mode}"
@@ -238,6 +242,7 @@ def create_forward_context(
     additional_kwargs: dict[str, Any] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
+    tree_verify: Any = None,
 ):
     if vllm_config.compilation_config.fast_moe_cold_start:
         all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
@@ -256,6 +261,7 @@ def create_forward_context(
         skip_compiled=skip_compiled,
         additional_kwargs=additional_kwargs or {},
         is_padding=is_padding,
+        tree_verify=tree_verify,
     )
 
 
@@ -286,6 +292,7 @@ def set_forward_context(
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
+    tree_verify: Any = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -355,6 +362,7 @@ def set_forward_context(
         additional_kwargs,
         skip_compiled,
         is_padding=is_padding,
+        tree_verify=tree_verify,
     )
 
     try:

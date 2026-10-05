@@ -13,7 +13,7 @@ A chain-depth-d token is drawn from verify row ``0`` at depth 0 and from row
 ``accepted_arenas[r, d] + 1`` for ``d >= 1`` (the last accepted node's target
 row, whose distribution conditions on exactly the accepted-chain prefix of
 length ``d``). The tests run the REAL ``TreeVerifier`` on a synthetic block,
-then check that ``_df2t_tree_logprobs`` reproduces an independent reference:
+then check that ``_tree_logprobs`` reproduces an independent reference:
 the log-softmax of the processed rows at those draw rows, gathered at the
 emitted token, with per-request CSR boundaries in batch order.
 """
@@ -23,8 +23,8 @@ import pytest
 import torch
 
 from vllm.v1.outputs import LogprobsTensors
-from vllm.v1.worker.gpu.model_runner import _df2t_tree_logprobs
-from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import TreeVerifier
+from vllm.v1.worker.gpu.model_runner import _tree_logprobs
+from vllm.v1.worker.gpu.spec_decode.tree.tree_verifier import TreeVerifier
 
 _DEVICES = ["cuda"]
 
@@ -73,7 +73,7 @@ def test_df2t_tree_logprobs_matches_reference(device):
     )[:, 0]
 
     state_np = np.zeros(R, dtype=np.intp)
-    lp = _df2t_tree_logprobs(
+    lp = _tree_logprobs(
         processed,
         sampled,
         num_sampled,
@@ -119,7 +119,7 @@ def test_df2t_tree_logprobs_none_when_unrequested(device):
     acc = verifier.accepted_arenas
     cu_np = np.cumsum([0] + [1 + B] * R)
     assert (
-        _df2t_tree_logprobs(
+        _tree_logprobs(
             processed,
             sampled,
             num_sampled,

@@ -21,8 +21,8 @@ from vllm.utils.hashing import safe_hash
 from vllm.utils.import_utils import LazyLoader, has_arctic_inference
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-# Minimum df2t node budget when no asset-driven bound is configured (matches
-# ``df2t.budget._DEFAULT_FLOOR`` so the config and the runtime agree).
+# Minimum tree node budget when no asset-driven bound is configured (matches
+# ``tree.budget._DEFAULT_FLOOR`` so the config and the runtime agree).
 _DEFAULT_FLOOR = 1
 
 if TYPE_CHECKING:
@@ -72,7 +72,13 @@ MTPModelTypes = Literal[
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
 DSparkModelTypes = Literal["dspark"]
+# Deprecated alias: ``method="df2t"`` is ``method="dflash"`` with
+# ``tree_selection="df2t"``.
 DF2TModelTypes = Literal["df2t"]
+TreeSelectionMethod = Literal["df2t"]
+# Drafter architectures that expose per-position candidates and transition
+# scores for tree selection.
+_TREE_CANDIDATE_DRAFTERS = frozenset({"DFlash2DraftModel", "DF2TDraftModel"})
 EagleModelTypes = Literal[
     "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
 ]
@@ -559,16 +565,18 @@ class SpeculativeConfig:
     """Whether to adaptively size the draft-verification budget from per-request
     confidence. Currently only supported for method="dspark"."""
 
-    # Tree speculative decoding (DF2T).
-    enable_tree: bool = True
-    """Serve the DFlash2 draft as a top-B TREE (``method="df2t"``).
+    # Tree speculative decoding.
+    tree_selection: TreeSelectionMethod | None = None
+    """Verify a draft TREE instead of a chain, and how to select it.
 
-    ``method="df2t"`` + ``enable_tree=True`` builds the prefix tree and
-    verifies it with tree traversal. ``enable_tree=False`` turns the SAME
-    drafter into the DFlash2 greedy CHAIN (``use_df2t_tree()`` is False and
-    every tree-only knob falls back to the dflash chain values), so a single
-    df2t checkpoint can serve either mode. Kept ``True`` by default because
-    tree serving is the df2t path; dedicated df2t tree configs omit it."""
+    The drafter (``method``) proposes candidates per draft position; the
+    selection method turns them into a prefix tree of up to ``tree_budget``
+    nodes, which the target verifies in one forward and walks losslessly.
+    ``None`` verifies the drafter's chain.
+
+    - ``"df2t"``: lazy k-best expansion over the drafter's per-position
+      transition scores, emitting nodes best-first by path probability.
+    """
     tree_budget: int | None = Field(default=None, ge=1)
     """Policy node count B at s=1.0; also the static decode shape 1+B."""
     max_tree_budget: int = Field(default=64, ge=1)
@@ -577,7 +585,7 @@ class SpeculativeConfig:
     Bounded by 64: the ancestor word is a single int64 bitmask per tree node
     (one bit per node arena, ``1 << arena`` in the TreeBuilder), so a budget
     above 64 needs a multi-word ancestor representation that this cut does not
-    implement. ``_validate_df2t`` rejects ``max_tree_budget > 64`` with a clear
+    implement. ``_validate_tree`` rejects ``max_tree_budget > 64`` with a clear
     error rather than overflowing the word at runtime."""
     max_tree_depth: int | None = Field(default=None, ge=1)
     """Tree depth cap; default min(num_speculative_tokens, block_size-1)."""
@@ -590,6 +598,16 @@ class SpeculativeConfig:
     tree_builder_num_warps: Literal[1, 2, 4, 8, 16] = 2
     """Warps per request in the df2t tree-builder kernel. 2 is fastest on an
     RTX 5090 (SM120); other GPUs may prefer a different value."""
+    adaptive_tree_width: bool = False
+    """Adaptive tree verification: each decode step verifies the first ``w``
+    nodes of every request's tree, with ``w`` picked from
+    ``tree_verify_widths`` to maximize expected accepted tokens per unit of
+    profiled step cost. Expected acceptance comes from the trees' node path
+    masses, calibrated online against the verifier's walk."""
+    tree_verify_widths: list[int] | None = None
+    """Candidate verify widths for ``adaptive_tree_width``, each captured as
+    its own uniform decode graph. ``nodes_max`` is always a candidate. Defaults
+    to the powers of two from 4 below ``nodes_max``."""
 
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
@@ -667,7 +685,6 @@ class SpeculativeConfig:
             "extract_hidden_states",
             "dflash",
             "dspark",
-            "df2t",
         )
         factors.append(uses_aux_hidden_states)
 
@@ -692,10 +709,10 @@ class SpeculativeConfig:
                 )
             )
 
-        if self.use_df2t():
+        if self.use_tree():
             factors.append(
                 (
-                    self.enable_tree,
+                    self.tree_selection,
                     self.tree_budget,
                     self.max_tree_budget,
                     self.max_tree_depth,
@@ -1171,6 +1188,15 @@ class SpeculativeConfig:
         # can not be detected, it will be considered as the "draft_model" by
         # default.
 
+        if self.method == "df2t":
+            logger.warning(
+                "method `df2t` is deprecated: df2t is a tree selection method. "
+                "Use method `dflash` with tree_selection `df2t`."
+            )
+            self.method = "dflash"
+            if self.tree_selection is None:
+                self.tree_selection = "df2t"
+
         # infer method from user args
         if self.method is None and SpeculativeConfig._is_custom_proposer_path(
             self.model
@@ -1228,9 +1254,9 @@ class SpeculativeConfig:
                         "method='custom_class' requires 'model' to contain the "
                         "custom proposer module path (e.g., 'my_module.MyProposer')."
                     )
-            elif self.method == "df2t":
-                # The df2t draft_model_config is supplied directly.
-                self._validate_df2t()
+            elif self.use_tree():
+                # The draft_model_config is supplied directly.
+                self._validate_tree()
             else:
                 raise ValueError(
                     "num_speculative_tokens was provided but without speculative model."
@@ -1371,7 +1397,7 @@ class SpeculativeConfig:
                         draft_hf.truncated_vocab_size = target_vocab
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash", "dspark", "df2t"):
+                if self.method in ("eagle", "eagle3", "dflash", "dspark"):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -1514,8 +1540,8 @@ class SpeculativeConfig:
 
                 if self.method in ("dflash", "dspark"):
                     self.parallel_drafting = True
-                elif self.use_df2t():
-                    self._validate_df2t()
+                if self.use_tree():
+                    self._validate_tree()
 
                 if self.num_speculative_tokens is not None and hasattr(
                     self.draft_model_config.hf_config, "num_lookahead_tokens"
@@ -1946,29 +1972,25 @@ class SpeculativeConfig:
         EAGLE3               eagle3        No       0
         P-EAGLE              eagle3        Yes      K - 1
         DFlash               dflash        Yes      K
-        DF2T                 df2t          Yes      max_tree_budget
         DSpark               dspark        Yes      K - 1
         MTP                  mtp           No       0
         N-gram               ngram         No       0
         Draft model          draft_model   No       1
         PARD                 draft_model   Yes      K
+        Any tree             (any)         -        max_tree_budget
         ==================== ============= ======== ================
 
-        DF2T reserves the TREE BUDGET ``max_tree_budget`` draft slots, NOT
-        ``num_speculative_tokens``: the tree can be wider than the drafter
-        block depth (B > L), and buffering to the ceiling is what makes that
-        expressible.
+        Tree verification reserves the tree budget ``max_tree_budget`` draft
+        slots, not ``num_speculative_tokens``: a tree can be wider than the
+        drafter's depth.
         """
         num_draft_tokens = self.num_speculative_tokens
 
-        if self.use_df2t_tree():
-            # DF2T (tree on) verifies a tree of up to max_tree_budget nodes.
+        if self.use_tree():
             return self.max_tree_budget
 
-        if self.use_dflash() or self.use_df2t():
-            # DFlash reserves K slots; a df2t config with the tree OFF serves
-            # the DFlash2 greedy CHAIN from the same drafter, so it keeps the
-            # dflash slot math exactly (never the PARD K-1 beyond it).
+        if self.use_dflash():
+            # DFlash reserves K slots (never the PARD K-1 beyond it).
             return num_draft_tokens
 
         if self.parallel_drafting:
@@ -1988,36 +2010,28 @@ class SpeculativeConfig:
 
     @property
     def tree_lookahead(self) -> int:
-        """DF2T scheduler reservation / KV-arena ceiling: ``1 + max_tree_budget``.
+        """Tree scheduler reservation / KV-arena ceiling: ``1 + max_tree_budget``.
 
-        Every df2t request reserves this many KV slots past its scheduled tokens
-        (the ``num_lookahead_tokens`` the scheduler and warmup read), independent
-        of the drafter block depth and of the per-request verify width. Buffering
-        to the ceiling is what makes a tree wider than ``max_tree_depth``
-        (B > L) expressible. Non-df2t methods return 0 (the base property
-        derives their lookahead from ``num_speculative_tokens``).
+        Every tree request reserves this many KV slots past its scheduled
+        tokens (the ``num_lookahead_tokens`` the scheduler and warmup read),
+        independent of the drafter depth and of the per-request verify width.
+        0 for chain verification (whose lookahead derives from
+        ``num_speculative_tokens``).
         """
-        if not self.use_df2t_tree():
+        if not self.use_tree():
             return 0
         return 1 + self.max_tree_budget
 
     @property
     def tree_decode_width(self) -> int:
-        """DF2T uniform decode-graph width: ``1 + nodes_max``.
+        """Tree uniform decode-graph width: ``1 + nodes_max``.
 
-        The target verify forward runs ``1 + B_i`` rows per tree request; with
-        no confidence head every request verifies the static ``nodes_max``
-        budget, so the uniform graph is ``1 + nodes_max`` (`a static run with a
-        single B still produces the uniform 1+B graph`). ``nodes_max`` itself
-        is the ``s``-scaled ``tree_budget`` clamped to ``[floor, ceiling]`` —
-        this never derives from ``num_speculative_tokens``. The graph may be
-        captured up to ``tree_lookahead``; the ceiling reservation is the
-        separate quantity above.
-
-        Non-df2t methods return 0 (the decode width is ``1 +
-        num_speculative_tokens`` in the base property).
+        The target verify forward runs ``1 + nodes_max`` rows per tree request
+        (``nodes_max`` is the ``s``-scaled ``tree_budget`` clamped to
+        ``[floor, ceiling]``, never derived from ``num_speculative_tokens``).
+        0 for chain verification.
         """
-        if not self.use_df2t_tree():
+        if not self.use_tree():
             return 0
         budget = (
             self.tree_budget if self.tree_budget is not None else self.max_tree_budget
@@ -2030,16 +2044,30 @@ class SpeculativeConfig:
         return 1 + nodes_max
 
     @property
+    def tree_verify_width_ladder(self) -> list[int]:
+        """Ascending tree verify widths a decode step may use.
+
+        Just ``[nodes_max]`` unless ``adaptive_tree_width`` is on. Empty when
+        the tree is disabled.
+        """
+        if not self.use_tree():
+            return []
+        nodes_max = self.tree_decode_width - 1
+        if not self.adaptive_tree_width:
+            return [nodes_max]
+        widths = self.tree_verify_widths
+        if widths is None:
+            widths = [1 << i for i in range(2, 7) if (1 << i) < nodes_max]
+        return sorted({w for w in widths if 1 <= w < nodes_max} | {nodes_max})
+
+    @property
     def num_draft_rows_per_req(self) -> int:
         """Per-request draft rows the scheduler schedules/pads each decode step.
 
-        For df2t this is the static tree width ``nodes_max`` (a tree wider than
-        the drafter block depth is expressible) when the tree is enabled; a
-        df2t config with ``enable_tree=False`` carries the DFlash2 chain width
-        ``num_speculative_tokens``. Every other speculative method carries
-        ``num_speculative_tokens`` too.
+        The static tree width ``nodes_max`` under tree verification (a tree
+        can be wider than the drafter depth), else ``num_speculative_tokens``.
         """
-        if self.use_df2t_tree():
+        if self.use_tree():
             return self.tree_decode_width - 1
         return self.num_speculative_tokens
 
@@ -2075,43 +2103,40 @@ class SpeculativeConfig:
     def use_dspark(self) -> bool:
         return self.method == "dspark"
 
-    def use_df2t(self) -> bool:
-        return self.method == "df2t"
-
-    def use_df2t_tree(self) -> bool:
-        """Whether df2t actually serves the TREE (vs the DFlash2 greedy chain).
-
-        ``method="df2t"`` with ``enable_tree=False`` is the off-switch: the
-        speculator's chain ``_generate_draft`` and every tree-only reservation
-        (draft slots, lookahead, decode width, carry width) fall back to the
-        dflash chain values, so a df2t config can serve either mode from the
-        same drafter. ``use_df2t()`` (the method identity) still routes the
-        speculator selection and the df2t drafter validation.
-        """
-        return self.method == "df2t" and self.enable_tree
+    def use_tree(self) -> bool:
+        """Whether drafts are verified as a tree (``tree_selection``)."""
+        return self.tree_selection is not None
 
     def get_num_draft_tokens(self) -> int:
-        if self.use_df2t_tree() and self.tree_budget is not None:
+        if self.use_tree() and self.tree_budget is not None:
             return int(round(self.tree_s * self.tree_budget))
         return self.num_speculative_tokens
 
-    def _validate_df2t(self) -> None:
-        self.parallel_drafting = True
+    def _validate_tree(self) -> None:
         archs = set(getattr(self.draft_model_config, "architectures", []))
-        if not (archs & {"DF2TDraftModel", "DFlash2DraftModel"}):
+        if self.method != "dflash" or not (archs & _TREE_CANDIDATE_DRAFTERS):
             raise ValueError(
-                "df2t requires a DFlash2DraftModel/DF2TDraftModel drafter; "
-                f"got architectures={sorted(archs)}."
+                "tree verification needs a drafter that proposes per-position "
+                f"candidates ({sorted(_TREE_CANDIDATE_DRAFTERS)} under method "
+                f"'dflash'); got method={self.method!r}, "
+                f"architectures={sorted(archs)}."
             )
+        self.parallel_drafting = True
         if self.num_speculative_tokens is None:
-            raise ValueError("df2t requires num_speculative_tokens")
+            raise ValueError("tree verification requires num_speculative_tokens")
         if self.tree_budget is None:
             self.tree_budget = self.max_tree_budget
         if self.tree_budget > self.max_tree_budget:
             raise ValueError("tree_budget exceeds max_tree_budget")
+        if self.tree_verify_widths is not None and any(
+            w < 1 for w in self.tree_verify_widths
+        ):
+            raise ValueError(
+                f"tree_verify_widths must be positive, got {self.tree_verify_widths}"
+            )
         if self.max_tree_budget > 64:
             raise ValueError(
-                "df2t max_tree_budget must be <= 64: the ancestor word is a "
+                "max_tree_budget must be <= 64: the ancestor word is a "
                 "single int64 per node (one bit per node arena, a tree wider "
                 f"than 64 needs multi-word ancestor words); got "
                 f"max_tree_budget={self.max_tree_budget}. Lower "
@@ -2126,8 +2151,8 @@ class SpeculativeConfig:
         hf_config = getattr(self.draft_model_config, "hf_config", None)
         if hf_config is None:
             raise ValueError(
-                "df2t requires the draft model config to expose an HF config "
-                "(for dflash_config.block_size); got none."
+                "tree verification requires the draft model config to expose an HF "
+                "config (for dflash_config.block_size); got none."
             )
         block_size = getattr(
             getattr(hf_config, "dflash_config", {}), "block_size", None

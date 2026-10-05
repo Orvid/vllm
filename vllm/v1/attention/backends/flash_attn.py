@@ -571,43 +571,43 @@ class FlashAttentionMetadata:
     rswa_window: int | None = None
     rswa_window_tensor: torch.Tensor | None = None
 
-    # df2t tree-verify mask on FA4.  The runner attaches the CuTE-DSL mask_mod
-    # and its aux tensors (ancestor words + per-request C offsets) on df2t
+    # tree-verify mask on FA4.  The runner attaches the CuTE-DSL mask_mod
+    # and its aux tensors (ancestor words + per-request C offsets) on tree
     # verify batches when ``tree_attention_backend == "fa4"``;
     # ``FlashAttentionImpl.forward`` picks them up and applies them exactly
     # like the mm-prefix / R-SWA mask mods (causal + window are suppressed
     # because the tree mask encodes them fully).
-    df2t_tree_mask_mod: Callable | None = None
-    df2t_tree_aux_tensors: list[torch.Tensor] | None = None
+    tree_mask_mod: Callable | None = None
+    tree_aux_tensors: list[torch.Tensor] | None = None
 
 
-def _df2t_tree_mask_composition_guard(attn_metadata: FlashAttentionMetadata) -> None:
-    """Fail closed when the FA4 commit kernel would drop the df2t tree mask.
+def _tree_mask_composition_guard(attn_metadata: FlashAttentionMetadata) -> None:
+    """Fail closed when the FA4 commit kernel would drop the tree mask.
 
     The commit kernel dispatches ``mask_mod = rswa_mask_mod_fn or mm_mask_mod
-    or df2t_tree_mask_mod``, so on an R-SWA or mm-prefix (prefix-LM) layer the
+    or tree_mask_mod``, so on an R-SWA or mm-prefix (prefix-LM) layer the
     tree mask comes *last* and would be silently dropped while causal is
-    already False -- tree siblings would attend each other. df2t does not
+    already False -- tree siblings would attend each other. tree verification does not
     support composing the tree mask with the R-SWA or mm-prefix mask, so raise
     loudly instead of running a verify forward without the tree mask. This is a
-    fail-closed backstop to the config-time rejection (``_validate_df2t_
+    fail-closed backstop to the config-time rejection (``_validate_tree_
     attention``).
     """
-    if getattr(attn_metadata, "df2t_tree_mask_mod", None) is None:
+    if getattr(attn_metadata, "tree_mask_mod", None) is None:
         return
     if getattr(attn_metadata, "rswa_prefix_lens", None) is not None:
         raise RuntimeError(
-            "df2t tree verify is not supported on an R-SWA layer: the FA4 "
+            "tree verify is not supported on an R-SWA layer: the FA4 "
             "kernel dispatches the R-SWA mask before the tree mask, so the "
             "tree mask would be silently dropped while causal is already "
-            "False. Disable R-SWA (rswa_window) for the df2t target."
+            "False. Disable R-SWA (rswa_window) for the tree-verified target."
         )
     if getattr(attn_metadata, "mm_prefix_query_range_tensor", None) is not None:
         raise RuntimeError(
-            "df2t tree verify is not supported on an mm-prefix (prefix-LM) "
+            "tree verify is not supported on an mm-prefix (prefix-LM) "
             "layer: the FA4 kernel dispatches the mm-prefix mask before the "
             "tree mask, so the tree mask would be silently dropped. Disable "
-            "mm-prefix attention for the df2t target."
+            "mm-prefix attention for the tree-verified target."
         )
 
 
@@ -1323,16 +1323,16 @@ class FlashAttentionImpl(AttentionImpl):
             # Profiling run.
             return output.fill_(0)
 
-        # Fail closed: a staged df2t tree mask can only run on FA4. Under
-        # df2t+fa4 the selection already resolves FA4 (fa_utils), but a
+        # Fail closed: a staged tree mask can only run on FA4. Under
+        # tree+fa4 the selection already resolves FA4 (fa_utils), but a
         # silent downgrade (e.g. a head-dim fallback) must never drop the
         # per-query tree mask and run plain causal attention.
         if (
-            getattr(attn_metadata, "df2t_tree_mask_mod", None) is not None
+            getattr(attn_metadata, "tree_mask_mod", None) is not None
             and self.vllm_flash_attn_version != 4
         ):
             raise RuntimeError(
-                "df2t tree-verify mask requires FlashAttention-4, but the "
+                "tree-verify mask requires FlashAttention-4, but the "
                 f"resolved FA version is {self.vllm_flash_attn_version}. "
                 "Use tree_attention_backend='fa4' (default) with FA4 enabled, "
                 "or tree_attention_backend='flex'."
@@ -1491,18 +1491,18 @@ class FlashAttentionImpl(AttentionImpl):
                     # mask_mod fully expresses R-SWA; disable FA's own window.
                     sliding_window_size = None
 
-                # df2t tree verify (FA4): the CuTE-DSL mask_mod encodes the
+                # tree verify (FA4): the CuTE-DSL mask_mod encodes the
                 # ancestor-or-self tree mask (context + anchor + reachable
                 # nodes) plus the positional sliding-window term for windowed
                 # targets, which supersedes FA's causal and window handling.
-                df2t_tree_mask_mod = attn_metadata.df2t_tree_mask_mod
-                df2t_tree_aux = attn_metadata.df2t_tree_aux_tensors
-                if df2t_tree_mask_mod is not None:
+                tree_mask_mod = attn_metadata.tree_mask_mod
+                tree_aux = attn_metadata.tree_aux_tensors
+                if tree_mask_mod is not None:
                     # Fail closed (backstop to the config-time validation):
                     # the commit kernel puts the tree mask LAST, so an R-SWA or
                     # mm-prefix layer would silently drop it while causal is
                     # already False.
-                    _df2t_tree_mask_composition_guard(attn_metadata)
+                    _tree_mask_composition_guard(attn_metadata)
                     causal = False
                     sliding_window_size = None
 
@@ -1551,8 +1551,8 @@ class FlashAttentionImpl(AttentionImpl):
                     dynamic_causal=dynamic_causal,
                     num_splits=num_splits,
                     s_aux=self.sinks,
-                    mask_mod=rswa_mask_mod_fn or mm_mask_mod or df2t_tree_mask_mod,
-                    aux_tensors=rswa_aux or mm_aux or df2t_tree_aux,
+                    mask_mod=rswa_mask_mod_fn or mm_mask_mod or tree_mask_mod,
+                    aux_tensors=rswa_aux or mm_aux or tree_aux,
                 )
                 return output
 

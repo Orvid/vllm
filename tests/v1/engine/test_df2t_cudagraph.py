@@ -42,7 +42,8 @@ def _run(cudagraph_mode: str) -> list[int]:
     llm = LLM(
         model=_TARGET,
         speculative_config={
-            "method": "df2t",
+            "method": "dflash",
+            "tree_selection": "df2t",
             "model": _DRAFT,
             "num_speculative_tokens": 15,
             "tree_attention_backend": "fa4",
@@ -92,7 +93,8 @@ def test_df2t_with_piecewise_only_mode_fails_closed() -> None:
         LLM(
             model=_TARGET,
             speculative_config={
-                "method": "df2t",
+                "method": "dflash",
+                "tree_selection": "df2t",
                 "model": _DRAFT,
                 "num_speculative_tokens": 15,
                 "tree_attention_backend": "fa4",

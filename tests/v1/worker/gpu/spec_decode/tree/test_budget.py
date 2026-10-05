@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm.v1.worker.gpu.spec_decode.df2t.budget import (
+from vllm.v1.worker.gpu.spec_decode.tree.budget import (
     BudgetPolicy,
     resolve_nodes_max,
     shape,
@@ -124,7 +124,8 @@ def test_resolve_nodes_max_agrees_with_config_under_defaults():
     ``get_num_draft_tokens`` under the default knobs, so both consumers see
     the same per-deployment node budget."""
     cfg = SimpleNamespace(
-        method="df2t",
+        method="dflash",
+        tree_selection="df2t",
         tree_s=1.0,
         tree_budget=16,
         nodes_ceiling=64,

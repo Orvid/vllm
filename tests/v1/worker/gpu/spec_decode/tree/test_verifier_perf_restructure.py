@@ -21,10 +21,10 @@ Two guarantees, both bit-identity discriminations on the PRODUCTION device loop
 import pytest
 import torch
 
-from tests.v1.worker.gpu.spec_decode.df2t.reference_verifier import (
+from tests.v1.worker.gpu.spec_decode.tree.reference_verifier import (
     tree_verify_reference,
 )
-from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import TreeVerifier
+from vllm.v1.worker.gpu.spec_decode.tree.tree_verifier import TreeVerifier
 
 
 def _random_trees(num_reqs, B, vocab, seed):
@@ -126,7 +126,7 @@ def test_greedy_fused_walk_bit_identical_to_torch_loop():
     across varied trees (early-stop, full chain, multi-request, small B) and
     must reproduce the reference oracle's emitted stream on every column it
     reads."""
-    from vllm.v1.worker.gpu.spec_decode.df2t.tree_verifier import (
+    from vllm.v1.worker.gpu.spec_decode.tree.tree_verifier import (
         TreeVerifier as TV,
     )
 
