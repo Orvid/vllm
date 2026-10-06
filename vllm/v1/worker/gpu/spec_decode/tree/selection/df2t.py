@@ -65,9 +65,13 @@ def _tree_builder_kernel(
             other=float("-inf"),
         ).to(tl.float32)
         vals = tl.where(pr < K, vals, 0.0)
+        # A NaN score is no candidate (nor is a -inf one: a top-k with fewer
+        # valid entries than K returns sentinel ids there).
+        vals = tl.where(vals == vals, vals, float("-inf"))
         mx = tl.max(vals, axis=1)[:, None]
+        mx = tl.where(mx > float("-inf"), mx, 0.0)
         logp = (vals - mx) - tl.log(tl.sum(tl.exp(vals - mx), axis=1))[:, None]
-        logp = tl.where(ok2, logp, float("-inf"))
+        logp = tl.where(ok2 & (vals > float("-inf")), logp, float("-inf"))
         li = tl.expand_dims(logp, 2)
         lj = tl.expand_dims(logp, 1)
         beats = (lj > li) | ((lj == li) & (jj < ii))
@@ -101,7 +105,9 @@ def _tree_builder_kernel(
     rank = tl.zeros([CAP], dtype=tl.int32)
     prank = tl.zeros([CAP], dtype=tl.int32)
     pa = tl.full([CAP], -1, dtype=tl.int32)
-    valid = first
+    # A frontier entry of zero probability (-inf mass) is never emitted, so a
+    # proposal with fewer than B possible nodes yields a smaller tree.
+    valid = first & (mass > float("-inf"))
     tok_acc = tl.zeros([BP], dtype=tl.int64)
     dep_acc = tl.zeros([BP], dtype=tl.int64)
     par_acc = tl.zeros([BP], dtype=tl.int64)
@@ -111,7 +117,7 @@ def _tree_builder_kernel(
     key_max = 0x7FFFFFFFFFFFFFFF
 
     emit = tl.full((), 0, tl.int32)
-    nvalid = tl.full((), 1, tl.int32)
+    nvalid = tl.sum(valid.to(tl.int32), axis=0)
     nxt = tl.full((), 1, tl.int32)
     while (emit < B) & (nvalid > 0):
         top_mass = tl.max(tl.where(valid, mass, neg_inf), axis=0)
@@ -164,10 +170,10 @@ def _tree_builder_kernel(
         prank = tl.where(new, top_rank, prank)
         pa = tl.where(new, emit, pa)
         path = tl.where(new, top_path * 16, path)
-        valid = valid | new
+        valid = (valid | new) & (mass > neg_inf)
 
         nxt = nxt + has_child.to(tl.int32)
-        nvalid = nvalid - 1 + has_sib.to(tl.int32) + has_child.to(tl.int32)
+        nvalid = tl.sum(valid.to(tl.int32), axis=0)
         emit = emit + 1
 
     # Columns past the live node count are written inert (mask token, depth

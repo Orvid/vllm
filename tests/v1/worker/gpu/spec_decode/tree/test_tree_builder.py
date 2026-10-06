@@ -126,3 +126,19 @@ def test_triton_builder_strides_by_drafter_steps():
         assert torch.equal(out.depths[r, :n].cpu(), ref.depths)
         assert torch.equal(out.parents[r, :n].cpu(), ref.parents)
         assert torch.equal(out.words[r, :n].cpu(), ref.words)
+
+
+def test_triton_builder_never_emits_impossible_candidates():
+    """Candidates scored -inf or NaN (a top-k short of valid entries returns
+    sentinel ids there) are never emitted: the tree just gets smaller."""
+    R, L, K, B = 1, 3, 4, 32
+    sentinel = 2**31 - 1
+    scores, cand = _raw_inputs(R, L, K, B, seed=7)
+    # Two real candidates per position; the others are impossible.
+    scores[..., 2] = float("-inf")
+    scores[..., 3] = float("nan")
+    cand[..., 2:] = sentinel
+    out = TreeBuilder(R, L, K, B, "cuda").build(scores, cand)
+    n = int(out.num_nodes[0])
+    assert n == 2 + 4 + 8  # a full binary tree of depth 3
+    assert (out.token_ids[0, :n] != sentinel).all()
