@@ -84,6 +84,23 @@ def test_select_trades_acceptance_against_cost(narrow_cost, expected):
     assert ctl.select(np.array([0, 1])) == expected
 
 
+def test_measured_step_time_corrects_the_profiled_cost():
+    """The profile claims 0.1 ms steps; real steps take longer. The chosen
+    width's estimate rises with what is measured, which then makes the
+    uncorrected width look cheaper, so it gets tried and corrected too."""
+    ctl = TreeWidthController([2, 4], max_num_reqs=4, device=DEVICE)
+    ctl.set_cost_table(build_cost_table({(2, 1): 0.1, (4, 1): 0.1}, [2, 4], 4))
+    _record(ctl, [0])
+    chosen = set()
+    for _ in range(300):
+        chosen.add(ctl.select(np.array([0])))
+        torch.cuda._sleep(2_000_000)  # about a millisecond of GPU work
+    torch.accelerator.synchronize()
+    ctl.select(np.array([0]))
+    assert chosen == {2, 4}
+    assert (ctl.cost_delta_ms > 0.2).all()
+
+
 def test_new_request_never_reads_previous_occupant_curve():
     ctl = TreeWidthController([2, 4], max_num_reqs=4, device=DEVICE)
     ctl.set_cost_table(build_cost_table({(2, 1): 0.5, (4, 1): 1.0}, [2, 4], 4))

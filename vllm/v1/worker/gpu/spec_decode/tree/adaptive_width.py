@@ -17,13 +17,16 @@ chance that the target agrees all the way down decays with depth. Trimming a
 tree never changes whether a kept node is accepted (the draws along its path
 are the same), so every verified node is an unbiased sample for its bin
 whatever width ran. ``cost`` is profiled at startup on the captured uniform
-decode graphs.
+decode graphs and corrected online per width from the measured GPU time
+between consecutive tree steps, which covers per-step work outside the graphs
+and costs that depend on the data or drift over time.
 
 The host reads the per-request curves one step stale through a pinned ring
 it polls without blocking, so the choice never syncs the async pipeline.
 """
 
 import math
+from collections import deque
 
 import numpy as np
 import torch
@@ -42,6 +45,11 @@ _PRIOR_N = 4.0
 # tracks a drifting workload.
 _DECAY_INTERVAL = 512
 _RING = 4
+# Online step-cost correction: EMA weight per measured step (half-life ~44
+# steps, so it follows drifting costs), and the cap on a measured interval
+# relative to its prediction.
+_COST_ALPHA = 1.0 / 64
+_MAX_STEP_RATIO = 3.0
 
 
 @triton.jit
@@ -177,6 +185,16 @@ class TreeWidthController:
         self._mean_curve: np.ndarray | None = None
         # cost_ms[j, n]: profiled step time verifying widths[j] for n requests.
         self.cost_ms: np.ndarray | None = None
+        # Online correction per width (ms): the startup profile replays graphs
+        # on dummy inputs, so it misses per-step work outside them and costs
+        # that depend on the real data and drift over time (e.g. which MoE
+        # experts the rows reach and whether they are resident).
+        self.cost_delta_ms = np.zeros(nl, dtype=np.float64)
+        self._next_event = torch.cuda.Event(enable_timing=True)
+        self._open: tuple[torch.cuda.Event, int, int] | None = None
+        self._timed: deque[tuple[torch.cuda.Event, int, int, torch.cuda.Event]] = (
+            deque()
+        )
 
     def add_request(self, slot: int) -> None:
         self.first_built_step[slot] = -1
@@ -272,6 +290,30 @@ class TreeWidthController:
         assert cost_ms.shape[0] == len(self.widths)
         self.cost_ms = cost_ms
 
+    def step_cost_ms(self, n: int) -> np.ndarray:
+        """Expected step time per width for ``n`` requests: the profiled
+        table plus each width's online correction."""
+        assert self.cost_ms is not None
+        return self.cost_ms[:, min(n, self.cost_ms.shape[1] - 1)] + self.cost_delta_ms
+
+    def _time_step(self, j: int, n: int) -> None:
+        """Mark this step's start on the stream; the interval from the
+        previous mark is the previous tree step's real GPU time, folded into
+        its width's correction once the marks have landed."""
+        if self._open is not None:
+            self._timed.append((*self._open, self._next_event))
+        self._open = (self._next_event, j, n)
+        self._next_event.record()
+        self._next_event = torch.cuda.Event(enable_timing=True)
+        while self._timed and self._timed[0][3].query():
+            start, pj, pn, end = self._timed.popleft()
+            predicted = self.step_cost_ms(pn)[pj]
+            # An interval spanning other work (a prefill, an idle engine)
+            # overstates this width's cost, so one sample moves the estimate
+            # by a bounded amount; a real, larger cost still converges.
+            ms = min(start.elapsed_time(end), _MAX_STEP_RATIO * predicted)
+            self.cost_delta_ms[pj] += _COST_ALPHA * (ms - predicted)
+
     def select(self, slots: np.ndarray) -> int:
         """Verify width for a decode batch over request-state ``slots``."""
         n = len(slots)
@@ -287,10 +329,12 @@ class TreeWidthController:
             else:
                 self._mean_curve += 0.05 * (known_mean - self._mean_curve)
         elif self._mean_curve is None:
+            self._time_step(len(self.widths) - 1, n)
             return self.B
         expected = known.sum(axis=0) + self._mean_curve * (n - len(known))
-        score = (n + expected) / self.cost_ms[:, min(n, self.cost_ms.shape[1] - 1)]
-        return self.widths[int(np.argmax(score))]
+        j = int(np.argmax((n + expected) / self.step_cost_ms(n)))
+        self._time_step(j, n)
+        return self.widths[j]
 
 
 def default_profile_request_counts(max_num_reqs: int) -> list[int]:
