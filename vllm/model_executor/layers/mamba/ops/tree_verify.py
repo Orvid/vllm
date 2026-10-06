@@ -312,6 +312,179 @@ def tree_gated_delta_rule(
 
 
 @triton.jit
+def _tree_gated_delta_rule_chunk_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    g_ptr,
+    beta_ptr,
+    o_ptr,
+    h0_ptr,
+    state_indices_ptr,
+    query_start_loc_ptr,
+    row_parent_ptr,
+    scale,
+    stride_state_slot,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BV: tl.constexpr,
+    MAXD: tl.constexpr,
+    LOG2_MAXD: tl.constexpr,
+):
+    """One request's verify rows as a single chunk of the gated delta rule,
+    with the causal mask replaced by the ancestor relation.
+
+    A row's transformed value depends only on its ancestors, so the chunk's
+    lower-triangular system (ancestors precede descendants) yields every row's
+    output from the committed state at once:
+      A = beta_t exp(G_t - G_s) k_t.k_s for s a strict ancestor of t,
+      T = (I + A)^-1, w = T (beta exp(G) k), u = T (beta v),
+      v' = u - w S0^T, o = exp(G) q S0^T + (q k^T exp(G_t - G_s))_anc v',
+    with G_t the decay summed along t's path.
+    """
+    i_v = tl.program_id(0)
+    i_nh = tl.program_id(1)
+    n = i_nh // HV
+    hv = i_nh % HV
+    h = hv // (HV // H)
+    bos = tl.load(query_start_loc_ptr + n).to(tl.int64)
+    eos = tl.load(query_start_loc_ptr + n + 1).to(tl.int64)
+    t = tl.arange(0, BT)
+    rows = bos + t
+    live = rows < eos
+    o_k = tl.arange(0, K)
+    o_v = i_v * BV + tl.arange(0, BV)
+    mv = o_v < V
+
+    # Ancestor-or-self relation between the request's rows.
+    anc = t[:, None] == t[None, :]
+    cur = tl.where(live, rows, -1)
+    for _ in tl.static_range(MAXD):
+        p = tl.load(row_parent_ptr + tl.maximum(cur, 0), mask=cur >= 0, other=-1)
+        p = p.to(tl.int64)
+        cur = tl.where((cur >= 0) & (p >= bos) & (p < cur), p, -1)
+        anc = anc | ((cur - bos)[:, None] == t[None, :])
+    anc = anc & live[:, None] & live[None, :]
+
+    b_g = tl.load(g_ptr + rows * HV + hv, mask=live, other=0.0).to(tl.float32)
+    b_beta = tl.load(beta_ptr + rows * HV + hv, mask=live, other=0.0).to(tl.float32)
+    big_g = tl.sum(tl.where(anc, b_g[None, :], 0.0), axis=1)
+    decay = tl.where(anc, tl.exp(big_g[:, None] - big_g[None, :]), 0.0)
+
+    b_k = tl.load(
+        k_ptr + (rows[:, None] * H + h) * K + o_k[None, :],
+        mask=live[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    b_q = tl.load(
+        q_ptr + (rows[:, None] * H + h) * K + o_k[None, :],
+        mask=live[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    b_q = b_q * scale
+    b_v = tl.load(
+        v_ptr + (rows[:, None] * HV + hv) * V + o_v[None, :],
+        mask=live[:, None] & mv[None, :],
+        other=0.0,
+    ).to(tl.float32)
+
+    kk = tl.dot(b_k, tl.trans(b_k), input_precision="ieee")
+    strict = anc & (t[:, None] != t[None, :])
+    a = tl.where(strict, b_beta[:, None] * decay * kk, 0.0)
+    # T = (I + A)^-1. A links strict ancestors only, so A^j vanishes once j
+    # exceeds the longest path (MAXD rows): T = prod_j (I + (-A)^(2^j)).
+    eye = (t[:, None] == t[None, :]).to(tl.float32)
+    m = -a
+    tinv = eye + m
+    for _ in tl.static_range(1, LOG2_MAXD):
+        m = tl.dot(m, m, input_precision="ieee")
+        tinv = tl.dot(tinv, eye + m, input_precision="ieee")
+
+    w = tl.dot(
+        tinv, b_k * (b_beta * tl.exp(big_g))[:, None], input_precision="ieee"
+    )
+    u = tl.dot(tinv, b_v * b_beta[:, None], input_precision="ieee")
+
+    slot = tl.load(state_indices_ptr + n).to(tl.int64)
+    s0 = tl.load(
+        h0_ptr
+        + slot * stride_state_slot
+        + hv * V * K
+        + o_v[:, None] * K
+        + o_k[None, :],
+        mask=mv[:, None] & (slot > 0),
+        other=0.0,
+    ).to(tl.float32)
+    s0_t = tl.trans(s0)  # [K, BV]
+    v_new = u - tl.dot(w, s0_t, input_precision="ieee")
+    qk = tl.dot(b_q, tl.trans(b_k), input_precision="ieee")
+    o = tl.exp(big_g)[:, None] * tl.dot(b_q, s0_t, input_precision="ieee")
+    o += tl.dot(qk * decay, v_new, input_precision="ieee")
+    tl.store(
+        o_ptr + (rows[:, None] * HV + hv) * V + o_v[None, :],
+        o.to(o_ptr.dtype.element_ty),
+        mask=live[:, None] & mv[None, :],
+    )
+
+
+def tree_gated_delta_rule_chunk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    ssm_state: torch.Tensor,
+    state_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_seqs: int,
+    row_parent: torch.Tensor,
+    max_depth: int,
+    max_rows: int,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """:func:`tree_gated_delta_rule` as one masked chunk per request
+    (tensor-core dots); requests may hold at most ``max_rows`` rows."""
+    num_rows, H, K = k.shape
+    HV, V = v.shape[1], v.shape[2]
+    o = torch.empty_like(v)
+    if num_rows == 0 or num_seqs == 0:
+        return o
+    if scale is None:
+        scale = K**-0.5
+    assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+    assert ssm_state.stride(3) == 1 and ssm_state.stride(2) == K
+    assert K == triton.next_power_of_2(K)
+    BV = 32
+    _tree_gated_delta_rule_chunk_kernel[(triton.cdiv(V, BV), num_seqs * HV)](
+        q,
+        k,
+        v,
+        g,
+        beta,
+        o,
+        ssm_state,
+        state_indices,
+        query_start_loc,
+        row_parent,
+        scale,
+        ssm_state.stride(0),
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        BT=max(16, triton.next_power_of_2(max_rows)),
+        BV=BV,
+        MAXD=triton.next_power_of_2(max_depth),
+        LOG2_MAXD=max(1, (triton.next_power_of_2(max_depth) - 1).bit_length()),
+        num_warps=4,
+    )
+    return o
+
+
+@triton.jit
 def _commit_conv_state_kernel(
     x_ptr,
     x_stride,

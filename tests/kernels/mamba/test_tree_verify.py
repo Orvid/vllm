@@ -15,6 +15,7 @@ from vllm.model_executor.layers.mamba.ops.tree_verify import (
     commit_gated_delta_rule_paths,
     tree_causal_conv1d,
     tree_gated_delta_rule,
+    tree_gated_delta_rule_chunk,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -67,7 +68,9 @@ def test_tree_conv1d_matches_per_path_conv():
         torch.testing.assert_close(out[row], ref, rtol=1e-4, atol=1e-4)
 
 
-def test_tree_gated_delta_rule_matches_per_path_recurrence():
+@pytest.mark.parametrize("chunked", [False, True])
+def test_tree_gated_delta_rule_matches_per_path_recurrence(chunked: bool):
+    """Both the per-path replay and the ancestor-masked chunk kernel."""
     torch.manual_seed(0)
     parent, qsl, slots = _batch()
     H, HV, K, V = 2, 4, 32, 64
@@ -79,9 +82,14 @@ def test_tree_gated_delta_rule_matches_per_path_recurrence():
     beta = torch.rand(T, HV, device=DEVICE)
     state = torch.randn(8, HV, V, K, device=DEVICE)
     state_before = state.clone()
-    out = tree_gated_delta_rule(
-        q, k, v, g, beta, state, slots, qsl, 2, parent, max_depth=8
-    )
+    if chunked:
+        out = tree_gated_delta_rule_chunk(
+            q, k, v, g, beta, state, slots, qsl, 2, parent, max_depth=8, max_rows=7
+        )
+    else:
+        out = tree_gated_delta_rule(
+            q, k, v, g, beta, state, slots, qsl, 2, parent, max_depth=8
+        )
     torch.testing.assert_close(state, state_before)
     p, ql = parent.tolist(), qsl.tolist()
     scale = K**-0.5

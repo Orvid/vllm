@@ -17,6 +17,7 @@ from torch import Tensor
 
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import get_dtype_size
+from vllm.v1.kv_cache_interface import MambaSpec
 
 _CopyBlock = 256
 
@@ -121,6 +122,12 @@ def _plan_kernel(
     bstride = tl.load(bt_strides + g)
     nb = tl.load(bt_nbs + g)
     bs = tl.load(bt_bss + g)
+    base = g * max_a
+    if bs == 0:
+        # A group without relocatable KV (recurrent state): nothing moves.
+        tl.store(out_enter + base + i, 0)
+        tl.store(out_stale + base + i, 0)
+        return
     n_acc = tl.load(num_sampled_ptr + r) - 1
     ht = tl.load(has_tree_ptr + r) != 0
     valid = (j < n_acc) & ht
@@ -145,7 +152,6 @@ def _plan_kernel(
         dbidx = tl.minimum(dbk // bs, nb - 1)
         dpk = tl.load(row + dbidx).to(tl.int64) * bs + dbk % bs
         stale = stale & ((src_phys != dpk) | (vk == 0))
-    base = g * max_a
     tl.store(out_src + base + i, src_phys)
     tl.store(out_dst + base + i, dst_phys)
     tl.store(out_enter + base + i, (valid & move).to(tl.int8))
@@ -157,6 +163,8 @@ def _gather_all_kernel(
     kv_base,  # first layer's cache view (base pointer of the shared backing)
     layer_off_ptr,  # [L] int64 element offset of each layer from kv_base
     elems_ptr,  # [L] int32 elements per slot per layer (num_heads * content)
+    block_tokens_ptr,  # [L] int32 slots per cache block of each layer view
+    block_el_ptr,  # [L] int64 elements between cache blocks of each layer
     group_of_ptr,  # [L] int32 kv-cache group each layer belongs to
     src_ptr,  # [G, a] int64 source phys slot per (group, entry)
     enter_ptr,  # [G, a] int8: 1 when the entry must move
@@ -183,7 +191,9 @@ def _gather_all_kernel(
     if do == 0:
         return
     phys = tl.load(src_ptr + g * g_stride + entry, mask=in_plan, other=0)
-    base_off = tl.load(layer_off_ptr + layer) + phys * el
+    nbt = tl.load(block_tokens_ptr + layer).to(tl.int64)
+    bel = tl.load(block_el_ptr + layer)
+    base_off = tl.load(layer_off_ptr + layer) + (phys // nbt) * bel + (phys % nbt) * el
     offs = tl.arange(0, BLOCK)
     for start in tl.range(0, el, BLOCK):
         inc = start + offs
@@ -201,6 +211,8 @@ def _scatter_zero_all_kernel(
     kv_base,  # first layer's cache view (base pointer of the shared backing)
     layer_off_ptr,  # [L] int64 element offset of each layer from kv_base
     elems_ptr,  # [L] int32 elements per slot per layer
+    block_tokens_ptr,  # [L] int32 slots per cache block of each layer view
+    block_el_ptr,  # [L] int64 elements between cache blocks of each layer
     group_of_ptr,  # [L] int32 kv-cache group each layer belongs to
     dst_ptr,  # [G, a] int64 destination phys slot per (group, entry)
     src_ptr,  # [G, a] int64 source phys slot per (group, entry)
@@ -228,14 +240,13 @@ def _scatter_zero_all_kernel(
     stale = tl.load(stale_ptr + idx, mask=in_plan, other=0)
     if (do == 0) & (stale == 0):
         return
-    base_dst = (
-        tl.load(layer_off_ptr + layer)
-        + tl.load(dst_ptr + idx, mask=in_plan, other=0) * el
-    )
-    base_src = (
-        tl.load(layer_off_ptr + layer)
-        + tl.load(src_ptr + idx, mask=in_plan, other=0) * el
-    )
+    nbt = tl.load(block_tokens_ptr + layer).to(tl.int64)
+    bel = tl.load(block_el_ptr + layer)
+    dst = tl.load(dst_ptr + idx, mask=in_plan, other=0)
+    src = tl.load(src_ptr + idx, mask=in_plan, other=0)
+    layer_off = tl.load(layer_off_ptr + layer)
+    base_dst = layer_off + (dst // nbt) * bel + (dst % nbt) * el
+    base_src = layer_off + (src // nbt) * bel + (src % nbt) * el
     offs = tl.arange(0, BLOCK)
     for start in tl.range(0, el, BLOCK):
         inc = start + offs
@@ -361,6 +372,16 @@ def _align8(nbytes: int) -> int:
     return (nbytes + 7) & ~7
 
 
+def _is_attention_like(spec: Any) -> bool:
+    """Whether a kv-cache group holds per-token KV the compactor relocates
+    (recurrent state commits through its layers instead)."""
+    return (
+        getattr(spec, "num_heads", None) is not None
+        and getattr(spec, "state_content_size_bytes", None) is not None
+        and getattr(spec, "dtype", None) is not None
+    )
+
+
 def _buffer_layout(
     *,
     G: int,
@@ -386,6 +407,8 @@ def _buffer_layout(
         ("group_of", L, 4),
         ("elems", L, 4),
         ("layer_off", L, 8),
+        ("block_tokens", L, 4),
+        ("block_el", L, 8),
         ("src", G * max_a, 8),
         ("dst", G * max_a, 8),
         ("enter", G * max_a, 1),
@@ -494,6 +517,10 @@ class TreeKVCompaction:
         self.block_sizes: list[int] = []
         layers: list[tuple[int, Tensor]] = []
         for g, group in enumerate(kv_cache_groups):
+            if isinstance(group.kv_cache_spec, MambaSpec):
+                # Recurrent state commits through its layers (TreeCommit).
+                self.block_sizes.append(0)
+                continue
             bs = getattr(group.kv_cache_spec, "block_size", None)
             if bs is None:
                 raise ValueError(
@@ -514,15 +541,20 @@ class TreeKVCompaction:
                     )
                 _, num_heads, tokens_per_block, content = layer.shape
                 elems = num_heads * content
-                if layer.stride() != (
-                    tokens_per_block * elems,
-                    content,
-                    elems,
-                    1,
+                # A slot's KV must be one contiguous run (LBNHC within a
+                # block); blocks may be padded (hybrid models pad attention
+                # pages to the recurrent state's page size).
+                stride = layer.stride()
+                if not (
+                    stride[3] == 1
+                    and stride[2] == elems
+                    and (num_heads == 1 or stride[1] == content)
+                    and stride[0] >= tokens_per_block * elems
                 ):
                     raise ValueError(
-                        "df2t compaction requires per-slot-contiguous "
-                        f"(LBNHC) layer caches; got strides {layer.stride()}"
+                        "tree compaction requires per-slot-contiguous "
+                        f"(LBNHC) layer caches; layer {name} has shape "
+                        f"{tuple(layer.shape)}, strides {stride}"
                     )
                 layers.append((g, layer))
 
@@ -614,12 +646,16 @@ class TreeKVCompaction:
         self._group_of = carve("group_of", (self._L,), torch.int32)
         self._elems = carve("elems", (self._L,), torch.int32)
         self._layer_off = carve("layer_off", (self._L,), torch.int64)
-        for idx, (g, num_heads, content, _) in enumerate(layer_info):
+        self._block_tokens = carve("block_tokens", (self._L,), torch.int32)
+        self._block_el = carve("block_el", (self._L,), torch.int64)
+        for idx, (g, num_heads, content, layer) in enumerate(layer_info):
             self._group_of[idx] = g
             self._elems[idx] = num_heads * content
             self._layer_off[idx] = (
-                layer_info[idx][3].data_ptr() - base_layer.data_ptr()
+                layer.data_ptr() - base_layer.data_ptr()
             ) // itemsize
+            self._block_tokens[idx] = layer.shape[2]
+            self._block_el[idx] = layer.stride(0)
         self._src = carve("src", (self._G, max_a), torch.int64)
         self._dst = carve("dst", (self._G, max_a), torch.int64)
         self._enter = carve("enter", (self._G, max_a), torch.int8)
@@ -706,18 +742,16 @@ class TreeKVCompaction:
         itemsize = 0
         for group in kv_cache_groups:
             spec = group.kv_cache_spec
-            num_heads = getattr(spec, "num_heads", None)
-            content_bytes = getattr(spec, "state_content_size_bytes", None)
-            dtype = getattr(spec, "dtype", None)
-            if num_heads is None or content_bytes is None or dtype is None:
-                # Not an attention-like layer the compactor can relocate.
+            if not _is_attention_like(spec):
                 continue
-            el = num_heads * (content_bytes // get_dtype_size(dtype))
+            el = spec.num_heads * (
+                spec.state_content_size_bytes // get_dtype_size(spec.dtype)
+            )
             if el <= 0:
                 continue
             L += len(group.layer_names)
             max_el = max(max_el, el)
-            itemsize = get_dtype_size(dtype)
+            itemsize = get_dtype_size(spec.dtype)
         if L == 0:
             return 0
         cw = nodes_max if chain_w is None else chain_w
@@ -867,6 +901,8 @@ class TreeKVCompaction:
                 self._kv_base,
                 self._layer_off,
                 self._elems,
+                self._block_tokens,
+                self._block_el,
                 self._group_of,
                 self._src,
                 self._enter,
@@ -882,6 +918,8 @@ class TreeKVCompaction:
                 self._kv_base,
                 self._layer_off,
                 self._elems,
+                self._block_tokens,
+                self._block_el,
                 self._group_of,
                 self._dst,
                 self._src,
