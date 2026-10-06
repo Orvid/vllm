@@ -23,6 +23,7 @@ import torch
 from torch import Tensor
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.worker.gpu.spec_decode.tree.proposal import DraftProposal
 from vllm.v1.worker.gpu.spec_decode.tree.tree_metadata import TreeDraft
 
 
@@ -264,6 +265,16 @@ class TreeBuilder:
             .expand(max_num_reqs, B)
             .contiguous()
         )
+
+    def select(self, proposal: DraftProposal) -> TreeDraft:
+        """The tree over the proposal's top ``K`` candidates per position,
+        ranked by their conditional logits (each candidate's own logit when
+        the drafter's positions are independent)."""
+        cand, unary = proposal.candidates(self.K)
+        scores = proposal.conditional(cand)
+        if scores is None:
+            scores = unary.float().unsqueeze(-2).expand(*unary.shape[:2], self.K, -1)
+        return self.build(scores, cand)
 
     def build(self, scores: Tensor, cand: Tensor) -> TreeDraft:
         """Populate the tree for each request.

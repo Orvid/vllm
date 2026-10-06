@@ -2,11 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tree drafting over any candidate-producing drafter.
 
-``TreeSpeculatorMixin`` turns a parallel drafter into a tree drafter: the
-drafter supplies per-position candidates and transition scores
-(``_draft_tree_candidates``), and the configured tree selection method
-(``SpeculativeConfig.tree_selection``) turns them into a best-first prefix
-tree. The drafter itself knows nothing about trees.
+``TreeSpeculatorMixin`` turns a parallel drafter into a tree drafter. The
+drafter runs its step and describes what it knows about the draft positions
+(``_draft_proposal`` -> :class:`DraftProposal`); the configured tree selection
+method (``SpeculativeConfig.tree_selection``) queries that for candidates and
+scores and ranks them into a best-first prefix tree. The drafter itself knows
+nothing about trees.
+
+Verification walks the tree with draws from the target alone, so the
+candidates only affect acceptance, never the output distribution.
 """
 
 from typing import Any
@@ -20,8 +24,8 @@ from vllm.v1.worker.gpu.spec_decode.tree.tree_metadata import TreeDraft
 
 
 class TreeSpeculatorMixin:
-    """Mixed in ahead of a drafter class that implements
-    ``_draft_tree_candidates`` (see :func:`tree_speculator_class`)."""
+    """Mixed in ahead of a drafter class that implements ``_draft_proposal``
+    (see :func:`tree_speculator_class`)."""
 
     # Provided by the drafter class.
     max_num_reqs: int
@@ -32,6 +36,9 @@ class TreeSpeculatorMixin:
     def __init__(self, vllm_config, device):
         super().__init__(vllm_config, device)  # type: ignore[call-arg]
         d = vllm_config.speculative_config
+        if not hasattr(self, "top_k"):
+            # No candidate head fixes the drafter's own K.
+            self.top_k = d.tree_candidate_top_k
         self.max_depth = d.max_tree_depth
         self.tree_budget = d.tree_budget
         self.budget = BudgetPolicy.from_config(d)
@@ -85,7 +92,7 @@ class TreeSpeculatorMixin:
     ) -> None:
         """Draft candidates, select the tree, and carry its node tokens (emit
         order) as this request's draft tokens."""
-        candidate_ids, scores = self._draft_tree_candidates(  # type: ignore[attr-defined]
+        proposal = self._draft_proposal(  # type: ignore[attr-defined]
             num_reqs,
             num_tokens_padded,
             attn_metadata,
@@ -93,7 +100,7 @@ class TreeSpeculatorMixin:
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
-        tree = self.tree_selector.build(scores, candidate_ids)
+        tree = self.tree_selector.select(proposal)
         self._last_tree = tree
         self._last_built_rows = num_reqs
         # The selector pads columns past a tree's node count with the
@@ -160,10 +167,10 @@ class TreeSpeculatorMixin:
 
 def tree_speculator_class(drafter_cls: type) -> type:
     """The tree-drafting variant of a candidate-producing drafter class."""
-    if not hasattr(drafter_cls, "_draft_tree_candidates"):
+    if not hasattr(drafter_cls, "_draft_proposal"):
         raise ValueError(
-            f"{drafter_cls.__name__} does not propose per-position candidates, "
-            "so it cannot drive tree verification."
+            f"{drafter_cls.__name__} does not propose its draft positions in "
+            "parallel, so it cannot drive tree verification."
         )
     return type(
         f"Tree{drafter_cls.__name__}",

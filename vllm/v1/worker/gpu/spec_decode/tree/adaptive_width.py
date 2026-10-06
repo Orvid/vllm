@@ -9,12 +9,15 @@ choice maximizes expected emitted tokens per unit of step cost:
     w* = argmax_w (R + sum_r A_r(w)) / cost(R, w)
 
 ``A_r(w)`` is the expected number of accepted nodes among request ``r``'s first
-``w``: the sum of each node's acceptance probability, estimated from its
-drafter path log-probability through a binned calibration table fitted online
-against the verifier's walk. Trimming a tree never changes whether a kept node
-is accepted (the draws along its path are the same), so every verified node is
-an unbiased sample for its bin whatever width ran. ``cost`` is profiled at
-startup on the captured uniform decode graphs.
+``w``: the sum of each node's acceptance probability, estimated from its depth
+and drafter path log-probability through a binned calibration table fitted
+online against the verifier's walk. Depth matters on its own: a parallel
+drafter can be equally sure of every position of its main chain while the
+chance that the target agrees all the way down decays with depth. Trimming a
+tree never changes whether a kept node is accepted (the draws along its path
+are the same), so every verified node is an unbiased sample for its bin
+whatever width ran. ``cost`` is profiled at startup on the captured uniform
+decode graphs.
 
 The host reads the per-request curves one step stale through a pinned ring
 it polls without blocking, so the choice never syncs the async pipeline.
@@ -28,9 +31,11 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_pin_memory_available
 
-# Calibration bins over the node path log-probability, [-NUM_BINS * BIN_W, 0].
+# Calibration bins over the node path log-probability, [-NUM_BINS * BIN_W, 0],
+# per node depth (deeper nodes share the last depth's bins).
 _NUM_BINS = 64
 _BIN_W = 0.25
+_NUM_DEPTHS = 16
 # Pseudo-observations behind the exp(logp) prior in each bin.
 _PRIOR_N = 4.0
 # Halve the calibration statistics this often (in observed steps), so the fit
@@ -40,10 +45,20 @@ _RING = 4
 
 
 @triton.jit
+def _calib_bin(
+    lp, depth, NUM_BINS: tl.constexpr, BIN_W: tl.constexpr, ND: tl.constexpr
+):
+    b = tl.maximum(tl.minimum((-lp / BIN_W).to(tl.int32), NUM_BINS - 1), 0)
+    d = tl.maximum(tl.minimum(depth.to(tl.int32) - 1, ND - 1), 0)
+    return d * NUM_BINS + b
+
+
+@triton.jit
 def _observe_kernel(
     hits_ptr,
     counts_ptr,
     logp_ptr,  # [max_num_reqs, B] f32 per request state
+    depth_ptr,  # [max_num_reqs, B] i32 per request state
     idx_mapping_ptr,
     num_nodes_ptr,  # [R] i64 verified node count
     arenas_ptr,  # [*, arena_stride] i64 accepted arena per depth (col 0 unused)
@@ -53,6 +68,7 @@ def _observe_kernel(
     AP: tl.constexpr,
     NUM_BINS: tl.constexpr,
     BIN_W: tl.constexpr,
+    ND: tl.constexpr,
 ):
     r = tl.program_id(0)
     slot = tl.load(idx_mapping_ptr + r).to(tl.int64)
@@ -60,6 +76,7 @@ def _observe_kernel(
     node = tl.arange(0, BP)
     live = node < nn
     lp = tl.load(logp_ptr + slot * B + node, mask=live, other=0.0)
+    depth = tl.load(depth_ptr + slot * B + node, mask=live, other=1)
     cols = tl.arange(0, AP)
     acc = tl.load(
         arenas_ptr + r * arena_stride + cols,
@@ -67,8 +84,7 @@ def _observe_kernel(
         other=-1,
     )
     hit = tl.sum((node[:, None] == acc[None, :]).to(tl.float32), axis=1)
-    b = tl.minimum((-lp / BIN_W).to(tl.int32), NUM_BINS - 1)
-    b = tl.maximum(b, 0)
+    b = _calib_bin(lp, depth, NUM_BINS, BIN_W, ND)
     tl.atomic_add(counts_ptr + b, 1.0, mask=live)
     tl.atomic_add(hits_ptr + b, hit, mask=live)
 
@@ -77,6 +93,8 @@ def _observe_kernel(
 def _predict_kernel(
     curves_ptr,  # [max_num_reqs, NL] f32 per request state
     logp_ptr,  # [R, B] f32 built this step
+    depth_ptr,  # [R, depth_stride] built this step
+    depth_stride,
     idx_mapping_ptr,
     hits_ptr,
     counts_ptr,
@@ -87,12 +105,14 @@ def _predict_kernel(
     NLP: tl.constexpr,
     NUM_BINS: tl.constexpr,
     BIN_W: tl.constexpr,
+    ND: tl.constexpr,
 ):
     r = tl.program_id(0)
     slot = tl.load(idx_mapping_ptr + r).to(tl.int64)
     node = tl.arange(0, BP)
     lp = tl.load(logp_ptr + r * B + node, mask=node < B, other=float("-inf"))
-    b = tl.maximum(tl.minimum((-lp / BIN_W).to(tl.int32), NUM_BINS - 1), 0)
+    depth = tl.load(depth_ptr + r * depth_stride + node, mask=node < B, other=1)
+    b = _calib_bin(lp, depth, NUM_BINS, BIN_W, ND)
     p = tl.load(hits_ptr + b) / tl.load(counts_ptr + b)
     p = tl.where(lp > float("-inf"), p, 0.0)
     j = tl.arange(0, NLP)
@@ -122,14 +142,17 @@ class TreeWidthController:
 
         centers = (np.arange(_NUM_BINS) + 0.5) * _BIN_W
         self.counts = torch.full(
-            (_NUM_BINS,), _PRIOR_N, dtype=torch.float32, device=device
+            (_NUM_DEPTHS * _NUM_BINS,), _PRIOR_N, dtype=torch.float32, device=device
         )
         self.hits = torch.tensor(
-            _PRIOR_N * np.exp(-centers), dtype=torch.float32, device=device
+            np.tile(_PRIOR_N * np.exp(-centers), _NUM_DEPTHS),
+            dtype=torch.float32,
+            device=device,
         )
         self.logp = torch.full(
             (max_num_reqs, self.B), float("-inf"), dtype=torch.float32, device=device
         )
+        self.depths = torch.ones(max_num_reqs, self.B, dtype=torch.int32, device=device)
         self.curves = torch.zeros(max_num_reqs, nl, dtype=torch.float32, device=device)
 
         pin = is_pin_memory_available()
@@ -173,6 +196,7 @@ class TreeWidthController:
             self.hits,
             self.counts,
             self.logp,
+            self.depths,
             idx_mapping,
             num_nodes.contiguous(),
             accepted_arenas,
@@ -182,6 +206,7 @@ class TreeWidthController:
             AP=triton.next_power_of_2(accepted_arenas.shape[1]),
             NUM_BINS=_NUM_BINS,
             BIN_W=_BIN_W,
+            ND=_NUM_DEPTHS,
         )
         self._observed += 1
         if self._observed % _DECAY_INTERVAL == 0:
@@ -189,10 +214,15 @@ class TreeWidthController:
             self.counts.mul_(0.5)
 
     def record_trees(
-        self, idx_mapping: torch.Tensor, slots: np.ndarray, logp: torch.Tensor
+        self,
+        idx_mapping: torch.Tensor,
+        slots: np.ndarray,
+        logp: torch.Tensor,
+        depths: torch.Tensor,
     ) -> None:
-        """Keep this step's node path masses and publish the requests' expected
-        acceptance curves to the host (asynchronously)."""
+        """Keep this step's node path masses and depths (``[R, B]`` each) and
+        publish the requests' expected acceptance curves to the host
+        (asynchronously)."""
         num_reqs = idx_mapping.shape[0]
         self._step += 1
         if num_reqs == 0:
@@ -200,9 +230,12 @@ class TreeWidthController:
         first = self.first_built_step[slots]
         self.first_built_step[slots] = np.where(first < 0, self._step, first)
         self.logp[idx_mapping] = logp[:num_reqs]
+        self.depths[idx_mapping] = depths[:num_reqs, : self.B].to(torch.int32)
         _predict_kernel[(num_reqs,)](
             self.curves,
             logp,
+            depths,
+            depths.stride(0),
             idx_mapping,
             self.hits,
             self.counts,
@@ -213,6 +246,7 @@ class TreeWidthController:
             NLP=triton.next_power_of_2(len(self.widths)),
             NUM_BINS=_NUM_BINS,
             BIN_W=_BIN_W,
+            ND=_NUM_DEPTHS,
         )
         k = self._ring_next
         if self._ring_step[k] >= 0 and not self._ring_events[k].query():

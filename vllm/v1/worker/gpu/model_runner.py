@@ -2373,6 +2373,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch.idx_mapping,
                 input_batch.idx_mapping_np,
                 selector.logp[: input_batch.num_reqs],
+                selector.depths[: input_batch.num_reqs],
             )
 
     def _load_trees(

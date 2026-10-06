@@ -71,9 +71,16 @@ def test_tree_resolution():
     assert cfg.parallel_drafting
 
 
-def test_tree_rejects_drafter_without_candidates():
-    with pytest.raises(ValueError, match="candidates"):
-        _build(arch="DFlashDraftModel")
+def test_tree_accepts_drafter_without_candidate_head():
+    """A plain DFlash drafter drives trees from each position's top-k."""
+    cfg = _build(arch="DFlashDraftModel")
+    assert cfg.use_tree()
+    assert cfg.tree_candidate_top_k == 8
+
+
+def test_tree_rejects_sequential_drafters():
+    with pytest.raises(ValueError, match="in parallel"):
+        _build(method="ngram", draft_model_config=None)
 
 
 def test_tree_rejects_tree_budget_over_ceiling():

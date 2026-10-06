@@ -92,6 +92,33 @@ class DSparkMarkovHead(nn.Module):
         """Vocab-size transition bias from a Markov embedding ([B, r] -> [B, V])."""
         return logits_processor(self.markov_w2, markov_embed)
 
+    def gathered_weight(self, index: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """Rows ``index`` (draft vocab, any shape) of the bias projection, as
+        ``[*index.shape, r]`` in ``dtype``."""
+        if self.markov_w2._retain_weight_for_gather and self.markov_w2.is_w4a16_nvfp4:
+            flat_index = index.reshape(-1)
+            packed_weight = self.markov_w2._nvfp4_weight_for_gather.index_select(
+                0, flat_index
+            )
+            weight_scale = self.markov_w2._nvfp4_weight_scale_for_gather.index_select(
+                0, flat_index
+            )
+            return dequantize_to_dtype(
+                packed_weight,
+                weight_scale,
+                self.markov_w2._nvfp4_weight_global_scale_for_gather,
+                dtype=dtype,
+                block_size=self.markov_w2._nvfp4_group_size_for_gather,
+                swizzle=False,
+            ).view(*index.shape, -1)
+        weight = self.markov_w2.weight[index]
+        if weight.dtype != dtype:
+            raise RuntimeError(
+                "Gathered Markov projection requires unquantized weights or "
+                "retained ModelOpt W4A16 NVFP4 weights."
+            )
+        return weight
+
     def apply_bias_gathered(
         self,
         markov_embed: torch.Tensor,
@@ -106,51 +133,30 @@ class DSparkMarkovHead(nn.Module):
         positions. This method scatters the corrected candidate values into
         that dense buffer so the normal sampler sees the truncated proposal.
         """
-        if self.markov_w2._retain_weight_for_gather and self.markov_w2.is_w4a16_nvfp4:
+        if (
+            self.markov_w2._retain_weight_for_gather
+            and self.markov_w2.is_w4a16_nvfp4
             # Use the fast Triton kernel for W4A16 NVFP4 weights with BF16
             # activations on CUDA. FP16 activations, non-CUDA accelerators, and
             # CPU use the slower dequantize/scatter fallback below.
-            if (
-                current_platform.is_cuda()
-                and markov_embed.is_cuda
-                and markov_embed.dtype == torch.bfloat16
-                and values.dtype == torch.bfloat16
-                and logits.dtype == torch.bfloat16
-            ):
-                nvfp4_gathered_bias(
-                    markov_embed,
-                    self.markov_w2._nvfp4_weight_for_gather,
-                    self.markov_w2._nvfp4_weight_scale_for_gather,
-                    self.markov_w2._nvfp4_weight_global_scale_for_gather,
-                    values,
-                    index,
-                    logits,
-                    scale,
-                )
-                return logits
-
-            flat_index = index.reshape(-1)
-            packed_weight = self.markov_w2._nvfp4_weight_for_gather.index_select(
-                0, flat_index
-            )
-            weight_scale = self.markov_w2._nvfp4_weight_scale_for_gather.index_select(
-                0, flat_index
-            )
-            weight = dequantize_to_dtype(
-                packed_weight,
-                weight_scale,
+            and current_platform.is_cuda()
+            and markov_embed.is_cuda
+            and markov_embed.dtype == torch.bfloat16
+            and values.dtype == torch.bfloat16
+            and logits.dtype == torch.bfloat16
+        ):
+            nvfp4_gathered_bias(
+                markov_embed,
+                self.markov_w2._nvfp4_weight_for_gather,
+                self.markov_w2._nvfp4_weight_scale_for_gather,
                 self.markov_w2._nvfp4_weight_global_scale_for_gather,
-                dtype=markov_embed.dtype,
-                block_size=self.markov_w2._nvfp4_group_size_for_gather,
-                swizzle=False,
-            ).view(*index.shape, -1)
-        else:
-            weight = self.markov_w2.weight[index]
-            if weight.dtype != markov_embed.dtype:
-                raise RuntimeError(
-                    "Gathered Markov projection requires unquantized weights or "
-                    "retained ModelOpt W4A16 NVFP4 weights."
-                )
+                values,
+                index,
+                logits,
+                scale,
+            )
+            return logits
+        weight = self.gathered_weight(index, markov_embed.dtype)
         corrected = values.unsqueeze(-1).clone()
         corrected.baddbmm_(
             weight,
@@ -298,6 +304,26 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
             values,
             index,
             self.logits_processor.scale,
+        )
+
+    def markov_transition_bias(
+        self, prev_token_ids: torch.Tensor, index: torch.Tensor
+    ) -> torch.Tensor:
+        """Markov bias from each previous token to each candidate.
+
+        Args:
+            prev_token_ids: ``[..., P]`` previous tokens (target vocab).
+            index: ``[..., C]`` candidate tokens (draft vocab).
+
+        Returns:
+            ``[..., P, C]`` bias, as the sequential head would add it.
+
+        """
+        head = self.model.markov_head
+        embed = head.embed(prev_token_ids)
+        weight = head.gathered_weight(index, embed.dtype)
+        return self.logits_processor.scale * torch.matmul(
+            embed, weight.transpose(-1, -2)
         )
 
     def compute_confidence(

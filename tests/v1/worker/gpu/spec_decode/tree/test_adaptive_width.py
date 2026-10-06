@@ -19,12 +19,19 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUD
 DEVICE = torch.device("cuda")
 # Two confident nodes, then two doubtful ones (best-first path log-probs).
 LOGP = [-0.05, -0.1, -2.0, -2.1]
+DEPTHS = [1, 2, 1, 2]
 
 
-def _record(ctl: TreeWidthController, slots: list[int]) -> None:
+def _record(
+    ctl: TreeWidthController,
+    slots: list[int],
+    logp_row: list[float] = LOGP,
+    depth_row: list[int] = DEPTHS,
+) -> None:
     idx = torch.tensor(slots, dtype=torch.int32, device=DEVICE)
-    logp = torch.tensor([LOGP] * len(slots), dtype=torch.float32, device=DEVICE)
-    ctl.record_trees(idx, np.array(slots), logp)
+    logp = torch.tensor([logp_row] * len(slots), dtype=torch.float32, device=DEVICE)
+    depths = torch.tensor([depth_row] * len(slots), dtype=torch.int64, device=DEVICE)
+    ctl.record_trees(idx, np.array(slots), logp, depths)
     torch.accelerator.synchronize()
 
 
@@ -45,6 +52,22 @@ def test_calibration_learns_per_node_acceptance():
     for _ in range(200):
         _observe_first_two_accepted(ctl, [1])
     _record(ctl, [1])
+    ctl._poll()
+    curve = ctl.host_curves[1]
+    assert curve[0] == pytest.approx(2.0, abs=0.05)
+    assert curve[1] == pytest.approx(2.0, abs=0.05)
+
+
+def test_calibration_separates_depths_at_equal_path_mass():
+    """A drafter equally sure of a whole chain: the target agrees with the
+    first two positions only, so the curve must not credit the deeper nodes
+    for sharing their path mass."""
+    chain = [-0.05] * 4
+    ctl = TreeWidthController([2, 4], max_num_reqs=4, device=DEVICE)
+    _record(ctl, [1], chain, [1, 2, 3, 4])
+    for _ in range(200):
+        _observe_first_two_accepted(ctl, [1])
+    _record(ctl, [1], chain, [1, 2, 3, 4])
     ctl._poll()
     curve = ctl.host_curves[1]
     assert curve[0] == pytest.approx(2.0, abs=0.05)

@@ -26,6 +26,7 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
 from vllm.v1.worker.gpu.spec_decode.dflash.utils import load_dflash_model
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.spec_decode.tree.proposal import DraftProposal
 from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -87,9 +88,9 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.max_num_tokens, dtype=torch.int64, device=device
         )
 
-        # DF2T only: the accepted-chain source (the runner's TreeVerifier) and
+        # Trees only: the accepted-chain source (the runner's TreeVerifier) and
         # the tree node budget that sizes the arena->depth context lookup.
-        self.tree_verifier = None
+        self.tree_verifier: TreeVerifier | None = None
         self.nodes_max = 1
 
         # Per-mask-token sampling buffers. Flattened from (num_reqs, num_spec_tokens).
@@ -307,6 +308,30 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.draft_tokens[:num_reqs] = draft_tokens.view(
             num_reqs, self.num_speculative_steps
         )
+
+    def _draft_proposal(
+        self,
+        num_reqs: int,
+        num_tokens_padded: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    ) -> DraftProposal:
+        """The block's parallel denoising pass, for tree selection: each draft
+        position's target-vocab logits, independent given the context."""
+        last_hidden_states = self._run_model(
+            num_tokens_padded,
+            attn_metadata,
+            slot_mappings,
+            num_tokens_across_dp,
+            cudagraph_runtime_mode,
+        )
+        num_sample = num_reqs * self.num_speculative_steps
+        logits = self.model.compute_logits(
+            last_hidden_states[self.sample_indices[:num_sample]]
+        )
+        return DraftProposal(logits.view(num_reqs, self.num_speculative_steps, -1))
 
     def _num_graph_context_tokens(self, num_reqs: int) -> int:
         # Context rows a captured draft step stores: one full verify per request.
@@ -529,6 +554,7 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert self.query_cudagraph_manager is not None
+            assert batch_desc.num_reqs is not None
             self.query_cudagraph_manager.run_fullgraph(batch_desc)
             # The replayed graph's tree build wrote batch_desc.num_reqs rows
             # into the draft builder buffers; mirror that width so a consumer

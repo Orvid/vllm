@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tree selection methods: drafter candidates -> best-first prefix tree.
+"""Tree selection methods: a drafter's proposal -> best-first prefix tree.
 
-A selector consumes per-position candidates ``[R, S, K]`` and transition
-scores ``[R, S, K, K]`` and writes each request's tree into persistent
+A selector queries the drafter's :class:`DraftProposal` for the candidates and
+scores it needs, ranks them, and writes each request's tree into persistent
 buffers: one packed ``[R, 4 * B + 1]`` row (tokens | depths | parents | words |
 num_nodes, inert past the node count) with named strided views, plus each
 node's path log-probability (``logp``) for adaptive verify width. Nodes are

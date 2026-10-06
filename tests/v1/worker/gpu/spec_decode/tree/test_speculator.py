@@ -92,6 +92,90 @@ def test_init_speculator_composes_tree_onto_drafter() -> None:
     assert spec.draft_tokens.shape[1] == 64
 
 
+def test_plain_dflash_drafts_trees_from_its_position_distributions() -> None:
+    """A drafter without a candidate head composes too, with K from the
+    config's top-k fallback."""
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+    from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
+        DFlash2Speculator,
+    )
+
+    vllm_config = _fake_vllm_config()
+    vllm_config.speculative_config.draft_model_config.architectures = [
+        "DFlashDraftModel"
+    ]
+    spec = init_speculator(vllm_config, torch.device("cpu"))
+
+    assert isinstance(spec, DFlashSpeculator)
+    assert not isinstance(spec, DFlash2Speculator)
+    assert spec.top_k == vllm_config.speculative_config.tree_candidate_top_k
+
+
+def test_independent_proposal_offers_top_k_and_no_edge_term() -> None:
+    from vllm.v1.worker.gpu.spec_decode.tree.proposal import DraftProposal
+
+    logits = torch.tensor([[[0.0, 3.0, 1.0, 2.0], [5.0, 4.0, 0.0, 1.0]]])
+    proposal = DraftProposal(logits)
+    ids, unary = proposal.candidates(2)
+
+    assert ids.tolist() == [[[1, 3], [0, 1]]]
+    assert unary.tolist() == [[[3.0, 2.0], [5.0, 4.0]]]
+    assert proposal.conditional(ids) is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_selector_scores_independent_positions_by_their_own_logits() -> None:
+    """With no edge term, every edge into a candidate carries the
+    candidate's own logit."""
+    from vllm.v1.worker.gpu.spec_decode.tree.proposal import DraftProposal
+    from vllm.v1.worker.gpu.spec_decode.tree.selection.df2t import TreeBuilder
+
+    torch.manual_seed(0)
+    R, S, K, V = 2, 4, 3, 50
+    logits = torch.randn(R, S, V, device="cuda")
+    a = TreeBuilder(R, S, K, 12, "cuda")
+    b = TreeBuilder(R, S, K, 12, "cuda")
+    a.select(DraftProposal(logits))
+    values, ids = logits.topk(K, dim=-1)
+    b.build(values.unsqueeze(-2).expand(R, S, K, K), ids)
+    assert torch.equal(a.packed, b.packed)
+
+
+def test_dspark_proposal_scores_edges_with_the_markov_head() -> None:
+    """Edges carry the backbone logit plus the Markov bias from the
+    predecessor token (the anchor at the first position), in draft vocab."""
+    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkProposal
+
+    # Target vocab 6, draft vocab 3 holding target tokens 1, 3 and 4.
+    d2t = torch.tensor([1, 2, 2])  # draft id + offset = target id
+    t2d = torch.tensor([-1, 0, -1, 1, 2, -1])
+    seen = {}
+
+    class _Model:
+        def map_draft_to_target(self, ids):
+            return ids + d2t[ids]
+
+        def markov_transition_bias(self, prev, index):
+            seen["prev"], seen["index"] = prev, index
+            return (prev.unsqueeze(-1) * 10 + index.unsqueeze(-2)).float()
+
+    base = torch.tensor([[[0.5, 2.0, 1.0], [3.0, 0.0, 1.5]]])  # [R=1, S=2, 3]
+    proposal = DSparkProposal(_Model(), base, torch.tensor([5]), t2d)
+    ids, unary = proposal.candidates(2)
+    assert ids.tolist() == [[[3, 4], [1, 4]]]
+    assert unary.tolist() == [[[2.0, 1.0], [3.0, 1.5]]]
+
+    scores = proposal.conditional(torch.tensor([[[3, 4], [1, 0]]]))
+    assert seen["prev"].tolist() == [[[5, 5], [3, 4]]]
+    assert seen["index"].tolist() == [[[1, 2], [0, 0]]]
+    # Position 0 follows the anchor (5): logit + 50 + draft id.
+    assert scores[0, 0].tolist() == [[53.0, 53.0], [53.0, 53.0]]
+    # Position 1: predecessor 3 or 4; target 0 is outside the draft vocab.
+    assert scores[0, 1, 0, 0].item() == 3.0 + 30.0
+    assert scores[0, 1, 1, 0].item() == 3.0 + 40.0
+    assert scores[0, 1, :, 1].tolist() == [float("-inf"), float("-inf")]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_generate_draft_builds_tree_and_draft_tokens() -> None:
     """DF2T ``_generate_draft`` must build the per-request tree over the same

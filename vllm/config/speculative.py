@@ -76,9 +76,9 @@ DSparkModelTypes = Literal["dspark"]
 # ``tree_selection="df2t"``.
 DF2TModelTypes = Literal["df2t"]
 TreeSelectionMethod = Literal["df2t"]
-# Drafter architectures that expose per-position candidates and transition
-# scores for tree selection.
-_TREE_CANDIDATE_DRAFTERS = frozenset({"DFlash2DraftModel", "DF2TDraftModel"})
+# Methods whose drafters propose every draft position in parallel, so their
+# per-position candidates can be selected into a tree.
+_TREE_DRAFT_METHODS = frozenset({"dflash", "dspark"})
 EagleModelTypes = Literal[
     "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
 ]
@@ -607,7 +607,11 @@ class SpeculativeConfig:
     tree_verify_widths: list[int] | None = None
     """Candidate verify widths for ``adaptive_tree_width``, each captured as
     its own uniform decode graph. ``nodes_max`` is always a candidate. Defaults
-    to the powers of two from 4 below ``nodes_max``."""
+    to 7, 15, 31 and 63 below ``nodes_max`` (verify blocks of 8 to 64 rows:
+    row-tiled kernels pad anything just past a power of two to the next)."""
+    tree_candidate_top_k: int = Field(default=8, ge=1, le=16)
+    """Candidates per draft position for drafters without a candidate head of
+    their own (top-k of each position's draft distribution)."""
 
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
@@ -1213,6 +1217,14 @@ class SpeculativeConfig:
                 "method `%s` is deprecated and replaced with mtp.", self.method
             )
             self.method = "mtp"
+
+        if self.use_tree() and self.method not in _TREE_DRAFT_METHODS:
+            # Fail closed: most methods never reach the tree validation below.
+            raise ValueError(
+                "tree verification needs a drafter that proposes every draft "
+                f"position in parallel (methods {sorted(_TREE_DRAFT_METHODS)}); "
+                f"got method={self.method!r}."
+            )
 
         if self.model is None and self.num_speculative_tokens is not None:
             if self.method == "mtp":
@@ -2057,7 +2069,8 @@ class SpeculativeConfig:
             return [nodes_max]
         widths = self.tree_verify_widths
         if widths is None:
-            widths = [1 << i for i in range(2, 7) if (1 << i) < nodes_max]
+            # The anchor plus 2^k - 1 nodes fills whole power-of-two row tiles.
+            widths = [(1 << i) - 1 for i in range(3, 7) if (1 << i) - 1 < nodes_max]
         return sorted({w for w in widths if 1 <= w < nodes_max} | {nodes_max})
 
     @property
@@ -2124,14 +2137,6 @@ class SpeculativeConfig:
         return self.num_speculative_tokens
 
     def _validate_tree(self) -> None:
-        archs = set(getattr(self.draft_model_config, "architectures", []))
-        if self.method != "dflash" or not (archs & _TREE_CANDIDATE_DRAFTERS):
-            raise ValueError(
-                "tree verification needs a drafter that proposes per-position "
-                f"candidates ({sorted(_TREE_CANDIDATE_DRAFTERS)} under method "
-                f"'dflash'); got method={self.method!r}, "
-                f"architectures={sorted(archs)}."
-            )
         self.parallel_drafting = True
         if self.num_speculative_tokens is None:
             raise ValueError("tree verification requires num_speculative_tokens")

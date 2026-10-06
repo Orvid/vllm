@@ -33,8 +33,73 @@ from vllm.logger import init_logger
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+from vllm.v1.worker.gpu.spec_decode.tree.proposal import DraftProposal
 
 logger = init_logger(__name__)
+
+
+class DSparkProposal(DraftProposal):
+    """DSpark's draft positions: parallel backbone logits (draft vocab) plus
+    the sequential head's Markov bias from each position's predecessor token.
+
+    Args:
+        model: The DSpark draft model.
+        base_logits: ``[R, S, V_draft]`` backbone logits.
+        anchor_ids: ``[R]`` each request's anchor token (target vocab).
+        target_to_draft: ``[V]`` draft id of each target token (-1 = not in
+            the draft vocab), or None for a full-vocab draft.
+
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        base_logits: torch.Tensor,
+        anchor_ids: torch.Tensor,
+        target_to_draft: torch.Tensor | None,
+    ):
+        self._model = model
+        self._base = base_logits
+        self._anchor_ids = anchor_ids
+        self._target_to_draft = target_to_draft
+
+    @property
+    def num_positions(self) -> int:
+        return self._base.shape[1]
+
+    def marginal_logits(self) -> torch.Tensor | None:
+        """Backbone logits before the Markov bias, in target vocab."""
+        if self._target_to_draft is None:
+            return self._base
+        logits = self._base.new_full(
+            (*self._base.shape[:2], self._target_to_draft.shape[0]), float("-inf")
+        )
+        cols = self._model.map_draft_to_target(
+            torch.arange(self._base.shape[-1], device=self._base.device)
+        )
+        return logits.index_copy_(-1, cols, self._base)
+
+    def candidates(self, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+        values, draft_ids = self._base.topk(k, dim=-1)
+        return self._model.map_draft_to_target(draft_ids), values
+
+    def conditional(self, ids: torch.Tensor) -> torch.Tensor | None:
+        num_reqs, _, num_cands = ids.shape
+        t2d = self._target_to_draft
+        draft_ids = ids if t2d is None else t2d[ids]
+        in_vocab = draft_ids >= 0
+        draft_ids = draft_ids.clamp(min=0)
+        prev = torch.cat(
+            [
+                self._anchor_ids[:, None, None].expand(num_reqs, 1, num_cands),
+                ids[:, :-1],
+            ],
+            dim=1,
+        )
+        unary = self._base.gather(-1, draft_ids).float()
+        unary = torch.where(in_vocab, unary, float("-inf"))
+        bias = self._model.markov_transition_bias(prev, draft_ids).float()
+        return unary.unsqueeze(-2) + bias
 
 
 class DSparkSpeculator(DFlashSpeculator):
@@ -72,6 +137,10 @@ class DSparkSpeculator(DFlashSpeculator):
             * self.num_query_per_req
         )
 
+        # Draft id of each target token (-1 = absent) for a reduced draft
+        # vocab, so tree selection can score any target token; set in
+        # load_draft_model.
+        self._target_to_draft: torch.Tensor | None = None
         # Reduced-vocab probabilistic drafting only; set in load_draft_model.
         self._d2t_scatter_index: torch.Tensor | None = None
         self._draft_scatter_buf: torch.Tensor | None = None
@@ -87,6 +156,13 @@ class DSparkSpeculator(DFlashSpeculator):
         target_attn_layer_names: set[str],
     ) -> torch.nn.Module:
         model = load_dspark_model(target_model, self.vllm_config)
+        if model.draft_id_to_target_id is not None:
+            d2t = model.draft_id_to_target_id
+            draft_ids = torch.arange(d2t.shape[0], device=d2t.device)
+            self._target_to_draft = torch.full(
+                (self.vocab_size,), -1, dtype=torch.int64, device=d2t.device
+            )
+            self._target_to_draft[draft_ids + d2t] = draft_ids
         # Reduced draft vocab: probabilistic rejection sampling indexes draft
         # logits by target id, so precompute the draft->target column map and a
         # scratch buffer to scatter logits into target vocab before sampling.
@@ -246,6 +322,33 @@ class DSparkSpeculator(DFlashSpeculator):
             self.draft_token_confidence_probs[:num_reqs] = confidence.view(
                 num_reqs, n_spec
             )
+
+    def _draft_proposal(
+        self,
+        num_reqs: int,
+        num_tokens_padded: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    ) -> DSparkProposal:
+        """The parallel backbone pass, for tree selection; the sequential
+        Markov head is applied to whatever edges the selector scores."""
+        head_hidden = self._run_model(
+            num_tokens_padded,
+            attn_metadata,
+            slot_mappings,
+            num_tokens_across_dp,
+            cudagraph_runtime_mode,
+        )
+        num_sample = num_reqs * self.num_speculative_steps
+        base_logits = self.model.compute_draft_logits(
+            head_hidden[self.sample_indices[:num_sample]]
+        ).view(num_reqs, self.num_speculative_steps, -1)
+        anchor_ids = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+        return DSparkProposal(
+            self.model, base_logits, anchor_ids, self._target_to_draft
+        )
 
     def _generate_draft(
         self,

@@ -10,6 +10,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.tree.proposal import CandidateHeadProposal
 
 
 @triton.jit
@@ -239,6 +240,27 @@ class DFlash2Speculator(DFlashSpeculator):
                 self.sample_idx_mapping[:num_sample],
                 self.sample_col[:num_sample],
             )
+
+    def _draft_proposal(
+        self,
+        num_reqs: int,
+        num_tokens_padded: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    ) -> CandidateHeadProposal:
+        """The candidate head's candidates and their transition scores."""
+        return CandidateHeadProposal(
+            *self._draft_tree_candidates(
+                num_reqs,
+                num_tokens_padded,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+            )
+        )
 
     def _draft_tree_candidates(
         self,
