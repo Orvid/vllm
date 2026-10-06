@@ -142,3 +142,27 @@ def test_triton_builder_never_emits_impossible_candidates():
     n = int(out.num_nodes[0])
     assert n == 2 + 4 + 8  # a full binary tree of depth 3
     assert (out.token_ids[0, :n] != sentinel).all()
+
+
+def test_children_follow_their_parents_candidate_row():
+    """Transition rows are indexed by the predecessor's candidate index, not
+    its best-first rank: the best path must be the greedy chain through the
+    transitions, which here prefer the other candidate after each one."""
+    L, K = 4, 2
+    cand = torch.tensor([[10, 11], [20, 21], [30, 31], [40, 41]], device="cuda")
+    scores = torch.zeros(1, L, K, K, device="cuda")
+    scores[0, 0, :, 1] = 3.0  # the anchor prefers candidate 1
+    for d in range(1, L):
+        scores[0, d, 0, 1] = 3.0  # after candidate 0 prefer candidate 1
+        scores[0, d, 1, 0] = 3.0  # after candidate 1 prefer candidate 0
+    greedy = [11, 20, 31, 40]
+
+    out = TreeBuilder(1, L, K, 8, "cuda").build(scores, cand[None])
+    ref = build_tree_naive(scores[0].cpu(), cand.cpu(), 8, L)
+    for tokens, depths in (
+        (out.token_ids[0].cpu(), out.depths[0].cpu()),
+        (ref.token_ids, ref.depths),
+    ):
+        # Best-first: the greedy chain's nodes are emitted first, in order.
+        assert depths[: len(greedy)].tolist() == [1, 2, 3, 4]
+        assert tokens[: len(greedy)].tolist() == greedy

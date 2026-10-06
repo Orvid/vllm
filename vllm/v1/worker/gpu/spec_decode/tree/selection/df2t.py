@@ -35,6 +35,7 @@ def _tree_builder_kernel(
     logp_out_ptr,  # [R, B] f32 node path log-mass (-inf past the node count)
     sorted_logp_ptr,  # [R, L * K, K] f32 best-first per-row logp
     sorted_cand_ptr,  # [R, L * K, K] i64 best-first per-row tokens
+    sorted_idx_ptr,  # [R, L * K, K] i32 best-first per-row candidate indices
     UMSB,  # int64 constant 1 << 63 for unsigned path comparison
     PAD,  # token id written to the inert tail past the live node count
     B: tl.constexpr,  # emitted nodes per request (<= 64)
@@ -81,6 +82,7 @@ def _tree_builder_kernel(
         srow = (row * (L * K) + d * K + pr) * K
         tl.store(sorted_logp_ptr + srow + rank, logp, mask=ok2)
         tl.store(sorted_cand_ptr + srow + rank, cands, mask=ok2)
+        tl.store(sorted_idx_ptr + srow + rank, tl.broadcast_to(cc, (KP, KP)), mask=ok2)
 
     tl.debug_barrier()
 
@@ -89,8 +91,11 @@ def _tree_builder_kernel(
     # packed path asc) -- the reference heap order -- emits it (emit index ==
     # arena index), replaces it with its next sibling and appends its best
     # child. Entries are (mass f64, parent mass f64, depth, rank, prank, parent
-    # arena, packed path). Paths pack 4 bits per depth; a depth-16 path can set
-    # the int64 sign bit, so paths compare unsigned (top bit flipped).
+    # arena, packed path), where rank is the entry's best-first position among
+    # its siblings and prank is its parent's candidate index, which picks the
+    # transition row it was ranked in (row 0 under the anchor). Paths pack 4
+    # bits per depth; a depth-16 path can set the int64 sign bit, so paths
+    # compare unsigned (top bit flipped).
     sorted_row = row * (L * K) * K
     slot = tl.arange(0, CAP)
     ar = tl.arange(0, BP)
@@ -137,8 +142,10 @@ def _tree_builder_kernel(
         sib_rank = top_rank + 1
         has_sib = sib_rank < K
         has_child = top_depth < L
-        crow = top_depth * K + top_rank
         token = tl.load(sorted_cand_ptr + sorted_row + drow * K + top_rank)
+        # The popped node's own candidate index picks its children's row.
+        top_idx = tl.load(sorted_idx_ptr + sorted_row + drow * K + top_rank)
+        crow = top_depth * K + top_idx
         sib_logp = tl.load(
             sorted_logp_ptr + sorted_row + drow * K + sib_rank, mask=has_sib, other=0.0
         )
@@ -167,7 +174,7 @@ def _tree_builder_kernel(
         pmass = tl.where(new, top_mass, pmass)
         depth = tl.where(new, top_depth + 1, depth)
         rank = tl.where(new, 0, rank)
-        prank = tl.where(new, top_rank, prank)
+        prank = tl.where(new, top_idx, prank)
         pa = tl.where(new, emit, pa)
         path = tl.where(new, top_path * 16, path)
         valid = (valid | new) & (mass > neg_inf)
@@ -249,6 +256,9 @@ class TreeBuilder:
         self._sorted_cand = torch.zeros(
             max_num_reqs, L * K, K, dtype=torch.int64, device=dev
         )
+        self._sorted_idx = torch.zeros(
+            max_num_reqs, L * K, K, dtype=torch.int32, device=dev
+        )
 
         # One packed row per request, [tokens | depths | parents | words |
         # num_nodes], so the tree moves (device store, host carry) as a single
@@ -305,6 +315,7 @@ class TreeBuilder:
             self.logp,
             self._sorted_logp,
             self._sorted_cand,
+            self._sorted_idx,
             self._umsb,
             self.pad_token_id,
             B=self.B,

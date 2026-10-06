@@ -261,7 +261,19 @@ def _best_first_perm(logp: torch.Tensor) -> torch.Tensor:
     return perm
 
 
-def _paths_to_draft(paths: list[tuple[int, ...]], tokens: torch.Tensor) -> TreeDraft:
+def _candidate_index(path: tuple[int, ...], perm: torch.Tensor) -> int:
+    """Candidate index of the node at ``path`` (best-first ranks per depth):
+    each rank is resolved in the row of its parent's candidate index, the
+    anchor's row being 0."""
+    idx = 0
+    for depth, rank in enumerate(path):
+        idx = int(perm[depth, idx, rank])
+    return idx
+
+
+def _paths_to_draft(
+    paths: list[tuple[int, ...]], tokens: torch.Tensor, perm: torch.Tensor
+) -> TreeDraft:
     n = len(paths)
     token_ids = torch.zeros(n, dtype=torch.long)
     depths = torch.zeros(n, dtype=torch.long)
@@ -270,8 +282,8 @@ def _paths_to_draft(paths: list[tuple[int, ...]], tokens: torch.Tensor) -> TreeD
     index: dict[tuple[int, ...], int] = {(): -1}
     for i, path in enumerate(paths):
         depth = len(path)
-        prank = path[-2] if depth >= 2 else 0
-        token_ids[i] = tokens[depth - 1, prank, path[-1]]
+        row = _candidate_index(path[:-1], perm)
+        token_ids[i] = tokens[depth - 1, row, path[-1]]
         depths[i] = depth
         parents[i] = index[path[:-1]]
         index[path] = i
@@ -285,9 +297,10 @@ def build_tree_naive(
     """Return the top-B tree prefixes ordered by transition mass.
 
     Args:
-        scores: [L, K, K] successor logits for (depth, predecessor rank,
-            candidate rank) in any order. Each row is re-ordered best-first
-            internally so the lazy next-sibling advance stays monotone in mass.
+        scores: [L, K, K] successor logits for (depth, predecessor candidate
+            index, candidate index); the predecessor of depth 0 is the anchor
+            (row 0). Each row is re-ordered best-first internally so the lazy
+            next-sibling advance stays monotone in mass.
         cand: [L, K] successor token ids per depth; the k-th candidate of a
             (depth, predecessor) row is ``cand[depth, k]``.
         B: number of emitted nodes (the implicit depth-0 anchor is excluded).
@@ -321,15 +334,16 @@ def build_tree_naive(
         depth = len(path)
         if path:
             parent_path = path[:-1]
-            prank = parent_path[-1] if parent_path else 0
+            prow = _candidate_index(parent_path, perm)
             rank = path[-1] + 1
             if rank < K:
-                sib_mass = parent_mass + float(sorted_logp[depth - 1, prank, rank])
+                sib_mass = parent_mass + float(sorted_logp[depth - 1, prow, rank])
                 heapq.heappush(heap, (-sib_mass, -parent_mass, parent_path + (rank,)))
         if depth >= L:
             continue
         # best child of this node
         c_rank = 0
-        child_mass = mass + float(sorted_logp[depth, path[-1] if path else 0, c_rank])
+        row = _candidate_index(path, perm)
+        child_mass = mass + float(sorted_logp[depth, row, c_rank])
         heapq.heappush(heap, (-child_mass, -mass, path + (c_rank,)))
-    return _paths_to_draft(emitted, tokens)
+    return _paths_to_draft(emitted, tokens, perm)
