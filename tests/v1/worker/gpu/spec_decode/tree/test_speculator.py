@@ -141,38 +141,56 @@ def test_selector_scores_independent_positions_by_their_own_logits() -> None:
     assert torch.equal(a.packed, b.packed)
 
 
+class _MarkovModel:
+    """A DSpark stand-in: target vocab 6, draft vocab 3 holding target tokens
+    1, 3 and 4, and a Markov bias of ``prev * w[draft id]``."""
+
+    d2t = torch.tensor([1, 2, 2])  # draft id + offset = target id
+    t2d = torch.tensor([-1, 0, -1, 1, 2, -1])
+    w = torch.tensor([0.0, 1.0, -1.0])
+
+    def map_draft_to_target(self, ids):
+        return ids + self.d2t[ids]
+
+    def markov_embed(self, token_ids):
+        return token_ids.float()
+
+    def markov_bias(self, embed):
+        return embed[:, None] * self.w
+
+    def markov_transition_bias(self, prev, index):
+        return prev.float().unsqueeze(-1) * self.w[index].unsqueeze(-2)
+
+
+def test_dspark_candidates_follow_the_greedy_chain() -> None:
+    """Candidates are ranked under the Markov head given the greedy previous
+    token, so the chain sampler's draft is always the first candidate."""
+    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkProposal
+
+    m = _MarkovModel()
+    base = torch.tensor([[[0.5, 2.0, 1.0], [3.0, 0.5, 1.5]]])  # [R=1, S=2, 3]
+    proposal = DSparkProposal(m, base, torch.tensor([5]), m.t2d)
+    ids, values = proposal.candidates(2)
+    # Position 0 after the anchor 5: [0.5, 7.0, -4.0] -> draft 1, 0.
+    # Position 1 after token 3: [3.0, 3.5, -1.5] -> draft 1, 0.
+    assert ids.tolist() == [[[3, 1], [3, 1]]]
+    assert values.tolist() == [[[7.0, 0.5], [3.5, 3.0]]]
+
+
 def test_dspark_proposal_scores_edges_with_the_markov_head() -> None:
     """Edges carry the backbone logit plus the Markov bias from the
     predecessor token (the anchor at the first position), in draft vocab."""
     from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkProposal
 
-    # Target vocab 6, draft vocab 3 holding target tokens 1, 3 and 4.
-    d2t = torch.tensor([1, 2, 2])  # draft id + offset = target id
-    t2d = torch.tensor([-1, 0, -1, 1, 2, -1])
-    seen = {}
-
-    class _Model:
-        def map_draft_to_target(self, ids):
-            return ids + d2t[ids]
-
-        def markov_transition_bias(self, prev, index):
-            seen["prev"], seen["index"] = prev, index
-            return (prev.unsqueeze(-1) * 10 + index.unsqueeze(-2)).float()
-
-    base = torch.tensor([[[0.5, 2.0, 1.0], [3.0, 0.0, 1.5]]])  # [R=1, S=2, 3]
-    proposal = DSparkProposal(_Model(), base, torch.tensor([5]), t2d)
-    ids, unary = proposal.candidates(2)
-    assert ids.tolist() == [[[3, 4], [1, 4]]]
-    assert unary.tolist() == [[[2.0, 1.0], [3.0, 1.5]]]
-
-    scores = proposal.conditional(torch.tensor([[[3, 4], [1, 0]]]))
-    assert seen["prev"].tolist() == [[[5, 5], [3, 4]]]
-    assert seen["index"].tolist() == [[[1, 2], [0, 0]]]
-    # Position 0 follows the anchor (5): logit + 50 + draft id.
-    assert scores[0, 0].tolist() == [[53.0, 53.0], [53.0, 53.0]]
-    # Position 1: predecessor 3 or 4; target 0 is outside the draft vocab.
-    assert scores[0, 1, 0, 0].item() == 3.0 + 30.0
-    assert scores[0, 1, 1, 0].item() == 3.0 + 40.0
+    m = _MarkovModel()
+    base = torch.tensor([[[0.5, 2.0, 1.0], [3.0, 0.5, 1.5]]])
+    proposal = DSparkProposal(m, base, torch.tensor([5]), m.t2d)
+    scores = proposal.conditional(torch.tensor([[[3, 1], [3, 0]]]))
+    # Position 0 follows the anchor (5).
+    assert scores[0, 0].tolist() == [[7.0, 0.5], [7.0, 0.5]]
+    # Position 1 follows 3 or 1; target 0 is outside the draft vocab.
+    assert scores[0, 1, 0, 0].item() == 0.5 + 3.0
+    assert scores[0, 1, 1, 0].item() == 0.5 + 1.0
     assert scores[0, 1, :, 1].tolist() == [float("-inf"), float("-inf")]
 
 

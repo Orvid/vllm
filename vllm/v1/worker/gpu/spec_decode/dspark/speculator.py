@@ -48,6 +48,8 @@ class DSparkProposal(DraftProposal):
         anchor_ids: ``[R]`` each request's anchor token (target vocab).
         target_to_draft: ``[V]`` draft id of each target token (-1 = not in
             the draft vocab), or None for a full-vocab draft.
+        draft_topk: Backbone tokens the sequential head re-ranks per position
+            (``dspark_draft_topk``), or None for the whole draft vocab.
 
     """
 
@@ -57,11 +59,13 @@ class DSparkProposal(DraftProposal):
         base_logits: torch.Tensor,
         anchor_ids: torch.Tensor,
         target_to_draft: torch.Tensor | None,
+        draft_topk: int | None = None,
     ):
         self._model = model
         self._base = base_logits
         self._anchor_ids = anchor_ids
         self._target_to_draft = target_to_draft
+        self._draft_topk = draft_topk
 
     @property
     def num_positions(self) -> int:
@@ -80,8 +84,27 @@ class DSparkProposal(DraftProposal):
         return logits.index_copy_(-1, cols, self._base)
 
     def candidates(self, k: int) -> tuple[torch.Tensor, torch.Tensor]:
-        values, draft_ids = self._base.topk(k, dim=-1)
-        return self._model.map_draft_to_target(draft_ids), values
+        """Each position's top ``k`` under the Markov head given the greedy
+        chain's previous token (the anchor first), as the chain sampler
+        drafts, so the greedy chain is always among them."""
+        prev = self._anchor_ids
+        ids, values = [], []
+        for s in range(self._base.shape[1]):
+            cond = self._base[:, s] + self._model.markov_bias(
+                self._model.markov_embed(prev)
+            )
+            if self._draft_topk is not None:
+                # The chain sampler only re-ranks the backbone's top tokens.
+                keep = self._base[:, s].topk(self._draft_topk, dim=-1).indices
+                cond = torch.full_like(cond, float("-inf")).scatter_(
+                    -1, keep, cond.gather(-1, keep)
+                )
+            v, draft_ids = cond.topk(k, dim=-1)
+            target_ids = self._model.map_draft_to_target(draft_ids)
+            ids.append(target_ids)
+            values.append(v)
+            prev = target_ids[:, 0]
+        return torch.stack(ids, dim=1), torch.stack(values, dim=1)
 
     def conditional(self, ids: torch.Tensor) -> torch.Tensor | None:
         num_reqs, _, num_cands = ids.shape
@@ -347,7 +370,11 @@ class DSparkSpeculator(DFlashSpeculator):
         ).view(num_reqs, self.num_speculative_steps, -1)
         anchor_ids = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
         return DSparkProposal(
-            self.model, base_logits, anchor_ids, self._target_to_draft
+            self.model,
+            base_logits,
+            anchor_ids,
+            self._target_to_draft,
+            self._draft_topk,
         )
 
     def _generate_draft(
