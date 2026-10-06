@@ -309,6 +309,11 @@ def tree_gated_delta_rule(
     return o
 
 
+# The chunk kernel holds [BT, BT] fp32 tiles; past 64 rows they no longer fit
+# in shared memory on 99 KB parts (SM12x).
+TREE_CHUNK_MAX_ROWS = 64
+
+
 @triton.jit
 def _tree_gated_delta_rule_chunk_kernel(
     q_ptr,
@@ -331,6 +336,7 @@ def _tree_gated_delta_rule_chunk_kernel(
     BV: tl.constexpr,
     MAXD: tl.constexpr,
     LOG2_MAXD: tl.constexpr,
+    KC: tl.constexpr,
 ):
     """One request's verify rows as a single chunk of the gated delta rule,
     with the causal mask replaced by the ancestor relation.
@@ -354,7 +360,6 @@ def _tree_gated_delta_rule_chunk_kernel(
     t = tl.arange(0, BT)
     rows = bos + t
     live = rows < eos
-    o_k = tl.arange(0, K)
     o_v = i_v * BV + tl.arange(0, BV)
     mv = o_v < V
 
@@ -373,24 +378,44 @@ def _tree_gated_delta_rule_chunk_kernel(
     big_g = tl.sum(tl.where(is_ancestor, b_g[None, :], 0.0), axis=1)
     decay = tl.where(is_ancestor, tl.exp(big_g[:, None] - big_g[None, :]), 0.0)
 
-    b_k = tl.load(
-        k_ptr + (rows[:, None] * H + h) * K + o_k[None, :],
-        mask=live[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    b_q = tl.load(
-        q_ptr + (rows[:, None] * H + h) * K + o_k[None, :],
-        mask=live[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    b_q = b_q * scale
+    # Row-by-row products over K in chunks, so no [BT, K] tile stays live.
+    slot = tl.load(state_indices_ptr + n).to(tl.int64)
+    s0_base = h0_ptr + slot * stride_state_slot + hv * V * K
+    kb_scale = b_beta * tl.exp(big_g)
+    kk = tl.zeros([BT, BT], dtype=tl.float32)
+    qk = tl.zeros([BT, BT], dtype=tl.float32)
+    ks0 = tl.zeros([BT, BV], dtype=tl.float32)  # (beta e^G k) S0^T
+    qs0 = tl.zeros([BT, BV], dtype=tl.float32)  # q S0^T
+    for kc in tl.static_range(0, K, KC):
+        o_k = kc + tl.arange(0, KC)
+        c_k = tl.load(
+            k_ptr + (rows[:, None] * H + h) * K + o_k[None, :],
+            mask=live[:, None],
+            other=0.0,
+        )
+        c_q = tl.load(
+            q_ptr + (rows[:, None] * H + h) * K + o_k[None, :],
+            mask=live[:, None],
+            other=0.0,
+        )
+        kk += tl.dot(c_k, tl.trans(c_k))
+        qk += tl.dot(c_q, tl.trans(c_k))
+        c_s0 = tl.load(
+            s0_base + o_v[:, None] * K + o_k[None, :],
+            mask=mv[:, None] & (slot > 0),
+            other=0.0,
+        ).to(tl.float32)
+        c_s0_t = tl.trans(c_s0)
+        ks0 += tl.dot(
+            c_k.to(tl.float32) * kb_scale[:, None], c_s0_t, input_precision="tf32"
+        )
+        qs0 += tl.dot(c_q.to(tl.float32), c_s0_t, input_precision="tf32")
     b_v = tl.load(
         v_ptr + (rows[:, None] * HV + hv) * V + o_v[None, :],
         mask=live[:, None] & mv[None, :],
         other=0.0,
     ).to(tl.float32)
 
-    kk = tl.dot(b_k, tl.trans(b_k), input_precision="tf32")
     strict = is_ancestor & (t[:, None] != t[None, :])
     a = tl.where(strict, b_beta[:, None] * decay * kk, 0.0)
     # T = (I + A)^-1. A links strict ancestors only, so A^j vanishes once j
@@ -402,24 +427,11 @@ def _tree_gated_delta_rule_chunk_kernel(
         m = tl.dot(m, m, input_precision="tf32")
         tinv = tl.dot(tinv, eye + m, input_precision="tf32")
 
-    w = tl.dot(tinv, b_k * (b_beta * tl.exp(big_g))[:, None], input_precision="tf32")
-    u = tl.dot(tinv, b_v * b_beta[:, None], input_precision="tf32")
-
-    slot = tl.load(state_indices_ptr + n).to(tl.int64)
-    s0 = tl.load(
-        h0_ptr
-        + slot * stride_state_slot
-        + hv * V * K
-        + o_v[:, None] * K
-        + o_k[None, :],
-        mask=mv[:, None] & (slot > 0),
-        other=0.0,
-    ).to(tl.float32)
-    s0_t = tl.trans(s0)  # [K, BV]
-    v_new = u - tl.dot(w, s0_t, input_precision="tf32")
-    qk = tl.dot(b_q, tl.trans(b_k), input_precision="tf32")
-    o = tl.exp(big_g)[:, None] * tl.dot(b_q, s0_t, input_precision="tf32")
+    # v' = T (beta v) - T ((beta e^G k) S0^T)
+    v_new = tl.dot(tinv, b_v * b_beta[:, None] - ks0, input_precision="tf32")
+    o = tl.exp(big_g)[:, None] * qs0
     o += tl.dot(qk * decay, v_new, input_precision="tf32")
+    o *= scale
     tl.store(
         o_ptr + (rows[:, None] * HV + hv) * V + o_v[None, :],
         o.to(o_ptr.dtype.element_ty),
@@ -443,7 +455,8 @@ def tree_gated_delta_rule_chunk(
     scale: float | None = None,
 ) -> torch.Tensor:
     """:func:`tree_gated_delta_rule` as one masked chunk per request
-    (tensor-core dots); requests may hold at most ``max_rows`` rows."""
+    (tensor-core dots, the committed state read once per head); requests may
+    hold at most ``max_rows <= TREE_CHUNK_MAX_ROWS`` rows."""
     num_rows, H, K = k.shape
     HV, V = v.shape[1], v.shape[2]
     o = torch.empty_like(v)
@@ -451,10 +464,12 @@ def tree_gated_delta_rule_chunk(
         return o
     if scale is None:
         scale = K**-0.5
+    assert max_rows <= TREE_CHUNK_MAX_ROWS, max_rows
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
     assert ssm_state.stride(3) == 1 and ssm_state.stride(2) == K
-    assert triton.next_power_of_2(K) == K
-    BV = 32
+    assert triton.next_power_of_2(K) == K and K % 32 == 0
+    # One program per head and request: the [BT, BT] system is solved once.
+    BV = min(128, triton.next_power_of_2(V))
     _tree_gated_delta_rule_chunk_kernel[(triton.cdiv(V, BV), num_seqs * HV)](
         q,
         k,
@@ -476,7 +491,9 @@ def tree_gated_delta_rule_chunk(
         BV=BV,
         MAXD=triton.next_power_of_2(max_depth),
         LOG2_MAXD=max(1, (triton.next_power_of_2(max_depth) - 1).bit_length()),
-        num_warps=4,
+        KC=32,
+        num_warps=8,
+        num_stages=1,
     )
     return o
 

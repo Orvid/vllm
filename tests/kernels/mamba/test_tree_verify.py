@@ -108,6 +108,38 @@ def test_tree_gated_delta_rule_matches_per_path_recurrence(chunked: bool):
             torch.testing.assert_close(out[row, hv], ref, rtol=tol, atol=tol)
 
 
+@pytest.mark.parametrize("width", [16, 32, 63])
+def test_chunk_kernel_matches_per_path_on_wide_trees(width: int):
+    """Trees up to the chunk kernel's row limit (padded tiles up to 64 rows),
+    at production head sizes and bf16 inputs."""
+    torch.manual_seed(width)
+    H, HV, K, V = 4, 8, 128, 128
+    num_reqs, rows = 2, 1 + width
+    parents: list[int] = []
+    for n in range(num_reqs):
+        base, depth = n * rows, [0]
+        parents.append(-1)
+        for i in range(1, rows):
+            options = [j for j in range(i) if depth[j] < 7]
+            p = options[int(torch.randint(len(options), ()))]
+            parents.append(base + p)
+            depth.append(depth[p] + 1)
+    T = num_reqs * rows
+    parent = torch.tensor(parents, dtype=torch.int32, device=DEVICE)
+    qsl = torch.arange(0, T + 1, rows, dtype=torch.int32, device=DEVICE)
+    slots = torch.tensor([1, 2], dtype=torch.int32, device=DEVICE)
+    q = F.normalize(torch.randn(T, H, K, device=DEVICE), dim=-1).bfloat16()
+    k = F.normalize(torch.randn(T, H, K, device=DEVICE), dim=-1).bfloat16()
+    v = torch.randn(T, HV, V, device=DEVICE).bfloat16()
+    g = -torch.rand(T, HV, device=DEVICE)
+    beta = torch.rand(T, HV, device=DEVICE)
+    state = torch.randn(3, HV, V, K, device=DEVICE) * 0.1
+    args = (q, k, v, g, beta, state, slots, qsl, num_reqs, parent)
+    ref = tree_gated_delta_rule(*args, max_depth=8)
+    out = tree_gated_delta_rule_chunk(*args, max_depth=8, max_rows=rows)
+    torch.testing.assert_close(out.float(), ref.float(), rtol=3e-3, atol=3e-3)
+
+
 @pytest.mark.parametrize("block_size", [4, 1 << 20])
 def test_commit_stores_block_end_and_running_states(block_size: int):
     """Committing a path replays it from the state the verify read and stores

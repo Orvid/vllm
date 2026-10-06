@@ -44,9 +44,11 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_update,
 )
 from vllm.model_executor.layers.mamba.ops.tree_verify import (
+    TREE_CHUNK_MAX_ROWS,
     commit_gated_delta_rule_paths,
     tree_causal_conv1d,
     tree_gated_delta_rule,
+    tree_gated_delta_rule_chunk,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
@@ -1327,19 +1329,36 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             apply_l2norm=True,
             output_g_exp=False,
         )
-        out = tree_gated_delta_rule(
-            query,
-            key,
-            value,
-            g,
-            beta,
-            ssm_state,
-            state_indices,
-            query_start_loc,
-            num_seqs,
-            tree.row_parent,
-            max_depth=tree.max_depth + 1,
-        )
+        max_rows = tree.max_width + 1
+        if max_rows <= TREE_CHUNK_MAX_ROWS:
+            out = tree_gated_delta_rule_chunk(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                ssm_state,
+                state_indices,
+                query_start_loc,
+                num_seqs,
+                tree.row_parent,
+                max_depth=tree.max_depth + 1,
+                max_rows=max_rows,
+            )
+        else:
+            out = tree_gated_delta_rule(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                ssm_state,
+                state_indices,
+                query_start_loc,
+                num_seqs,
+                tree.row_parent,
+                max_depth=tree.max_depth + 1,
+            )
         return out.unsqueeze(0)
 
     def tree_commit(

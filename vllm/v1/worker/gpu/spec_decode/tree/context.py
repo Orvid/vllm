@@ -133,6 +133,8 @@ class TreeVerifyContext:
         max_num_reqs: Requests a batch can hold.
         max_depth: Deepest node a tree can have (bounds a committed path).
         device: Device of the buffers.
+        max_width: Most nodes a request's tree can verify (its verify block
+            is the anchor plus these); defaults to the rows a batch holds.
 
     """
 
@@ -142,9 +144,11 @@ class TreeVerifyContext:
         max_num_reqs: int,
         max_depth: int,
         device: torch.device,
+        max_width: int | None = None,
     ):
         self.max_num_reqs = max_num_reqs
         self.max_depth = max_depth
+        self.max_width = max_num_tokens - 1 if max_width is None else max_width
         self.row_parent = torch.full(
             (max_num_tokens,), -1, dtype=torch.int32, device=device
         )

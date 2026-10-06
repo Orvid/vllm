@@ -797,7 +797,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if spec is not None and spec.use_tree():
             assert spec.max_tree_depth is not None
             self._tree_ctx = TreeVerifyContext(
-                self.max_num_tokens, self.max_num_reqs, spec.max_tree_depth, self.device
+                self.max_num_tokens,
+                self.max_num_reqs,
+                spec.max_tree_depth,
+                self.device,
+                max_width=BudgetPolicy.from_config(spec).resolve_nodes_max(),
             )
             draft_layers: set[str] = getattr(
                 self.speculator, "draft_attn_layer_names", set()
