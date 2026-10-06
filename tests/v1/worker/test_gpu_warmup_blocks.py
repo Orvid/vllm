@@ -84,20 +84,23 @@ def _make_runner(
     kv_cache_groups: list[KVCacheGroupSpec],
     num_lookahead_tokens: int,
     num_spec_steps: int = NUM_SPEC_STEPS,
+    decode_query_len: int | None = None,
 ) -> SimpleNamespace:
     """Stub model runner exposing only what the warmup entry points read."""
     return SimpleNamespace(
         num_speculative_steps=num_spec_steps,
         adaptive_verification=None,
         rejection_sampler=None,
-        decode_query_len=num_spec_steps + 1,
+        decode_query_len=decode_query_len or num_spec_steps + 1,
         is_pooling_model=False,
         is_encoder_decoder=False,
         is_last_pp_rank=True,
         max_num_reqs=4,
         max_model_len=MAX_MODEL_LEN,
         model_config=SimpleNamespace(get_vocab_size=lambda: 64),
-        model_state=SimpleNamespace(max_encoder_len=0),
+        model_state=SimpleNamespace(
+            max_encoder_len=0, num_new_sampled_tokens_per_step=1
+        ),
         scheduler_config=SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=2048),
         kv_cache_config=SimpleNamespace(
             kv_cache_groups=kv_cache_groups, num_blocks=1024
@@ -173,6 +176,25 @@ def test_warmup_kernels_reserves_lookahead_blocks(num_spec_steps, extra_lookahea
     )
 
     _assert_covers_lookahead(recorder.steps, num_lookahead_tokens)
+
+
+def test_warmup_drafts_fit_a_tree_narrower_than_the_drafter():
+    """A tree's verify block (4 rows) can be narrower than the drafter depth
+    (7): every spec-decode step schedules one draft per row past the anchor,
+    so the runner never computes more logits than the request has rows."""
+    seen = []
+
+    def execute_model(scheduler_output) -> None:
+        for req_id, drafts in scheduler_output.scheduled_spec_decode_tokens.items():
+            seen.append((len(drafts), scheduler_output.num_scheduled_tokens[req_id]))
+
+    warmup_kernels(
+        _make_runner([_attention_group()], 8, num_spec_steps=7, decode_query_len=4),
+        execute_model,
+        lambda grammar_output=None: None,
+    )
+    assert seen
+    assert all(drafts == 3 and scheduled == 4 for drafts, scheduled in seen)
 
 
 def test_mixed_warmup_reserves_lookahead_blocks():

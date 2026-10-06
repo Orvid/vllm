@@ -255,6 +255,11 @@ def _warmup_kernels(
 
     num_spec_steps = model_runner.num_speculative_steps
     decode_query_len = model_runner.decode_query_len
+    # Drafts a spec-decode request verifies per step: the query rows past its
+    # sampled tokens (a tree's width, which can be below the drafter depth).
+    num_drafts_per_step = (
+        decode_query_len - model_runner.model_state.num_new_sampled_tokens_per_step
+    )
     # Use decode_query_len + 1 tokens so the prefill batch's per-request query
     # length exceeds decode_query_len, preventing it from being misclassified as
     # a uniform decode batch.
@@ -406,7 +411,7 @@ def _warmup_kernels(
                 ]
                 step_num_scheduled_tokens[req_ids[i]] = num_tokens
                 if use_spec:
-                    step_spec_tokens[req_ids[i]] = [0] * num_spec_steps
+                    step_spec_tokens[req_ids[i]] = [0] * num_drafts_per_step
 
             decode_output = SchedulerOutput.make_empty()
             decode_output.scheduled_cached_reqs = cached_req_data
