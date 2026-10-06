@@ -3632,6 +3632,16 @@ def test_eagle_block_drop_can_be_disabled_without_disabling_eagle(
     assert speculative_config.use_eagle_block_drop() is not disable_eagle_block_drop
 
 
+def test_dflash_keeps_the_trailing_prefix_cache_block():
+    """DFlash's draft KV at a position depends on that position alone, so a
+    full trailing block is reusable and must not be dropped."""
+    speculative_config = SpeculativeConfig(method="ngram", num_speculative_tokens=3)
+    speculative_config.method = "dflash"
+
+    assert speculative_config.use_eagle()
+    assert not speculative_config.use_eagle_block_drop()
+
+
 def test_draft_sample_method_gumbel_is_rejected():
     with pytest.raises(ValidationError):
         SpeculativeConfig(

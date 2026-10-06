@@ -2094,8 +2094,19 @@ class SpeculativeConfig:
         return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
 
     def use_eagle_block_drop(self) -> bool:
-        """Whether volatile trailing cache blocks should be discarded."""
-        return self.use_eagle() and not self.disable_eagle_block_drop
+        """Whether volatile trailing cache blocks should be discarded.
+
+        EAGLE-style drafters key position ``p`` on token ``p + 1``, so the last
+        cached block's draft KV is incomplete. DFlash's context K/V at ``p`` is
+        a projection of the target's features at ``p`` alone, so a full block
+        is complete and is kept (on hybrid targets the drop would also back
+        the recurrent-state checkpoint off by a whole, often large, block).
+        """
+        return (
+            self.use_eagle()
+            and not self.use_dflash()
+            and not self.disable_eagle_block_drop
+        )
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"
