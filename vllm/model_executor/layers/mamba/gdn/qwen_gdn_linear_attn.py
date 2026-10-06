@@ -1342,7 +1342,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         return out.unsqueeze(0)
 
-    def tree_commit(self, commit: "TreeCommit", attn_metadata: Any) -> None:
+    def tree_commit(
+        self,
+        commit: "TreeCommit",
+        attn_metadata: Any,
+        block_table: torch.Tensor,
+        block_size: int,
+    ) -> None:
         metadata = (
             attn_metadata.get(self.prefix) if isinstance(attn_metadata, dict) else None
         )
@@ -1354,12 +1360,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert self._tree_stash is not None
         assert metadata.spec_state_indices_tensor is not None
         conv_state, conv_weights = self._conv_state_and_weights()
+        max_rows = commit.num_reqs * commit.max_rows_per_req
         commit_gated_delta_rule_paths(
-            self._tree_stash[commit.rows],
+            self._tree_stash[commit.rows[:max_rows]],
+            commit.positions[:max_rows],
             commit.cu_rows[: num_seqs + 1],
             num_seqs,
-            commit.max_rows_per_req,
             metadata.spec_state_indices_tensor[:num_seqs, 0],
+            block_table,
+            block_size,
             conv_state,
             conv_weights,
             self.conv1d.bias,

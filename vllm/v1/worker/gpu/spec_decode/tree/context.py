@@ -60,11 +60,13 @@ def _fill_row_parents_kernel(
 @triton.jit
 def _build_commit_kernel(
     rows_ptr,  # [R * (1 + L)] int64 committed rows, compacted
+    row_pos_ptr,  # [R * (1 + L)] committed rows' sequence positions
     cu_rows_ptr,  # [R + 1] int32
     num_rows_ptr,  # [R] int32
     arenas_ptr,  # [*, arena_stride] int64 accepted arena per depth (col 0 unused)
     arena_stride,
     query_start_loc_ptr,  # [R + 1] int32
+    positions_ptr,  # [num_tokens] batch rows' sequence positions
     tree_width_ptr,  # [R] int32
     num_reqs,
     L: tl.constexpr,  # max accepted depth
@@ -92,10 +94,13 @@ def _build_commit_kernel(
     row = tl.where(
         j[None, :] == 0, block_start[:, None], block_start[:, None] + 1 + arena
     )
+    mask = rm[:, None] & (j[None, :] < n[:, None])
+    tl.store(rows_ptr + start[:, None] + j[None, :], row.to(tl.int64), mask=mask)
+    anchor_pos = tl.load(positions_ptr + block_start, mask=rm & (width > 0), other=0)
     tl.store(
-        rows_ptr + start[:, None] + j[None, :],
-        row.to(tl.int64),
-        mask=rm[:, None] & (j[None, :] < n[:, None]),
+        row_pos_ptr + start[:, None] + j[None, :],
+        anchor_pos[:, None] + j[None, :],
+        mask=mask,
     )
 
 
@@ -111,6 +116,9 @@ class TreeCommit:
     """
 
     rows: torch.Tensor
+    # Sequence position of each committed row (the anchor's is the request's
+    # committed length C; an accepted node's is C + its depth).
+    positions: torch.Tensor
     cu_rows: torch.Tensor
     num_rows: torch.Tensor
     num_reqs: int
@@ -145,6 +153,9 @@ class TreeVerifyContext:
         # Commit buffers, written after each walk.
         per_req = 1 + max_depth
         self._commit_rows = torch.zeros(
+            max_num_reqs * per_req, dtype=torch.int64, device=device
+        )
+        self._commit_positions = torch.zeros(
             max_num_reqs * per_req, dtype=torch.int64, device=device
         )
         self._cu_rows = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
@@ -183,20 +194,25 @@ class TreeVerifyContext:
         )
 
     def build_commit(
-        self, accepted_arenas: torch.Tensor, query_start_loc: torch.Tensor
+        self,
+        accepted_arenas: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        positions: torch.Tensor,
     ) -> TreeCommit:
         """The committed path per tree request from the walk's accepted
         arenas (``[num_reqs, 1 + B]``, column ``d`` = the node accepted at
-        depth ``d``, -1 = none)."""
+        depth ``d``, -1 = none) and the batch rows' sequence ``positions``."""
         num_reqs = self.num_reqs
         if num_reqs:
             _build_commit_kernel[(1,)](
                 self._commit_rows,
+                self._commit_positions,
                 self._cu_rows,
                 self._num_rows,
                 accepted_arenas,
                 accepted_arenas.stride(0),
                 query_start_loc,
+                positions,
                 self.tree_width,
                 num_reqs,
                 L=self.max_depth,
@@ -205,6 +221,7 @@ class TreeVerifyContext:
             )
         return TreeCommit(
             rows=self._commit_rows,
+            positions=self._commit_positions,
             cu_rows=self._cu_rows[: num_reqs + 1],
             num_rows=self._num_rows[:num_reqs],
             num_reqs=num_reqs,

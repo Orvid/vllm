@@ -20,6 +20,7 @@ own chain kernels from the request's state slot, so the commit reuses each
 family's existing state-update path.
 """
 
+from collections.abc import Sequence
 from typing import Any, Protocol, runtime_checkable
 
 import torch
@@ -40,10 +41,19 @@ class TreeRecurrentLayer(Protocol):
         verify forward writes row ``i``'s inputs to."""
         ...
 
-    def tree_commit(self, commit: TreeCommit, attn_metadata: Any) -> None:
+    def tree_commit(
+        self,
+        commit: TreeCommit,
+        attn_metadata: Any,
+        block_table: torch.Tensor,
+        block_size: int,
+    ) -> None:
         """Advance each tree request's state over its committed rows (read
-        from the stash), using this step's ``attn_metadata`` for the layer's
-        state slots."""
+        from the stash), from the state slot the verify read (this step's
+        ``attn_metadata``). The state after a row is stored in the slot of the
+        row's state block (``block_table[req, position // block_size]``)
+        whenever the row ends that block or the path, so prefix caching finds
+        block-end states and the newest block holds the running state."""
         ...
 
 
@@ -65,9 +75,14 @@ class TreeRecurrentLayers:
 
     """
 
+    # Layer name -> (kv-cache group, state block size), set once the KV cache
+    # config is known (bind_kv_cache_groups).
+    _groups: dict[str, tuple[int, int]]
+
     def __init__(
         self, layers: dict[str, Any], max_rows: int, device: torch.device
     ) -> None:
+        self._groups = {}
         unsupported = [
             name
             for name, layer in layers.items()
@@ -87,6 +102,23 @@ class TreeRecurrentLayers:
                 torch.empty(max_rows, columns, dtype=dtype, device=device)
             )
 
-    def commit(self, commit: TreeCommit, attn_metadata: Any) -> None:
-        for layer in self.layers.values():
-            layer.tree_commit(commit, attn_metadata)
+    def bind_kv_cache_groups(self, kv_cache_groups: Sequence[Any]) -> None:
+        """Record each layer's kv-cache group and its state block size."""
+        for g, group in enumerate(kv_cache_groups):
+            for name in group.layer_names:
+                if name in self.layers:
+                    self._groups[name] = (g, group.kv_cache_spec.block_size)
+        missing = set(self.layers) - set(self._groups)
+        assert not missing, f"stateful layers without a kv-cache group: {missing}"
+
+    def commit(
+        self,
+        commit: TreeCommit,
+        attn_metadata: Any,
+        block_tables: Sequence[torch.Tensor],
+    ) -> None:
+        """Commit every layer, giving each its group's batch-ordered block
+        table."""
+        for name, layer in self.layers.items():
+            g, block_size = self._groups[name]
+            layer.tree_commit(commit, attn_metadata, block_tables[g], block_size)

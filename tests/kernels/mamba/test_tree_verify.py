@@ -103,22 +103,41 @@ def test_tree_gated_delta_rule_matches_per_path_recurrence(chunked: bool):
                 u = beta[r, hv] * (v[r, hv] - S @ k[r, h])
                 S = S + torch.outer(u, k[r, h])
             ref = S @ (q[row, h] * scale)
-            torch.testing.assert_close(out[row, hv], ref, rtol=1e-4, atol=1e-4)
+            # The chunk kernel's dots run in TF32.
+            tol = 2e-3 if chunked else 1e-4
+            torch.testing.assert_close(out[row, hv], ref, rtol=tol, atol=tol)
 
 
-def test_commit_advances_state_over_committed_rows():
-    """Committing a path leaves the conv state holding the path's newest raw
-    inputs and the recurrent state where the chain recurrence over the path
-    ends; a request with nothing committed keeps both."""
+@pytest.mark.parametrize("block_size", [4, 1 << 20])
+def test_commit_stores_block_end_and_running_states(block_size: int):
+    """Committing a path replays it from the state the verify read and stores
+    the state (and conv window) after the last row of every state block it
+    touches -- block-end states for prefix caching, then the running state --
+    leaving every other slot alone. With one block per sequence (no prefix
+    caching) only the running state is stored."""
     torch.manual_seed(0)
     H, HV, K, V, width = 2, 4, 32, 32, 4
     conv_dim = 2 * H * K + HV * V
-    # Request 0 commits 3 rows, request 1 none, request 2 two rows.
+    # Request 0 commits 3 rows at positions 6..8 (crossing into block 2 when
+    # blocks are 4 long), request 1 none, request 2 two rows at 9..10.
     cu = torch.tensor([0, 3, 3, 5], dtype=torch.int32, device=DEVICE)
-    slots = torch.tensor([2, 4, 6], dtype=torch.int32, device=DEVICE)
+    positions = torch.tensor([6, 7, 8, 9, 10], dtype=torch.int64, device=DEVICE)
+    num_blocks = 4
+    block_table = torch.arange(
+        1, 1 + 3 * num_blocks, dtype=torch.int32, device=DEVICE
+    ).view(3, num_blocks)
+    if block_size > 16:
+        block_table[:, 1:] = 0
+    # The verify read each request's state from the block of position C - 1.
+    init = torch.tensor(
+        [int(block_table[n, (c - 1) // block_size]) for n, c in enumerate([6, 9, 9])],
+        dtype=torch.int32,
+        device=DEVICE,
+    )
     rows = torch.randn(5, conv_dim + 2 * HV, device=DEVICE)
-    conv_state = torch.randn(8, conv_dim, width - 1, device=DEVICE)
-    ssm_state = torch.randn(8, HV, V, K, device=DEVICE)
+    num_slots = 1 + 3 * num_blocks
+    conv_state = torch.randn(num_slots, conv_dim, width - 1, device=DEVICE)
+    ssm_state = torch.randn(num_slots, HV, V, K, device=DEVICE)
     weight = torch.randn(conv_dim, width, device=DEVICE)
     bias = torch.randn(conv_dim, device=DEVICE)
     A_log = torch.randn(HV, device=DEVICE)
@@ -127,10 +146,12 @@ def test_commit_advances_state_over_committed_rows():
 
     commit_gated_delta_rule_paths(
         rows,
+        positions,
         cu,
         3,
-        3,
-        slots,
+        init,
+        block_table,
+        block_size,
         conv_state,
         weight,
         bias,
@@ -143,21 +164,16 @@ def test_commit_advances_state_over_committed_rows():
         V,
     )
 
-    torch.testing.assert_close(conv_state[4], conv_before[4])
-    torch.testing.assert_close(ssm_state[4], ssm_before[4])
+    conv_ref, ssm_ref = conv_before.clone(), ssm_before.clone()
     for n, (lo, hi) in enumerate([(0, 3), (3, 3), (3, 5)]):
         if lo == hi:
             continue
-        slot = slots[n]
-        x = rows[lo:hi, :conv_dim]
-        seq = torch.cat([conv_before[slot].T, x], dim=0)
-        torch.testing.assert_close(conv_state[slot], seq[-(width - 1) :].T)
-        S = ssm_before[slot].clone()
+        seq = torch.cat([conv_before[init[n]].T, rows[lo:hi, :conv_dim]], dim=0)
+        S = ssm_before[init[n]].clone()
         for t in range(hi - lo):
             window = seq[t : t + width]
             y = F.silu((window.T * weight).sum(-1) + bias)
             q, k, v = y.split([H * K, H * K, HV * V])
-            q = F.normalize(q.view(H, K), dim=-1) * K**-0.5
             k = F.normalize(k.view(H, K), dim=-1)
             v = v.view(HV, V)
             b = rows[lo + t, conv_dim : conv_dim + HV]
@@ -169,4 +185,11 @@ def test_commit_advances_state_over_committed_rows():
                 S[hv] = S[hv] * torch.exp(g[hv])
                 u = beta[hv] * (v[hv] - S[hv] @ k[h])
                 S[hv] = S[hv] + torch.outer(u, k[h])
-        torch.testing.assert_close(ssm_state[slot], S, rtol=1e-3, atol=1e-3)
+            pos = int(positions[lo + t])
+            last = t == hi - lo - 1
+            if last or (pos + 1) // block_size != pos // block_size:
+                slot = int(block_table[n, pos // block_size])
+                ssm_ref[slot] = S
+                conv_ref[slot] = seq[t + 1 : t + width].T
+    torch.testing.assert_close(conv_state, conv_ref)
+    torch.testing.assert_close(ssm_state, ssm_ref, rtol=1e-3, atol=1e-3)

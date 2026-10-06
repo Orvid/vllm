@@ -497,7 +497,7 @@ def test_batched_compaction_matches_reference_bit_identical():
         ]
         num_slots = int(num_computed.max().item()) + W + 2
         _seed_kv(views, group_specs, block_size, num_slots)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         initial = buf.clone()
         _old_compact_reference(
             views,
@@ -510,10 +510,10 @@ def test_batched_compaction_matches_reference_bit_identical():
             trees,
             R,
         )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         reference = buf.clone()
         buf.copy_(initial)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         compactor = TreeKVCompaction(R, W, views, groups, torch.device("cuda"))
         compactor.compact(
             num_sampled,
@@ -523,7 +523,7 @@ def test_batched_compaction_matches_reference_bit_identical():
             [block_tables] * len(groups),
             R,
         )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         assert torch.equal(buf, reference), f"seed {seed} diverged"
         # A single (slab, L)-grid pair covers the whole batch, and slabs tile
         # at whole-request boundaries (a W-multiple).
@@ -572,7 +572,7 @@ def test_batched_compaction_treeless_requests_untouched():
         [block_tables] * len(groups),
         R,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert torch.equal(buf, snapshot)
 
 
@@ -631,7 +631,11 @@ def test_batched_compaction_multi_slab_aliasing_at_boundary():
         .expand(R, nb)
         .contiguous()
     )
-    num_sampled = torch.full((R,), 4, dtype=torch.int32, device="cuda")
+    # num_sampled = 1 + the accepted nodes listed per request: a -1 arena
+    # inside the accepted count would give two nodes the same canonical slot,
+    # which the verifier never produces and which makes the result racy.
+    num_sampled = torch.full((R,), 3, dtype=torch.int32, device="cuda")
+    num_sampled[[6, 13, 19]] = 4
     accepted_arenas = torch.full((R, W + 1), -1, dtype=torch.long, device="cuda")
     trees = []
     for r in range(R):
@@ -661,7 +665,7 @@ def test_batched_compaction_multi_slab_aliasing_at_boundary():
 
     num_slots = int(num_computed.max().item()) + W + 2
     _seed_kv(views, group_specs, block_size, num_slots)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     initial = buf.clone()
     _old_compact_reference(
         views,
@@ -674,10 +678,10 @@ def test_batched_compaction_multi_slab_aliasing_at_boundary():
         trees,
         R,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     reference = buf.clone()
     buf.copy_(initial)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     # L=2, max_el=4, itemsize=4 -> row_bytes=32; budget=26*32 -> raw slab 26
     # (< a=96, multi-slab) and NOT a W-multiple pre-fix.
@@ -693,8 +697,12 @@ def test_batched_compaction_multi_slab_aliasing_at_boundary():
             [block_tables] * len(groups),
             R,
         )
-    torch.cuda.synchronize()
-    assert torch.equal(buf, reference)
+    torch.accelerator.synchronize()
+    bad = (buf != reference).nonzero().flatten()[:12].tolist()
+    assert not bad, (
+        f"elems {bad}: got {buf[bad].tolist()} want {reference[bad].tolist()} "
+        f"initial {initial[bad].tolist()}"
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -748,7 +756,7 @@ def test_batched_compaction_multi_slab_random_stress():
             block_size,
             int(num_computed.max().item()) + W + 2,
         )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         initial = buf.clone()
         _old_compact_reference(
             views,
@@ -761,10 +769,10 @@ def test_batched_compaction_multi_slab_random_stress():
             trees,
             R,
         )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         reference = buf.clone()
         buf.copy_(initial)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         # L=2, max_el=4, itemsize=4 -> row_bytes=32; budget=17*32=544 ->
         # raw slab 17, W-aligned to 15 (multiple of 5) < a=200 (multi-slab).
         with _force_slab_budget(17 * 32):
@@ -779,7 +787,7 @@ def test_batched_compaction_multi_slab_random_stress():
                 [block_tables] * len(groups),
                 R,
             )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         assert torch.equal(buf, reference), f"seed {seed} diverged"
 
 
@@ -909,7 +917,7 @@ def test_compaction_storage_carving_bit_identical():
     )
     num_slots = int(num_computed.max().item()) + W + 2
     _seed_kv(views, group_specs, block_size, num_slots)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     initial = buf.clone()
     _old_compact_reference(
         views,
@@ -922,10 +930,10 @@ def test_compaction_storage_carving_bit_identical():
         trees,
         R,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     reference = buf.clone()
     buf.copy_(initial)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     storage = torch.empty(
         TreeKVCompaction.reserved_bytes(
@@ -967,7 +975,7 @@ def test_compaction_storage_carving_bit_identical():
         [block_tables] * len(groups),
         R,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert torch.equal(buf, reference), "carved compactor diverged from reference"
     with pytest.raises(ValueError, match="reservation is too small"):
         TreeKVCompaction(
@@ -1033,7 +1041,7 @@ def test_batched_compaction_chain_width_vs_arena_span():
     ]
     num_slots = arena_span + 2
     _seed_kv(views, group_specs, block_size, num_slots)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     initial = buf.clone()
     _old_compact_reference(
         views,
@@ -1046,10 +1054,10 @@ def test_batched_compaction_chain_width_vs_arena_span():
         trees,
         R,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     reference = buf.clone()
     buf.copy_(initial)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     compactor = TreeKVCompaction(
         R, W, views, groups, torch.device("cuda"), arena_span=arena_span
@@ -1064,7 +1072,7 @@ def test_batched_compaction_chain_width_vs_arena_span():
         [block_tables] * len(groups),
         R,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert torch.equal(buf, reference), "deep-arena accepted nodes diverged"
     # The reservation must agree with the split sizing.
     assert (

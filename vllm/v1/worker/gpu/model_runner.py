@@ -604,7 +604,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 torch.Tensor,
                 torch.Tensor,
                 int,
-                int | None,
+                dict[str, int | None],
                 torch.Tensor | None,
             ]
             | None
@@ -892,35 +892,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     ),
                 )
                 if self.speculative_config.use_tree():
-                    # DF2T verifies with tree traversal, not rejection. The
-                    # TreeVerifier is sized by the operative df2t node budget
-                    # (BudgetPolicy.resolve_nodes_max, clamped to
-                    # [nodes_floor, nodes_ceiling]) — the same single source
-                    # that sizes the speculator's TreeBuilder — so the
-                    # unclamped get_num_draft_tokens cannot silently diverge
-                    # from the tree buffers. A tree-off df2t (enable_tree=False)
-                    # keeps ``tree_verifier`` None and reproduces the DFlash2
-                    # chain rejection path.
-                    # Fixed-round bound sized to the real chain width (the
-                    # node budget and the max tree depth), not the 64-node
-                    # ceiling: an accepted chain can never be longer than
-                    # ``min(nodes_max, max_tree_depth)``, plus the terminal
-                    # draw. Keeps the host-sync-free device verify loop from
-                    # iterating past any tree's depth.
+                    # Trees verify by traversal, not rejection. The verifier is
+                    # sized by the same node budget as the speculator's
+                    # TreeBuilder, and its fixed round count by the longest
+                    # possible accepted chain (min(nodes, depth)) plus the
+                    # terminal draw, so the device loop never iterates past
+                    # any tree's depth.
+                    nodes_max = BudgetPolicy.from_config(
+                        self.speculative_config
+                    ).resolve_nodes_max()
+                    max_depth = self.speculative_config.max_tree_depth
+                    assert max_depth is not None
                     self.tree_verifier = TreeVerifier(
                         self.max_num_reqs,
-                        BudgetPolicy.from_config(
-                            self.speculative_config
-                        ).resolve_nodes_max(),
+                        nodes_max,
                         self.vocab_size,
                         self.device,
-                        num_rounds=min(
-                            BudgetPolicy.from_config(
-                                self.speculative_config
-                            ).resolve_nodes_max()
-                            + 1,
-                            self.speculative_config.max_tree_depth + 1,
-                        ),
+                        num_rounds=min(nodes_max, max_depth) + 1,
                     )
                     # The df2t drafter conditions its next step on the
                     # accepted chain; give it the verifier it reads that from.
@@ -1190,6 +1178,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             for name, cache in kv_caches_dict.items()
             if cache.device == self.device
         }
+        if self._tree_recurrent is not None:
+            self._tree_recurrent.bind_kv_cache_groups(
+                self.kv_cache_config.kv_cache_groups
+            )
         if (
             not is_profiling
             and self.speculative_config is not None
@@ -3131,9 +3123,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # forward; advance it over each committed path now.
             assert self._tree_ctx is not None and self.tree_verifier is not None
             commit = self._tree_ctx.build_commit(
-                self.tree_verifier.accepted_arenas, input_batch.query_start_loc
+                self.tree_verifier.accepted_arenas,
+                input_batch.query_start_loc,
+                input_batch.positions,
             )
-            self._tree_recurrent.commit(commit, self._tree_step_attn_metadata)
+            self._tree_recurrent.commit(
+                commit,
+                self._tree_step_attn_metadata,
+                self.block_tables.input_block_tables,
+            )
         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
         return SamplerOutput(
             sampled_token_ids=sampled,

@@ -223,15 +223,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_accepted_tokens: torch.Tensor | None = None,
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
+        state_seq_lens: torch.Tensor | None = None,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
 
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
+        # Under tree verification a tree request's state covers only its
+        # committed tokens, not the verify block's rows.
         block_table_tensor = mamba_get_block_table_tensor(
             m.block_table_tensor,
-            m.seq_lens,
+            m.seq_lens if state_seq_lens is None else state_seq_lens,
             self.kv_cache_spec,
             self.vllm_config.cache_config.mamba_cache_mode,
         )

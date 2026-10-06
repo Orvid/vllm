@@ -16,9 +16,7 @@ their children within it.
 
 import torch
 
-from vllm.third_party.flash_linear_attention.ops.fused_sigmoid_gating import (
-    fused_sigmoid_gating_delta_rule_update,
-)
+from vllm.third_party.flash_linear_attention.ops import fused_post_conv_prep
 from vllm.triton_utils import tl, triton
 
 
@@ -342,8 +340,9 @@ def _tree_gated_delta_rule_chunk_kernel(
     output from the committed state at once:
       A = beta_t exp(G_t - G_s) k_t.k_s for s a strict ancestor of t,
       T = (I + A)^-1, w = T (beta exp(G) k), u = T (beta v),
-      v' = u - w S0^T, o = exp(G) q S0^T + (q k^T exp(G_t - G_s))_anc v',
-    with G_t the decay summed along t's path.
+      v' = u - w S0^T, o = exp(G) q S0^T + M v',
+    with G_t the decay summed along t's path and M = q k^T exp(G_t - G_s)
+    masked to s an ancestor of t (or t itself).
     """
     i_v = tl.program_id(0)
     i_nh = tl.program_id(1)
@@ -360,19 +359,19 @@ def _tree_gated_delta_rule_chunk_kernel(
     mv = o_v < V
 
     # Ancestor-or-self relation between the request's rows.
-    anc = t[:, None] == t[None, :]
+    is_ancestor = t[:, None] == t[None, :]
     cur = tl.where(live, rows, -1)
     for _ in tl.static_range(MAXD):
         p = tl.load(row_parent_ptr + tl.maximum(cur, 0), mask=cur >= 0, other=-1)
         p = p.to(tl.int64)
         cur = tl.where((cur >= 0) & (p >= bos) & (p < cur), p, -1)
-        anc = anc | ((cur - bos)[:, None] == t[None, :])
-    anc = anc & live[:, None] & live[None, :]
+        is_ancestor = is_ancestor | ((cur - bos)[:, None] == t[None, :])
+    is_ancestor = is_ancestor & live[:, None] & live[None, :]
 
     b_g = tl.load(g_ptr + rows * HV + hv, mask=live, other=0.0).to(tl.float32)
     b_beta = tl.load(beta_ptr + rows * HV + hv, mask=live, other=0.0).to(tl.float32)
-    big_g = tl.sum(tl.where(anc, b_g[None, :], 0.0), axis=1)
-    decay = tl.where(anc, tl.exp(big_g[:, None] - big_g[None, :]), 0.0)
+    big_g = tl.sum(tl.where(is_ancestor, b_g[None, :], 0.0), axis=1)
+    decay = tl.where(is_ancestor, tl.exp(big_g[:, None] - big_g[None, :]), 0.0)
 
     b_k = tl.load(
         k_ptr + (rows[:, None] * H + h) * K + o_k[None, :],
@@ -391,8 +390,8 @@ def _tree_gated_delta_rule_chunk_kernel(
         other=0.0,
     ).to(tl.float32)
 
-    kk = tl.dot(b_k, tl.trans(b_k), input_precision="ieee")
-    strict = anc & (t[:, None] != t[None, :])
+    kk = tl.dot(b_k, tl.trans(b_k), input_precision="tf32")
+    strict = is_ancestor & (t[:, None] != t[None, :])
     a = tl.where(strict, b_beta[:, None] * decay * kk, 0.0)
     # T = (I + A)^-1. A links strict ancestors only, so A^j vanishes once j
     # exceeds the longest path (MAXD rows): T = prod_j (I + (-A)^(2^j)).
@@ -400,13 +399,11 @@ def _tree_gated_delta_rule_chunk_kernel(
     m = -a
     tinv = eye + m
     for _ in tl.static_range(1, LOG2_MAXD):
-        m = tl.dot(m, m, input_precision="ieee")
-        tinv = tl.dot(tinv, eye + m, input_precision="ieee")
+        m = tl.dot(m, m, input_precision="tf32")
+        tinv = tl.dot(tinv, eye + m, input_precision="tf32")
 
-    w = tl.dot(
-        tinv, b_k * (b_beta * tl.exp(big_g))[:, None], input_precision="ieee"
-    )
-    u = tl.dot(tinv, b_v * b_beta[:, None], input_precision="ieee")
+    w = tl.dot(tinv, b_k * (b_beta * tl.exp(big_g))[:, None], input_precision="tf32")
+    u = tl.dot(tinv, b_v * b_beta[:, None], input_precision="tf32")
 
     slot = tl.load(state_indices_ptr + n).to(tl.int64)
     s0 = tl.load(
@@ -419,10 +416,10 @@ def _tree_gated_delta_rule_chunk_kernel(
         other=0.0,
     ).to(tl.float32)
     s0_t = tl.trans(s0)  # [K, BV]
-    v_new = u - tl.dot(w, s0_t, input_precision="ieee")
-    qk = tl.dot(b_q, tl.trans(b_k), input_precision="ieee")
-    o = tl.exp(big_g)[:, None] * tl.dot(b_q, s0_t, input_precision="ieee")
-    o += tl.dot(qk * decay, v_new, input_precision="ieee")
+    v_new = u - tl.dot(w, s0_t, input_precision="tf32")
+    qk = tl.dot(b_q, tl.trans(b_k), input_precision="tf32")
+    o = tl.exp(big_g)[:, None] * tl.dot(b_q, s0_t, input_precision="tf32")
+    o += tl.dot(qk * decay, v_new, input_precision="tf32")
     tl.store(
         o_ptr + (rows[:, None] * HV + hv) * V + o_v[None, :],
         o.to(o_ptr.dtype.element_ty),
@@ -456,7 +453,7 @@ def tree_gated_delta_rule_chunk(
         scale = K**-0.5
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
     assert ssm_state.stride(3) == 1 and ssm_state.stride(2) == K
-    assert K == triton.next_power_of_2(K)
+    assert triton.next_power_of_2(K) == K
     BV = 32
     _tree_gated_delta_rule_chunk_kernel[(triton.cdiv(V, BV), num_seqs * HV)](
         q,
@@ -485,6 +482,90 @@ def tree_gated_delta_rule_chunk(
 
 
 @triton.jit
+def _commit_dest_slot(
+    positions_ptr,
+    block_table_ptr,
+    bt_stride,
+    n,
+    lo,
+    t,
+    m,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Slot that the state after committed row ``t`` is stored in, or -1.
+
+    The state is stored at the last committed row of each state block (the
+    block-end state prefix caching restores from) and at the final row (the
+    running state). Without prefix caching the block spans the whole
+    sequence, so only the final row stores.
+    """
+    pos = tl.load(positions_ptr + lo + t)
+    blk = pos // BLOCK_SIZE
+    nxt = tl.load(positions_ptr + lo + tl.minimum(t + 1, m - 1))
+    store = (t == m - 1) | (nxt // BLOCK_SIZE != blk)
+    slot = tl.load(block_table_ptr + n * bt_stride + blk).to(tl.int64)
+    return tl.where(store, slot, -1)
+
+
+@triton.jit
+def _commit_recurrence_kernel(
+    k_ptr,
+    v_ptr,
+    g_ptr,
+    beta_ptr,
+    state_ptr,
+    stride_state_slot,
+    init_slots_ptr,
+    cu_rows_ptr,
+    positions_ptr,
+    block_table_ptr,
+    bt_stride,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BV: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    i_v = tl.program_id(0)
+    i_nh = tl.program_id(1)
+    n = i_nh // HV
+    hv = i_nh % HV
+    h = hv // (HV // H)
+    lo = tl.load(cu_rows_ptr + n).to(tl.int64)
+    m = tl.load(cu_rows_ptr + n + 1).to(tl.int64) - lo
+    init = tl.load(init_slots_ptr + n).to(tl.int64)
+    if (m == 0) | (init <= 0):
+        return
+    o_k = tl.arange(0, K)
+    o_v = i_v * BV + tl.arange(0, BV)
+    mv = o_v < V
+    tile = hv * V * K + o_v[:, None] * K + o_k[None, :]
+    b_h = tl.load(
+        state_ptr + init * stride_state_slot + tile, mask=mv[:, None], other=0.0
+    ).to(tl.float32)
+    for t in range(0, m):
+        r = lo + t
+        b_k = tl.load(k_ptr + (r * H + h) * K + o_k).to(tl.float32)
+        b_v = tl.load(v_ptr + (r * HV + hv) * V + o_v, mask=mv, other=0.0).to(
+            tl.float32
+        )
+        b_h *= tl.exp(tl.load(g_ptr + r * HV + hv).to(tl.float32))
+        b_v -= tl.sum(b_h * b_k[None, :], 1)
+        b_v *= tl.load(beta_ptr + r * HV + hv).to(tl.float32)
+        b_h += b_v[:, None] * b_k[None, :]
+        dest = _commit_dest_slot(
+            positions_ptr, block_table_ptr, bt_stride, n, lo, t, m, BLOCK_SIZE
+        )
+        if dest > 0:
+            tl.store(
+                state_ptr + dest * stride_state_slot + tile,
+                b_h.to(state_ptr.dtype.element_ty),
+                mask=mv[:, None],
+            )
+
+
+@triton.jit
 def _commit_conv_state_kernel(
     x_ptr,
     x_stride,
@@ -492,43 +573,61 @@ def _commit_conv_state_kernel(
     state_stride_slot,
     state_stride_dim,
     state_stride_col,
-    state_indices_ptr,
+    init_slots_ptr,
     cu_rows_ptr,
+    positions_ptr,
+    block_table_ptr,
+    bt_stride,
     dim,
     STATE_LEN: tl.constexpr,
+    STATE_LEN_P2: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
-    """Shift each request's committed rows into its conv state, keeping the
-    newest ``STATE_LEN`` inputs of ``[old state, rows]``."""
+    """Store each request's conv window (its newest ``STATE_LEN`` inputs)
+    wherever the recurrence stores its state: at state-block ends and after
+    the final committed row."""
     n = tl.program_id(0)
     lo = tl.load(cu_rows_ptr + n).to(tl.int64)
     m = tl.load(cu_rows_ptr + n + 1).to(tl.int64) - lo
-    slot = tl.load(state_indices_ptr + n).to(tl.int64)
-    if (m == 0) | (slot <= 0):
+    init = tl.load(init_slots_ptr + n).to(tl.int64)
+    if (m == 0) | (init <= 0):
         return
     d = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
     dm = d < dim
-    base = state_ptr + slot * state_stride_slot + d * state_stride_dim
-    # New column j is element m + j of [old state (STATE_LEN), rows (m)]. With
-    # m >= 1 it reads column m + j > j, so writing columns in increasing order
-    # never reads one already overwritten.
-    for j in tl.static_range(STATE_LEN):
-        src = m + j
-        old = tl.load(base + src * state_stride_col, mask=dm & (src < STATE_LEN))
-        new = tl.load(
-            x_ptr + (lo + src - STATE_LEN) * x_stride + d,
-            mask=dm & (src >= STATE_LEN),
+    c = tl.arange(0, STATE_LEN_P2)
+    cm = c < STATE_LEN
+    col_off = c[:, None] * state_stride_col + d[None, :] * state_stride_dim
+    window = tl.load(
+        state_ptr + init * state_stride_slot + col_off,
+        mask=cm[:, None] & dm[None, :],
+        other=0.0,
+    )
+    # shift[c, c'] = 1 when column c takes column c' = c + 1 of the window.
+    shift = (c[None, :] == c[:, None] + 1).to(window.dtype)
+    for t in range(0, m):
+        x = tl.load(x_ptr + (lo + t) * x_stride + d, mask=dm, other=0.0)
+        moved = tl.sum(shift[:, :, None] * window[None, :, :], axis=1)
+        window = tl.where(c[:, None] == STATE_LEN - 1, x.to(window.dtype), moved)
+        dest = _commit_dest_slot(
+            positions_ptr, block_table_ptr, bt_stride, n, lo, t, m, BLOCK_SIZE
         )
-        val = tl.where(src < STATE_LEN, old, new.to(old.dtype))
-        tl.store(base + j * state_stride_col, val, mask=dm)
+        if dest > 0:
+            tl.store(
+                state_ptr + dest * state_stride_slot + col_off,
+                window,
+                mask=cm[:, None] & dm[None, :],
+            )
 
 
 def commit_gated_delta_rule_paths(
     rows: torch.Tensor,
+    positions: torch.Tensor,
     cu_rows: torch.Tensor,
     num_seqs: int,
-    max_rows: int,
-    state_indices: torch.Tensor,
+    init_slots: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
     conv_state: torch.Tensor,
     conv_weight: torch.Tensor,
     conv_bias: torch.Tensor | None,
@@ -541,17 +640,25 @@ def commit_gated_delta_rule_paths(
     head_v_dim: int,
 ) -> None:
     """Advance each request's committed conv and recurrent state over its
-    committed rows (the chain recurrence kernel, fed by a chain-shaped tree
-    conv).
+    committed rows.
+
+    The replay starts from the state the verify read (``init_slots``) and
+    stores the state after each row into the slot of that row's state block
+    whenever the row ends the block or the path, so prefix caching finds
+    every completed block's end state and the newest block holds the running
+    state.
 
     Args:
         rows: ``[>= cu_rows[-1], conv_dim + 2 * HV]`` the committed rows' raw
             inputs (``mixed_qkv | b | a``), packed per request.
+        positions: ``[>= cu_rows[-1]]`` sequence position of each row.
         cu_rows: ``[num_seqs + 1]`` row offsets per request (a request with no
             rows keeps its state).
         num_seqs: Requests.
-        max_rows: Most rows a request commits.
-        state_indices: ``[num_seqs]`` state slot per request.
+        init_slots: ``[num_seqs]`` slot holding each request's committed
+            state (the one the verify read).
+        block_table: ``[num_seqs, blocks]`` state slot per state block.
+        block_size: Positions per state block.
         conv_state: ``(slots, dim, width - 1)``, updated in place.
         conv_weight: ``(dim, width)``.
         conv_bias: ``(dim,)`` or None.
@@ -577,18 +684,52 @@ def commit_gated_delta_rule_paths(
     # One spare entry absorbs the start offset of trailing empty requests.
     chain_parent = torch.arange(-1, num_rows, dtype=torch.int32, device=rows.device)
     chain_parent[cu_rows[:-1].long()] = -1
-    mixed_qkv = tree_causal_conv1d(
+    conv_out = tree_causal_conv1d(
         raw_qkv,
         conv_state,
         conv_weight,
         conv_bias,
         activation,
-        state_indices,
+        init_slots,
         cu_rows,
         num_seqs,
         chain_parent,
     )
-    block_d = 256
+    _, k, v, g, beta = fused_post_conv_prep(
+        conv_output=conv_out,
+        a=a,
+        b=b,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        num_k_heads=num_k_heads,
+        head_k_dim=head_k_dim,
+        head_v_dim=head_v_dim,
+        apply_l2norm=True,
+        output_g_exp=False,
+    )
+    assert ssm_state.stride(3) == 1 and ssm_state.stride(2) == head_k_dim
+    BV = 32
+    _commit_recurrence_kernel[(triton.cdiv(head_v_dim, BV), num_seqs * num_v_heads)](
+        k,
+        v,
+        g,
+        beta,
+        ssm_state,
+        ssm_state.stride(0),
+        init_slots,
+        cu_rows,
+        positions,
+        block_table,
+        block_table.stride(0),
+        H=num_k_heads,
+        HV=num_v_heads,
+        K=head_k_dim,
+        V=head_v_dim,
+        BV=BV,
+        BLOCK_SIZE=block_size,
+    )
+    block_d = 128
+    state_len = conv_state.shape[2]
     _commit_conv_state_kernel[(num_seqs, triton.cdiv(conv_dim, block_d))](
         raw_qkv,
         raw_qkv.stride(0),
@@ -596,27 +737,14 @@ def commit_gated_delta_rule_paths(
         conv_state.stride(0),
         conv_state.stride(1),
         conv_state.stride(2),
-        state_indices,
+        init_slots,
         cu_rows,
+        positions,
+        block_table,
+        block_table.stride(0),
         conv_dim,
-        STATE_LEN=conv_state.shape[2],
+        STATE_LEN=state_len,
+        STATE_LEN_P2=triton.next_power_of_2(state_len),
         BLOCK_D=block_d,
-    )
-    q, k, v = torch.split(mixed_qkv, [q_dim, q_dim, conv_dim - 2 * q_dim], dim=-1)
-    # Every token of a request writes the same slot, so the last one leaves
-    # the state after the whole committed path.
-    slots = state_indices[:, None].expand(num_seqs, max_rows).contiguous()
-    fused_sigmoid_gating_delta_rule_update(
-        A_log=A_log,
-        a=a,
-        b=b,
-        dt_bias=dt_bias,
-        q=q.contiguous().view(1, num_rows, num_k_heads, head_k_dim),
-        k=k.contiguous().view(1, num_rows, num_k_heads, head_k_dim),
-        v=v.contiguous().view(1, num_rows, num_v_heads, head_v_dim),
-        initial_state=ssm_state,
-        inplace_final_state=True,
-        cu_seqlens=cu_rows,
-        ssm_state_indices=slots,
-        use_qk_l2norm_in_kernel=True,
+        BLOCK_SIZE=block_size,
     )

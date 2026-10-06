@@ -45,16 +45,38 @@ def test_commit_lists_anchor_then_accepted_nodes():
     accepted = torch.full((2, 5), -1, dtype=torch.int64, device=DEVICE)
     accepted[1, 1] = 0  # node 0 at depth 1
     accepted[1, 2] = 1  # node 1 at depth 2
-    commit = ctx.build_commit(accepted, qsl)
+    # Request 1's anchor sits at position 20; nodes at 20 + depth.
+    positions = torch.arange(16, dtype=torch.int64, device=DEVICE)
+    positions[3:8] = torch.tensor([20, 21, 22, 21, 23])
+    commit = ctx.build_commit(accepted, qsl, positions)
     assert commit.num_rows.tolist() == [0, 3]
     assert commit.cu_rows.tolist() == [0, 0, 3]
     assert commit.rows[:3].tolist() == [3, 4, 5]
+    assert commit.positions[:3].tolist() == [20, 21, 22]
+
+
+def test_commit_after_a_larger_step_reads_only_this_steps_rows():
+    """Commit buffers keep earlier, larger steps' rows past the valid ones;
+    a smaller step's positions must not be read through them."""
+    ctx = TreeVerifyContext(16, 4, max_depth=3, device=DEVICE)
+    accepted = torch.full((2, 5), -1, dtype=torch.int64, device=DEVICE)
+    accepted[1, 1:3] = torch.tensor([0, 1])
+    ctx.build_commit(accepted, _batch(ctx), torch.arange(16, device=DEVICE))
+    qsl = torch.tensor([0, 2], dtype=torch.int32, device=DEVICE)
+    parents = torch.tensor([[-1]], dtype=torch.int64, device=DEVICE)
+    ctx.fill(qsl, 1, parents, torch.tensor([1], dtype=torch.int64, device=DEVICE))
+    accepted = torch.full((1, 5), -1, dtype=torch.int64, device=DEVICE)
+    positions = torch.tensor([40, 41], dtype=torch.int64, device=DEVICE)
+    commit = ctx.build_commit(accepted, qsl, positions)
+    torch.accelerator.synchronize()
+    assert commit.cu_rows.tolist() == [0, 1]
+    assert commit.positions[:1].tolist() == [40]
 
 
 class _Recurrent:
     def __init__(self):
         self.stash = None
-        self.commits = 0
+        self.commits: list = []
 
     def tree_stash_spec(self):
         return 8, torch.bfloat16
@@ -62,16 +84,30 @@ class _Recurrent:
     def bind_tree_stash(self, stash):
         self.stash = stash
 
-    def tree_commit(self, commit, attn_metadata):
-        self.commits += 1
+    def tree_commit(self, commit, attn_metadata, block_table, block_size):
+        self.commits.append((block_table, block_size))
 
 
-def test_recurrent_layers_get_stashes_and_commits():
+def test_recurrent_layers_get_stashes_and_their_groups_block_tables():
+    """Each stateful layer gets a stash, and its commit receives its own
+    kv-cache group's block table and state block size."""
+    from types import SimpleNamespace
+
     layer = _Recurrent()
+    layer.commits = []
     layers = TreeRecurrentLayers({"l0": layer}, max_rows=32, device=DEVICE)
+    assert layer.stash is not None
     assert layer.stash.shape == (32, 8) and layer.stash.dtype == torch.bfloat16
-    layers.commit(None, None)  # type: ignore[arg-type]
-    assert layer.commits == 1
+    groups = [
+        SimpleNamespace(layer_names=["attn"], kv_cache_spec=SimpleNamespace()),
+        SimpleNamespace(
+            layer_names=["l0"], kv_cache_spec=SimpleNamespace(block_size=16)
+        ),
+    ]
+    layers.bind_kv_cache_groups(groups)
+    tables = [torch.zeros(1), torch.ones(1)]
+    layers.commit(None, None, tables)  # type: ignore[arg-type]
+    assert layer.commits == [(tables[1], 16)]
 
 
 def test_stateful_layer_without_tree_support_fails_closed():

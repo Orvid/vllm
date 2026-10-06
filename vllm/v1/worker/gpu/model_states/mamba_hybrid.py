@@ -41,6 +41,10 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
+    # Under tree verification: the sequence length a request's recurrent state
+    # covers (its committed length for a tree request, whose query rows are
+    # tree nodes rather than sequence positions).
+    state_seq_lens: torch.Tensor | None = None
 
     def get_extra_common_attn_kwargs(
         self, kv_cache_group_id: int, num_reqs: int
@@ -60,7 +64,7 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
             ),
         ):
             return {}
-        return {
+        kwargs = {
             "num_accepted_tokens": None
             if self.num_accepted_tokens is None
             else self.num_accepted_tokens[:num_reqs],
@@ -68,10 +72,18 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
             if self.num_decode_draft_tokens_cpu is None
             else self.num_decode_draft_tokens_cpu[:num_reqs],
         }
+        if self.state_seq_lens is not None:
+            assert isinstance(attn_metadata_builder, GDNAttentionMetadataBuilder)
+            kwargs["state_seq_lens"] = self.state_seq_lens[:num_reqs]
+        return kwargs
 
 
 class MambaHybridModelState(DefaultModelState):
     """Model state for hybrid attention + Mamba / linear-attention models."""
+
+    # Whether drafts are verified as trees (their recurrent state is committed
+    # after the walk, outside the chain-acceptance bookkeeping).
+    _tree_mode: bool = False
 
     def __init__(
         self,
@@ -90,6 +102,8 @@ class MambaHybridModelState(DefaultModelState):
         # kernel reusing the postprocess copy machinery, so the per-step src
         # columns and the running state_idx are kept GPU-resident.
         self._align_mode = self.cache_config.mamba_cache_mode == "align"
+        spec_config = vllm_config.speculative_config
+        self._tree_mode = spec_config is not None and spec_config.use_tree()
         self.recoverssm = (
             RecoverSSMState() if self.cache_config.use_kda_recoverssm else None
         )
@@ -203,13 +217,25 @@ class MambaHybridModelState(DefaultModelState):
         # would need a V1-style async-D2H of the actual num_computed, since
         # num_computed_tokens_np is an optimistic mirror under async scheduling;
         # the launch cost is ~0.3% of TPOT, so the GPU fast-exit suffices.)
+        query_start_loc = input_batch.query_start_loc
+        widths = self._tree_widths(input_batch)
+        if widths is not None:
+            # A tree request's state advances only when its accepted path is
+            # committed after the walk (which also stores it in the right
+            # block), so here it schedules no state tokens.
+            query_lens = query_start_loc[1 : num_reqs + 1] - query_start_loc[:num_reqs]
+            query_lens = query_lens - torch.where(widths > 0, widths + 1, 0).to(
+                query_lens.dtype
+            )
+            query_start_loc = torch.zeros_like(query_start_loc[: num_reqs + 1])
+            torch.cumsum(query_lens, dim=0, out=query_start_loc[1:])
         block = 256
         grid = (triton.cdiv(num_reqs, block),)
         preprocess_mamba_align_fused_kernel[grid](
             input_batch.idx_mapping,
             self._mamba_state_idx_gpu,
             num_computed_tokens,
-            input_batch.query_start_loc,
+            query_start_loc,
             self.num_accepted_tokens_gpu,
             self._mamba_src_col_gpu,
             self._mamba_src_off_gpu,
@@ -217,6 +243,15 @@ class MambaHybridModelState(DefaultModelState):
             BLOCK_SIZE=block,
             MAMBA_BLOCK_SIZE=mamba_spec.block_size,
         )
+        if widths is not None:
+            # The commit already left a tree request's running state in its
+            # newest block; never migrate an older block over it.
+            req = input_batch.idx_mapping[:num_reqs].long()
+            self._mamba_src_col_gpu[req] = torch.where(
+                widths > 0,
+                -1,
+                self._mamba_src_col_gpu[req],
+            ).to(self._mamba_src_col_gpu.dtype)
         ctx.run_fused_precopy(
             num_reqs,
             self._mamba_state_idx_gpu,
@@ -319,6 +354,7 @@ class MambaHybridModelState(DefaultModelState):
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            state_seq_lens=self._tree_state_seq_lens(input_batch, num_reqs),
         )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
@@ -345,6 +381,25 @@ class MambaHybridModelState(DefaultModelState):
             )
         return attn_metadata
 
+    def _tree_widths(self, input_batch: InputBatch) -> torch.Tensor | None:
+        tree_batch = getattr(input_batch, "tree_batch", None)
+        return None if tree_batch is None else tree_batch.widths
+
+    def _tree_state_seq_lens(
+        self, input_batch: InputBatch, num_reqs: int
+    ) -> torch.Tensor | None:
+        """Per request, the sequence length its recurrent state covers: a tree
+        request's committed length (its verify block is the whole query)."""
+        widths = self._tree_widths(input_batch)
+        if widths is None:
+            return None
+        state_seq_lens = input_batch.seq_lens[:num_reqs].clone()
+        n = input_batch.num_reqs
+        state_seq_lens[:n] -= torch.where(widths > 0, widths + 1, 0).to(
+            state_seq_lens.dtype
+        )
+        return state_seq_lens
+
     def postprocess_state(
         self,
         idx_mapping: torch.Tensor,
@@ -354,6 +409,14 @@ class MambaHybridModelState(DefaultModelState):
         # Chunked prefill does not sample a token, so num_sampled can be 0.
         # Mamba treats num_accepted_tokens=1 as the neutral non-spec value.
         num_reqs = idx_mapping.shape[0]
+        if self._tree_mode:
+            # The tree commit replays the accepted path into the right state
+            # block itself, so the chain-acceptance bookkeeping stays neutral.
+            if num_reqs:
+                _fill_num_accepted_kernel[(num_reqs,)](
+                    idx_mapping, self.num_accepted_tokens_gpu, 1
+                )
+            return
         if num_reqs:
             if not isinstance(num_sampled, int):
                 # idx_mapping may contain -1 sentinels (filtered rows) under PP; the
