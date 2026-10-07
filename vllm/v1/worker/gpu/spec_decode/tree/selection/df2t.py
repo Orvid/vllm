@@ -43,10 +43,12 @@ def _predicted_experts(tok, table_ptr, H, NL, KE, NLP: tl.constexpr, KEP: tl.con
 
 
 @triton.jit
-def _new_expert_cost(
-    tok,
+def _new_expert_costs(
+    toks,  # [M] candidate tokens
+    live,  # [M] which candidates exist
     table_ptr,
-    act_ptr,
+    shared_ptr,
+    own_ptr,
     cost_ptr,
     unknown_cost,
     hit_rate,
@@ -58,18 +60,41 @@ def _new_expert_cost(
     NLP: tl.constexpr,
     KEP: tl.constexpr,
 ):
-    """Expected cost (ms) of the experts ``tok`` needs that the active set
-    does not have yet: its last-seen experts count at the predictor's hit
-    rate and the rest at ``unknown_cost``, which is also the whole charge
-    for a token never seen."""
-    nl, e, ok = _predicted_experts(tok, table_ptr, H, NL, KE, NLP, KEP)
-    word = tl.load(act_ptr + nl * EW + (e >> 5), mask=ok, other=0, cache_modifier=".cg")
+    """Expected cost (ms) per candidate of the experts it needs that the
+    active set (shared | own) does not have yet: its last-seen experts count
+    at the predictor's hit rate and the rest at ``unknown_cost``, which is
+    also the whole charge for a token never seen. All candidates are priced
+    in one gather."""
+    b = routing_bucket(toks, H)[:, None, None]
+    nl = tl.arange(0, NLP)[None, :, None]
+    kj = tl.arange(0, KEP)[None, None, :]
+    m = live[:, None, None] & (nl < NL) & (kj < KE)
+    e = tl.load(table_ptr + (nl * H + b) * KE + kj, mask=m, other=-1).to(tl.int32)
+    ok = m & (e >= 0)
+    e = tl.maximum(e, 0)
+    widx = nl * EW + (e >> 5)
+    word = tl.load(shared_ptr + widx, mask=ok, other=0, cache_modifier=".cg") | tl.load(
+        own_ptr + widx, mask=ok, other=0, cache_modifier=".cg"
+    )
     off = ((word >> (e & 31)) & 1) == 0
     w = tl.load(cost_ptr + nl * E + e, mask=ok, other=0.0)
-    cost = tl.sum(tl.sum(tl.where(ok & off, w, 0.0), axis=1), axis=0)
-    seen = tl.sum(tl.sum(ok.to(tl.int32), axis=1), axis=0) > 0
+    cost = tl.sum(tl.sum(tl.where(ok & off, w, 0.0), axis=2), axis=1)
+    seen = tl.sum(tl.sum(ok.to(tl.int32), axis=2), axis=1) > 0
     expected = hit_rate * cost + (1.0 - hit_rate) * unknown_cost
     return tl.where(seen, expected, unknown_cost)
+
+
+@triton.jit
+def _mass_order_pick(valid, mass, pmass, path, slot, UMSB, CAP: tl.constexpr):
+    """The frontier slot the reference heap pops: (mass desc, parent mass
+    desc, unsigned packed path asc)."""
+    top_mass = tl.max(tl.where(valid, mass, float("-inf")), axis=0)
+    c = valid & (mass == top_mass)
+    top_pmass = tl.max(tl.where(c, pmass, float("-inf")), axis=0)
+    c = c & (pmass == top_pmass)
+    key = path ^ UMSB
+    c = c & (key == tl.min(tl.where(c, key, 0x7FFFFFFFFFFFFFFF), axis=0))
+    return slot == tl.min(tl.where(c, slot, CAP), axis=0)
 
 
 @triton.jit
@@ -95,10 +120,12 @@ def _build_one(
     PAD,  # token id written to the inert tail past the live node count
     # Expert-aware selection only (EXPERT_AWARE):
     table_ptr,  # [NL, H, KE] i16 last-seen experts per (layer, token bucket)
-    active_ptr,  # [NL, EW] i32 the batch's active-expert bitmask
+    active_ptr,  # [NL, EW] i32 the batch's shared active-expert bitmask
+    own_ptr,  # [R, NL, EW] i32 each request's own active-expert additions
     cost_ptr,  # [NL, E] f32 ms to activate each expert
     anchor_ptr,  # [num_anchors] the batch's anchor tokens (rows always verified)
     lam_ptr,  # f32 tokens per ms: the exchange rate between cost and mass
+    aware_ptr,  # i32 how many of each tree's nodes are chosen expert-aware
     num_anchors,
     unknown_cost,  # ms expected for experts the table cannot predict
     hit_rate,  # share of a token's predicted experts it really uses
@@ -119,6 +146,7 @@ def _build_one(
     NLP: tl.constexpr,  # next power of two >= NL
     KEP: tl.constexpr,  # next power of two >= KE
     TOPM: tl.constexpr,  # frontier entries (best by mass) weighed per pop
+    WRITE_SHARED: tl.constexpr,  # this tree's experts go to the shared set
 ):
     row = row.to(tl.int64)
 
@@ -196,50 +224,66 @@ def _build_one(
     word_acc = tl.zeros([BP], dtype=tl.int64)
     lp_acc = tl.zeros([BP], dtype=tl.float32)
     neg_inf = float("-inf")
-    key_max = 0x7FFFFFFFFFFFFFFF
 
-    # Requests are built in turn against the batch's one active set, so
-    # each sees the experts every earlier request's tree already adds.
-    act_row = active_ptr
+    # The active set is the batch's shared one (anchors, and the first
+    # request's tree) plus this request's own additions.
+    own_row = own_ptr + row * NL * EW
+    if WRITE_SHARED:  # noqa: SIM108 (constexpr branch)
+        write_ptr = active_ptr
+    else:
+        write_ptr = own_row
     lam = 0.0
+    aware_n = tl.full((), 0, tl.int32)
     if EXPERT_AWARE:
         lam = tl.load(lam_ptr).to(tl.float32)
+        # Only the nodes likely to be verified are worth pricing; the rest
+        # follow the mass order.
+        aware_n = tl.load(aware_ptr)
 
     emit = tl.full((), 0, tl.int32)
     nvalid = tl.sum(valid.to(tl.int32), axis=0)
     nxt = tl.full((), FAN, tl.int32)
     while (emit < B) & (nvalid > 0):
         if EXPERT_AWARE:
-            # Weigh the TOPM most probable frontier entries by acceptance mass
-            # gained minus the cost of the experts they would add, in tokens
-            # (lam converts ms to tokens, the throughput trade CaDDTree's
-            # stopping rule makes). Any frontier entry keeps the tree
-            # prefix-closed.
-            remaining = valid
-            best_score = tl.full((), float("-inf"), tl.float32)
-            best_slot = tl.full((), CAP, tl.int32)
-            for _ in tl.static_range(TOPM):
-                m_mass = tl.max(tl.where(remaining, mass, neg_inf), axis=0)
-                m_slot = tl.min(
-                    tl.where(remaining & (mass == m_mass), slot, CAP), axis=0
-                )
-                ms = slot == m_slot
-                live_m = m_slot < CAP
-                m_row = (tl.sum(tl.where(ms, depth, 0), axis=0) - 1) * K + tl.sum(
-                    tl.where(ms, prank, 0), axis=0
-                )
-                m_tok = tl.load(
-                    sorted_cand_ptr
-                    + sorted_row
-                    + m_row * K
-                    + tl.sum(tl.where(ms, rank, 0), axis=0),
-                    mask=live_m,
-                    other=0,
-                )
-                m_cost = _new_expert_cost(
-                    m_tok,
+            if emit < aware_n:
+                # Weigh the TOPM most probable frontier entries by acceptance
+                # mass gained minus the cost of the experts they would add, in
+                # tokens (lam converts ms to tokens, the throughput trade
+                # CaDDTree's stopping rule makes). Any frontier entry keeps
+                # the tree prefix-closed.
+                tv = tl.arange(0, TOPM)
+                remaining = valid
+                toks = tl.zeros([TOPM], dtype=tl.int64)
+                cand_mass = tl.full([TOPM], float("-inf"), tl.float64)
+                cand_slot = tl.full([TOPM], CAP, tl.int32)
+                for t in tl.static_range(TOPM):
+                    m_mass = tl.max(tl.where(remaining, mass, neg_inf), axis=0)
+                    m_slot = tl.min(
+                        tl.where(remaining & (mass == m_mass), slot, CAP), axis=0
+                    )
+                    ms = slot == m_slot
+                    m_row = (tl.sum(tl.where(ms, depth, 0), axis=0) - 1) * K + tl.sum(
+                        tl.where(ms, prank, 0), axis=0
+                    )
+                    m_tok = tl.load(
+                        sorted_cand_ptr
+                        + sorted_row
+                        + m_row * K
+                        + tl.sum(tl.where(ms, rank, 0), axis=0),
+                        mask=m_slot < CAP,
+                        other=0,
+                    )
+                    toks = tl.where(tv == t, m_tok, toks)
+                    cand_mass = tl.where(tv == t, m_mass, cand_mass)
+                    cand_slot = tl.where(tv == t, m_slot, cand_slot)
+                    remaining = remaining & ~ms
+                live = cand_slot < CAP
+                costs = _new_expert_costs(
+                    toks,
+                    live,
                     table_ptr,
-                    act_row,
+                    active_ptr,
+                    own_row,
                     cost_ptr,
                     unknown_cost,
                     hit_rate,
@@ -251,20 +295,15 @@ def _build_one(
                     NLP,
                     KEP,
                 )
-                score = tl.exp(m_mass.to(tl.float32)) - lam * m_cost
-                better = live_m & (score > best_score)
-                best_score = tl.where(better, score, best_score)
-                best_slot = tl.where(better, m_slot, best_slot)
-                remaining = remaining & ~ms
-            sel = slot == best_slot
+                score = tl.where(
+                    live, tl.exp(cand_mass.to(tl.float32)) - lam * costs, neg_inf
+                )
+                best = tl.argmax(score, axis=0)
+                sel = slot == tl.sum(tl.where(tv == best, cand_slot, 0), axis=0)
+            else:
+                sel = _mass_order_pick(valid, mass, pmass, path, slot, UMSB, CAP)
         else:
-            top_mass = tl.max(tl.where(valid, mass, neg_inf), axis=0)
-            c = valid & (mass == top_mass)
-            top_pmass = tl.max(tl.where(c, pmass, neg_inf), axis=0)
-            c = c & (pmass == top_pmass)
-            key = path ^ UMSB
-            c = c & (key == tl.min(tl.where(c, key, key_max), axis=0))
-            sel = slot == tl.min(tl.where(c, slot, CAP), axis=0)
+            sel = _mass_order_pick(valid, mass, pmass, path, slot, UMSB, CAP)
         top_mass = tl.sum(tl.where(sel, mass, 0.0), axis=0)
         top_pmass = tl.sum(tl.where(sel, pmass, 0.0), axis=0)
         top_depth = tl.sum(tl.where(sel, depth, 0), axis=0)
@@ -278,9 +317,10 @@ def _build_one(
         has_sib = sib_rank < K
         has_child = top_depth < L
         token = tl.load(sorted_cand_ptr + sorted_row + drow * K + top_rank)
-        if EXPERT_AWARE:
-            _activate_experts(token, table_ptr, act_row, H, NL, KE, EW, NLP, KEP)
-            tl.debug_barrier()
+        if EXPERT_AWARE:  # noqa: SIM102 (constexpr branch)
+            if emit < aware_n:
+                _activate_experts(token, table_ptr, write_ptr, H, NL, KE, EW, NLP, KEP)
+                tl.debug_barrier()
         # The popped node's own candidate index picks its children's row.
         top_idx = tl.load(sorted_idx_ptr + sorted_row + drow * K + top_rank)
         crow = top_depth * K + top_idx
@@ -352,13 +392,14 @@ def _tree_builder_kernel(
     PAD,
     table_ptr,
     active_ptr,
+    own_ptr,
     cost_ptr,
     anchor_ptr,
     lam_ptr,
+    aware_ptr,
     num_anchors,
     unknown_cost,
     stats_ptr,  # [2] f32 (predicted experts used, predicted experts) so far
-    num_rows,
     H,
     NL,
     KE,
@@ -376,94 +417,67 @@ def _tree_builder_kernel(
     NLP: tl.constexpr,
     KEP: tl.constexpr,
     TOPM: tl.constexpr,
+    PHASE: tl.constexpr,
 ):
-    """One request per program; expert-aware selection builds the whole batch
-    in one program, request after request, against one shared active set
-    seeded with every anchor row's experts."""
+    """One request per program. Expert-aware selection runs in two phases:
+    PHASE 1 (one program) seeds the shared active set with every anchor
+    row's experts and builds the first request's tree into it; PHASE 2 then
+    builds the other requests in parallel, each against the shared set plus
+    its own additions."""
     hit_rate = 0.0
     if EXPERT_AWARE:
+        hit_rate = tl.load(stats_ptr) / tl.maximum(tl.load(stats_ptr + 1), 1.0)
+    if PHASE == 1:
         for a in range(num_anchors):
             _activate_experts(
                 tl.load(anchor_ptr + a), table_ptr, active_ptr, H, NL, KE, EW, NLP, KEP
             )
         tl.debug_barrier()
-        hit_rate = tl.load(stats_ptr) / tl.maximum(tl.load(stats_ptr + 1), 1.0)
-        for r in range(num_rows):
-            _build_one(
-                r,
-                scores_ptr,
-                cand_ptr,
-                out_ptr,
-                logp_out_ptr,
-                sorted_logp_ptr,
-                sorted_cand_ptr,
-                sorted_idx_ptr,
-                UMSB,
-                PAD,
-                table_ptr,
-                active_ptr,
-                cost_ptr,
-                anchor_ptr,
-                lam_ptr,
-                num_anchors,
-                unknown_cost,
-                hit_rate,
-                H,
-                NL,
-                KE,
-                E,
-                EW,
-                B,
-                K,
-                L,
-                S,
-                KP,
-                BP,
-                CAP,
-                FAN,
-                EXPERT_AWARE,
-                NLP,
-                KEP,
-                TOPM,
-            )
+        row = 0
+    elif PHASE == 2:
+        row = tl.program_id(0) + 1
     else:
-        _build_one(
-            tl.program_id(0),
-            scores_ptr,
-            cand_ptr,
-            out_ptr,
-            logp_out_ptr,
-            sorted_logp_ptr,
-            sorted_cand_ptr,
-            sorted_idx_ptr,
-            UMSB,
-            PAD,
-            table_ptr,
-            active_ptr,
-            cost_ptr,
-            anchor_ptr,
-            lam_ptr,
-            num_anchors,
-            unknown_cost,
-            hit_rate,
-            H,
-            NL,
-            KE,
-            E,
-            EW,
-            B,
-            K,
-            L,
-            S,
-            KP,
-            BP,
-            CAP,
-            FAN,
-            EXPERT_AWARE,
-            NLP,
-            KEP,
-            TOPM,
-        )
+        row = tl.program_id(0)
+    _build_one(
+        row,
+        scores_ptr,
+        cand_ptr,
+        out_ptr,
+        logp_out_ptr,
+        sorted_logp_ptr,
+        sorted_cand_ptr,
+        sorted_idx_ptr,
+        UMSB,
+        PAD,
+        table_ptr,
+        active_ptr,
+        own_ptr,
+        cost_ptr,
+        anchor_ptr,
+        lam_ptr,
+        aware_ptr,
+        num_anchors,
+        unknown_cost,
+        hit_rate,
+        H,
+        NL,
+        KE,
+        E,
+        EW,
+        B,
+        K,
+        L,
+        S,
+        KP,
+        BP,
+        CAP,
+        FAN,
+        EXPERT_AWARE,
+        NLP,
+        KEP,
+        TOPM,
+        PHASE == 1,
+    )
 
 
 class TreeBuilder:
@@ -555,6 +569,7 @@ class TreeBuilder:
         self.routing: MoERoutingMemory | None = None
         self.lam: Tensor | None = None
         self._active: Tensor | None = None
+        self._own: Tensor | None = None
         self.top_m = 4
 
     def bind_routing(self, routing: MoERoutingMemory, lam: Tensor) -> None:
@@ -565,8 +580,56 @@ class TreeBuilder:
         self.routing = routing
         self.lam = lam
         words = (routing.num_experts + 31) // 32
+        dev = self.packed.device
         self._active = torch.zeros(
-            routing.num_layers, words, dtype=torch.int32, device=self.packed.device
+            routing.num_layers, words, dtype=torch.int32, device=dev
+        )
+        self._own = torch.zeros(
+            self.max_num_reqs, routing.num_layers, words, dtype=torch.int32, device=dev
+        )
+        # How many of each tree's nodes are chosen expert-aware; the caller
+        # sets it to the verify width it expects (the rest follow the mass
+        # order, which is far cheaper to build).
+        self.aware_nodes = torch.full((1,), self.B, dtype=torch.int32, device=dev)
+
+    def _launch(
+        self,
+        scores: Tensor,
+        cand: Tensor,
+        grid: tuple[int],
+        route_args: tuple,
+        nlp: int,
+        kep: int,
+        fan: int,
+        phase: int,
+    ) -> None:
+        expert_aware = phase != 0
+        _tree_builder_kernel[grid](
+            scores,
+            cand,
+            self.packed,
+            self.logp,
+            self._sorted_logp,
+            self._sorted_cand,
+            self._sorted_idx,
+            self._umsb,
+            self.pad_token_id,
+            *route_args,
+            B=self.B,
+            K=self.K,
+            L=self.L,
+            S=self.num_steps,
+            KP=self._kp,
+            BP=self._bp,
+            CAP=triton.next_power_of_2(fan * (self.B + 1)),
+            FAN=fan,
+            EXPERT_AWARE=expert_aware,
+            NLP=nlp,
+            KEP=kep,
+            TOPM=self.top_m,
+            PHASE=phase,
+            # The expert-aware pops gather [TOPM, layers, experts] tiles.
+            num_warps=max(self._num_warps, 4) if expert_aware else self._num_warps,
         )
 
     def select(
@@ -603,20 +666,26 @@ class TreeBuilder:
         scores = scores.contiguous()
         cand = cand.contiguous()
         routing = self.routing
-        if routing is not None:
-            assert anchor_ids is not None and self._active is not None
-            assert self.lam is not None
+        if routing is None:
+            # Inert placeholders: the expert-aware code is compiled out.
+            route_args = (self.packed,) * 7 + (0, 0.0, self.packed, 1, 1, 1, 1, 1)
+            self._launch(scores, cand, (R,), route_args, 1, 1, 1, 0)
+        else:
+            assert anchor_ids is not None and self.lam is not None
+            assert self._active is not None and self._own is not None
             self._active.zero_()
+            self._own[:R].zero_()
             route_args = (
                 routing.table,
                 self._active,
+                self._own,
                 routing.cost_ms,
                 anchor_ids,
                 self.lam,
+                self.aware_nodes,
                 anchor_ids.shape[0],
                 routing.unknown_cost_ms,
                 routing.hit_stats,
-                R,
                 routing.buckets,
                 routing.num_layers,
                 routing.top_k,
@@ -625,38 +694,13 @@ class TreeBuilder:
             )
             nlp = triton.next_power_of_2(routing.num_layers)
             kep = triton.next_power_of_2(routing.top_k)
-            fan = self.top_m
-            grid = (1,)
-        else:
-            # Inert placeholders: the expert-aware code is compiled out.
-            route_args = (self.packed,) * 5 + (0, 0.0, self.packed, R, 1, 1, 1, 1, 1)
-            nlp = kep = fan = 1
-            grid = (R,)
-        _tree_builder_kernel[grid](
-            scores,
-            cand,
-            self.packed,
-            self.logp,
-            self._sorted_logp,
-            self._sorted_cand,
-            self._sorted_idx,
-            self._umsb,
-            self.pad_token_id,
-            *route_args,
-            B=self.B,
-            K=self.K,
-            L=self.L,
-            S=self.num_steps,
-            KP=self._kp,
-            BP=self._bp,
-            CAP=triton.next_power_of_2(fan * (self.B + 1)),
-            FAN=fan,
-            EXPERT_AWARE=routing is not None,
-            NLP=nlp,
-            KEP=kep,
-            TOPM=self.top_m,
-            num_warps=self._num_warps,
-        )
+            # The first request's tree joins the anchors in the shared active
+            # set; the rest are then built in parallel against it.
+            self._launch(scores, cand, (1,), route_args, nlp, kep, self.top_m, 1)
+            if R > 1:
+                self._launch(
+                    scores, cand, (R - 1,), route_args, nlp, kep, self.top_m, 2
+                )
         return TreeDraft(
             token_ids=self.token_ids[:R],
             depths=self.depths[:R],

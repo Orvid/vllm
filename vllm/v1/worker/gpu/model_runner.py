@@ -1577,6 +1577,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         lam = getattr(self, "_tree_lam", None)
         if lam is not None:
             lam.fill_(ctl.throughput)
+            self.speculator.tree_selector.aware_nodes.fill_(width)  # type: ignore[union-attr]
         if all(len(drafts) <= width for drafts in draft_tokens.values()):
             return scheduler_output
         num_scheduled_tokens = dict(scheduler_output.num_scheduled_tokens)
