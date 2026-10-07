@@ -49,6 +49,8 @@ def _record_kernel(
     route_stride_layer,
     layer_ids_ptr,  # [NL] capturer layer index of each MoE layer
     stats_ptr,  # [2] f32 (predicted experts used, predicted experts)
+    touched_ptr,  # [NL, E] i8, set for every expert the forward routed to
+    E,
     H: tl.constexpr,
     NL: tl.constexpr,
     KE: tl.constexpr,
@@ -84,6 +86,7 @@ def _record_kernel(
         tl.atomic_add(stats_ptr, hits.to(tl.float32))
         tl.atomic_add(stats_ptr + 1, total.to(tl.float32))
     tl.store(slot, experts.to(tl.int16), mask=mask)
+    tl.store(touched_ptr + nl[:, None] * E + experts, 1, mask=mask & (experts >= 0))
 
 
 class MoERoutingMemory:
@@ -142,6 +145,13 @@ class MoERoutingMemory:
             [0.4 * _HIT_PRIOR, _HIT_PRIOR], dtype=torch.float32, device=device
         )
         self._records = 0
+        # Running total (ms, at the costs above) of the distinct experts each
+        # recorded forward routed to; the width controller regresses measured
+        # step times on it to learn what an expert really costs.
+        self._touched = torch.zeros(
+            self.num_layers, num_experts, dtype=torch.int8, device=device
+        )
+        self.forward_cost_total = torch.zeros(1, dtype=torch.float64, device=device)
 
     def set_expert_costs(self, cost_ms: torch.Tensor) -> None:
         """Per-expert activation cost (ms), ``[num_moe_layers, num_experts]``."""
@@ -164,6 +174,7 @@ class MoERoutingMemory:
         self._records += 1
         if self._records % _HIT_DECAY_EVERY == 0:
             self.hit_stats.mul_(0.5)
+        self._touched.zero_()
         _record_kernel[(num_tokens,)](
             self.table,
             input_ids,
@@ -172,11 +183,16 @@ class MoERoutingMemory:
             self.routes.stride(1),
             self.layer_ids,
             self.hit_stats,
+            self._touched,
+            self.num_experts,
             H=self.buckets,
             NL=self.num_layers,
             KE=self.top_k,
             NLP=triton.next_power_of_2(self.num_layers),
             KEP=triton.next_power_of_2(self.top_k),
+        )
+        self.forward_cost_total += (self._touched * self.cost_ms).sum(
+            dtype=torch.float64
         )
 
 

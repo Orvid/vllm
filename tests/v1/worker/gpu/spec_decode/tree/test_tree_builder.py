@@ -196,6 +196,15 @@ def test_routing_memory_records_each_moe_layer_by_token_bucket():
         assert mem.table[1, b].tolist() == l1  # capturer layer 2
 
 
+def test_routing_memory_totals_each_forwards_distinct_experts():
+    """Tokens 7 and 9 share expert 2 of layer 0: the forward reaches 7
+    distinct experts at 1 ms each, and the next forward adds its own."""
+    mem = _routing({7: [[1, 2], [3, 4]], 9: [[2, 6], [0, 7]]})
+    assert mem.forward_cost_total.item() == 7.0
+    mem.record(torch.tensor([7], device="cuda"), 1)
+    assert mem.forward_cost_total.item() == 11.0
+
+
 def _two_way_choice():
     """Under the anchor, candidate 10 (mass 0.55) needs four new experts and
     candidate 11 (mass 0.45) only experts the anchor (token 5) already uses."""

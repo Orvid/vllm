@@ -828,13 +828,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Expert-aware tree selection: record the target's MoE routing every
         # forward and let the tree builder price nodes by the experts they add,
-        # at the adaptive width controller's tokens-per-ms rate.
+        # at the adaptive width controller's tokens-per-ms rate, scaled by the
+        # expert cost it learns from measured step times.
         self._moe_routing: MoERoutingMemory | None = None
         self._tree_lam: torch.Tensor | None = None
         if spec is not None and spec.tree_selection == "df2t_moe":
             self._moe_routing = build_moe_routing_memory(
                 self.model, self.vllm_config, self.max_num_tokens, self.device
             )
+            if self._tree_width_ctl is not None:
+                self._tree_width_ctl.set_expert_meter(
+                    self._moe_routing.forward_cost_total
+                )
             self._tree_lam = torch.zeros(1, dtype=torch.float32, device=self.device)
             self.speculator.tree_selector.bind_routing(  # type: ignore[union-attr]
                 self._moe_routing, self._tree_lam
@@ -1576,7 +1581,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         width = ctl.select(slots)
         lam = getattr(self, "_tree_lam", None)
         if lam is not None:
-            lam.fill_(ctl.throughput)
+            lam.fill_(ctl.throughput * ctl.expert_cost_scale)
             self.speculator.tree_selector.aware_nodes.fill_(width)  # type: ignore[union-attr]
         if all(len(drafts) <= width for drafts in draft_tokens.values()):
             return scheduler_output
