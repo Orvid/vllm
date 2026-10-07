@@ -50,6 +50,12 @@ def _rms(x: Tensor) -> Tensor:
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)
 
 
+def _top_experts(logits: Tensor, k: int) -> Tensor:
+    # Bitonic-sorting each layer's few hundred logits beats topk's radix
+    # select across tens of thousands of rows.
+    return logits.sort(dim=-1, descending=True).indices[..., :k]
+
+
 class MoERoutingPredictor:
     """Predicted experts per candidate token, and what activating an expert
     costs.
@@ -189,7 +195,10 @@ class _RouterMLP(nn.Module):
         self.shape = (num_layers, num_experts)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.l2(nn.functional.gelu(self.l1(x))).view(-1, *self.shape)
+        # bf16 matmuls (tensor cores) over fp32 weights.
+        with torch.autocast(x.device.type, dtype=torch.bfloat16):
+            out = self.l2(nn.functional.gelu(self.l1(x)))
+        return out.view(-1, *self.shape)
 
 
 class OnlineRoutingPredictor(MoERoutingPredictor):
@@ -264,7 +273,7 @@ class OnlineRoutingPredictor(MoERoutingPredictor):
     def _topk(self, ids: Tensor, hidden: Tensor | None) -> Tensor:
         with torch.no_grad():
             logits = self.mlp(self._features(ids, hidden))
-        return logits.topk(self.top_k, dim=-1).indices
+        return _top_experts(logits, self.top_k)
 
     def predict(
         self, cand: Tensor, anchor_ids: Tensor, hidden: Tensor | None = None
@@ -377,13 +386,13 @@ class _TrainStep:
         ).scatter_(2, self.labels, 1.0)
         logits = p.mlp(self.feats)
         per_row = nn.functional.binary_cross_entropy_with_logits(
-            logits, target, reduction="none"
+            logits.float(), target, reduction="none"
         ).mean(dim=(1, 2))
         p.opt.zero_grad(set_to_none=True)
         (per_row * self.weight).sum().backward()
         p.opt.step()
         with torch.no_grad():
-            top = logits.topk(p.top_k, dim=-1).indices
+            top = _top_experts(logits, p.top_k)
             hit = (top[..., :, None] == self.labels[..., None, :]).any(-1)
             real = self.weight > 0
             p.hit_stats[0] += (hit.sum(dim=(1, 2)) * real).sum()
