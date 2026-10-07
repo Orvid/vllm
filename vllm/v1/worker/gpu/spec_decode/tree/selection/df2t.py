@@ -49,6 +49,7 @@ def _new_expert_cost(
     act_ptr,
     cost_ptr,
     unknown_cost,
+    hit_rate,
     H,
     NL,
     KE,
@@ -57,15 +58,18 @@ def _new_expert_cost(
     NLP: tl.constexpr,
     KEP: tl.constexpr,
 ):
-    """Cost (ms) of the experts ``tok`` is predicted to need that the active
-    set does not have yet; ``unknown_cost`` for a token never seen."""
+    """Expected cost (ms) of the experts ``tok`` needs that the active set
+    does not have yet: its last-seen experts count at the predictor's hit
+    rate and the rest at ``unknown_cost``, which is also the whole charge
+    for a token never seen."""
     nl, e, ok = _predicted_experts(tok, table_ptr, H, NL, KE, NLP, KEP)
     word = tl.load(act_ptr + nl * EW + (e >> 5), mask=ok, other=0, cache_modifier=".cg")
     off = ((word >> (e & 31)) & 1) == 0
     w = tl.load(cost_ptr + nl * E + e, mask=ok, other=0.0)
     cost = tl.sum(tl.sum(tl.where(ok & off, w, 0.0), axis=1), axis=0)
     seen = tl.sum(tl.sum(ok.to(tl.int32), axis=1), axis=0) > 0
-    return tl.where(seen, cost, unknown_cost)
+    expected = hit_rate * cost + (1.0 - hit_rate) * unknown_cost
+    return tl.where(seen, expected, unknown_cost)
 
 
 @triton.jit
@@ -78,7 +82,8 @@ def _activate_experts(
 
 
 @triton.jit
-def _tree_builder_kernel(
+def _build_one(
+    row,
     scores_ptr,  # [R, S, K, K] transition logits
     cand_ptr,  # [R, S, K] i64 successor token ids
     out_ptr,  # [R, 4 * B + 1] i64 packed tokens|depths|parents|words|num_nodes
@@ -90,12 +95,13 @@ def _tree_builder_kernel(
     PAD,  # token id written to the inert tail past the live node count
     # Expert-aware selection only (EXPERT_AWARE):
     table_ptr,  # [NL, H, KE] i16 last-seen experts per (layer, token bucket)
-    active_ptr,  # [R, NL, EW] i32 per-request active-expert bitmask, zeroed
+    active_ptr,  # [NL, EW] i32 the batch's active-expert bitmask
     cost_ptr,  # [NL, E] f32 ms to activate each expert
     anchor_ptr,  # [num_anchors] the batch's anchor tokens (rows always verified)
     lam_ptr,  # f32 tokens per ms: the exchange rate between cost and mass
     num_anchors,
-    unknown_cost,  # ms charged for a token with no recorded routing
+    unknown_cost,  # ms expected for experts the table cannot predict
+    hit_rate,  # share of a token's predicted experts it really uses
     H,
     NL,
     KE,
@@ -114,7 +120,7 @@ def _tree_builder_kernel(
     KEP: tl.constexpr,  # next power of two >= KE
     TOPM: tl.constexpr,  # frontier entries (best by mass) weighed per pop
 ):
-    row = tl.program_id(0).to(tl.int64)
+    row = row.to(tl.int64)
 
     # Pass 1: log-softmax each (depth, predecessor) row and sort successors
     # best-first so rank r means the r-th largest transition log-probability
@@ -192,16 +198,11 @@ def _tree_builder_kernel(
     neg_inf = float("-inf")
     key_max = 0x7FFFFFFFFFFFFFFF
 
-    act_row = active_ptr + row * NL * EW
+    # Requests are built in turn against the batch's one active set, so
+    # each sees the experts every earlier request's tree already adds.
+    act_row = active_ptr
     lam = 0.0
     if EXPERT_AWARE:
-        # Every request's anchor row is verified, so the batch's anchors'
-        # experts are active before any node is chosen.
-        for a in range(num_anchors):
-            _activate_experts(
-                tl.load(anchor_ptr + a), table_ptr, act_row, H, NL, KE, EW, NLP, KEP
-            )
-        tl.debug_barrier()
         lam = tl.load(lam_ptr).to(tl.float32)
 
     emit = tl.full((), 0, tl.int32)
@@ -241,6 +242,7 @@ def _tree_builder_kernel(
                     act_row,
                     cost_ptr,
                     unknown_cost,
+                    hit_rate,
                     H,
                     NL,
                     KE,
@@ -335,6 +337,133 @@ def _tree_builder_kernel(
     tl.store(out_ptr + base + 3 * B + ar, tl.where(live, word_acc, 0), mask=in_b)
     tl.store(out_ptr + base + 4 * B, emit.to(tl.int64))
     tl.store(logp_out_ptr + row * B + ar, tl.where(live, lp_acc, neg_inf), mask=in_b)
+
+
+@triton.jit
+def _tree_builder_kernel(
+    scores_ptr,
+    cand_ptr,
+    out_ptr,
+    logp_out_ptr,
+    sorted_logp_ptr,
+    sorted_cand_ptr,
+    sorted_idx_ptr,
+    UMSB,
+    PAD,
+    table_ptr,
+    active_ptr,
+    cost_ptr,
+    anchor_ptr,
+    lam_ptr,
+    num_anchors,
+    unknown_cost,
+    stats_ptr,  # [2] f32 (predicted experts used, predicted experts) so far
+    num_rows,
+    H,
+    NL,
+    KE,
+    E,
+    EW,
+    B: tl.constexpr,
+    K: tl.constexpr,
+    L: tl.constexpr,
+    S: tl.constexpr,
+    KP: tl.constexpr,
+    BP: tl.constexpr,
+    CAP: tl.constexpr,
+    FAN: tl.constexpr,
+    EXPERT_AWARE: tl.constexpr,
+    NLP: tl.constexpr,
+    KEP: tl.constexpr,
+    TOPM: tl.constexpr,
+):
+    """One request per program; expert-aware selection builds the whole batch
+    in one program, request after request, against one shared active set
+    seeded with every anchor row's experts."""
+    hit_rate = 0.0
+    if EXPERT_AWARE:
+        for a in range(num_anchors):
+            _activate_experts(
+                tl.load(anchor_ptr + a), table_ptr, active_ptr, H, NL, KE, EW, NLP, KEP
+            )
+        tl.debug_barrier()
+        hit_rate = tl.load(stats_ptr) / tl.maximum(tl.load(stats_ptr + 1), 1.0)
+        for r in range(num_rows):
+            _build_one(
+                r,
+                scores_ptr,
+                cand_ptr,
+                out_ptr,
+                logp_out_ptr,
+                sorted_logp_ptr,
+                sorted_cand_ptr,
+                sorted_idx_ptr,
+                UMSB,
+                PAD,
+                table_ptr,
+                active_ptr,
+                cost_ptr,
+                anchor_ptr,
+                lam_ptr,
+                num_anchors,
+                unknown_cost,
+                hit_rate,
+                H,
+                NL,
+                KE,
+                E,
+                EW,
+                B,
+                K,
+                L,
+                S,
+                KP,
+                BP,
+                CAP,
+                FAN,
+                EXPERT_AWARE,
+                NLP,
+                KEP,
+                TOPM,
+            )
+    else:
+        _build_one(
+            tl.program_id(0),
+            scores_ptr,
+            cand_ptr,
+            out_ptr,
+            logp_out_ptr,
+            sorted_logp_ptr,
+            sorted_cand_ptr,
+            sorted_idx_ptr,
+            UMSB,
+            PAD,
+            table_ptr,
+            active_ptr,
+            cost_ptr,
+            anchor_ptr,
+            lam_ptr,
+            num_anchors,
+            unknown_cost,
+            hit_rate,
+            H,
+            NL,
+            KE,
+            E,
+            EW,
+            B,
+            K,
+            L,
+            S,
+            KP,
+            BP,
+            CAP,
+            FAN,
+            EXPERT_AWARE,
+            NLP,
+            KEP,
+            TOPM,
+        )
 
 
 class TreeBuilder:
@@ -437,11 +566,7 @@ class TreeBuilder:
         self.lam = lam
         words = (routing.num_experts + 31) // 32
         self._active = torch.zeros(
-            self.max_num_reqs,
-            routing.num_layers,
-            words,
-            dtype=torch.int32,
-            device=self.packed.device,
+            routing.num_layers, words, dtype=torch.int32, device=self.packed.device
         )
 
     def select(
@@ -481,7 +606,7 @@ class TreeBuilder:
         if routing is not None:
             assert anchor_ids is not None and self._active is not None
             assert self.lam is not None
-            self._active[:R].zero_()
+            self._active.zero_()
             route_args = (
                 routing.table,
                 self._active,
@@ -490,20 +615,24 @@ class TreeBuilder:
                 self.lam,
                 anchor_ids.shape[0],
                 routing.unknown_cost_ms,
+                routing.hit_stats,
+                R,
                 routing.buckets,
                 routing.num_layers,
                 routing.top_k,
                 routing.num_experts,
-                self._active.shape[2],
+                self._active.shape[1],
             )
             nlp = triton.next_power_of_2(routing.num_layers)
             kep = triton.next_power_of_2(routing.top_k)
             fan = self.top_m
+            grid = (1,)
         else:
             # Inert placeholders: the expert-aware code is compiled out.
-            route_args = (self.packed,) * 5 + (0, 0.0, 1, 1, 1, 1, 1)
+            route_args = (self.packed,) * 5 + (0, 0.0, self.packed, R, 1, 1, 1, 1, 1)
             nlp = kep = fan = 1
-        _tree_builder_kernel[(R,)](
+            grid = (R,)
+        _tree_builder_kernel[grid](
             scores,
             cand,
             self.packed,

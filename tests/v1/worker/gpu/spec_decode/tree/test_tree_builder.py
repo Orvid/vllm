@@ -222,6 +222,41 @@ def test_expert_aware_selection_trades_mass_for_resident_experts(lam, first):
     assert sorted(out.token_ids[0].tolist()) == [10, 11]
 
 
+def test_expert_aware_selection_shares_experts_across_the_batch():
+    """Request 0's tree activates experts 2 and 3; request 1 then prefers its
+    slightly less likely node that routes there over one needing new
+    experts."""
+    L, K = 1, 2
+    cand = torch.tensor([[[20, 21]], [[30, 31]]], device="cuda")
+    scores = torch.zeros(2, L, K, K, device="cuda")
+    scores[:, 0, :, 0] = torch.log(torch.tensor(0.55))
+    scores[:, 0, :, 1] = torch.log(torch.tensor(0.45))
+    routing = _routing(
+        {
+            5: [[0, 1], [0, 1]],  # both anchors
+            20: [[2, 3], [2, 3]],
+            21: [[6, 7], [6, 7]],
+            30: [[4, 5], [4, 5]],  # new experts for request 1
+            31: [[2, 3], [2, 3]],  # what request 0 already activates
+        }
+    )
+    tb = TreeBuilder(2, 1, 2, 1, "cuda")
+    tb.bind_routing(routing, torch.tensor([1.0], device="cuda"))
+    out = tb.build(scores, cand, torch.tensor([5, 5], device="cuda"))
+    assert out.token_ids[:, 0].tolist() == [20, 31]
+
+
+def test_routing_memory_measures_its_hit_rate():
+    """Replacing a token's entry scores it as a prediction: of 4 predicted
+    experts, the token's new routing uses 3."""
+    mem = _routing({7: [[1, 2], [3, 4]]})
+    before = mem.hit_stats.clone()
+    mem.routes[0, 0] = torch.tensor([1, 9])
+    mem.routes[0, 2] = torch.tensor([3, 4])
+    mem.record(torch.tensor([7], device="cuda"), 1)
+    assert (mem.hit_stats - before).tolist() == [3.0, 4.0]
+
+
 def test_expert_aware_selection_without_cost_is_the_mass_order():
     """With costs priced at zero, expert-aware selection builds the same tree
     as ranking by mass alone."""

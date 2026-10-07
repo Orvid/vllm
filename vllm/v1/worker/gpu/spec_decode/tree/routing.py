@@ -27,6 +27,10 @@ from vllm.triton_utils import tl, triton
 logger = init_logger(__name__)
 
 DEFAULT_BUCKETS = 4096
+# Weight (in predicted experts) of the hit-rate prior, and how often (in
+# recorded forwards) the hit-rate statistics are halved.
+_HIT_PRIOR = 1000.0
+_HIT_DECAY_EVERY = 256
 # Knuth's multiplicative hash; buckets are a power of two.
 _HASH_MULT = 2654435761
 
@@ -44,6 +48,7 @@ def _record_kernel(
     route_stride_tok,
     route_stride_layer,
     layer_ids_ptr,  # [NL] capturer layer index of each MoE layer
+    stats_ptr,  # [2] f32 (predicted experts used, predicted experts)
     H: tl.constexpr,
     NL: tl.constexpr,
     KE: tl.constexpr,
@@ -64,11 +69,21 @@ def _record_kernel(
         mask=mask,
         other=-1,
     )
-    tl.store(
-        table_ptr + (nl[:, None] * H + b) * KE + kj[None, :],
-        experts.to(tl.int16),
-        mask=mask,
-    )
+    slot = table_ptr + (nl[:, None] * H + b) * KE + kj[None, :]
+    # Score the entry being replaced as a prediction of this routing: how many
+    # of the experts it predicted the token really used.
+    old = tl.load(slot, mask=mask, other=-1).to(tl.int32)
+    predicted = mask & (old >= 0)
+    used = tl.zeros([NLP, KEP], dtype=tl.int32)
+    for j in tl.static_range(KE):
+        e_j = tl.sum(tl.where(kj[None, :] == j, experts, 0), axis=1)
+        used += (old == e_j[:, None]).to(tl.int32)
+    hits = tl.sum(tl.sum(tl.where(predicted, used, 0), axis=1), axis=0)
+    total = tl.sum(tl.sum(predicted.to(tl.int32), axis=1), axis=0)
+    if total > 0:
+        tl.atomic_add(stats_ptr, hits.to(tl.float32))
+        tl.atomic_add(stats_ptr + 1, total.to(tl.float32))
+    tl.store(slot, experts.to(tl.int16), mask=mask)
 
 
 class MoERoutingMemory:
@@ -119,6 +134,14 @@ class MoERoutingMemory:
             .contiguous()
         )
         self._update_unknown_cost()
+        # (predicted experts the token then used, predicted experts): the
+        # predictor's hit rate, measured whenever a token's entry is replaced
+        # and decayed every _HIT_DECAY_EVERY records, from a prior near what
+        # Qwen3.6-35B-A3B measures (0.42).
+        self.hit_stats = torch.tensor(
+            [0.4 * _HIT_PRIOR, _HIT_PRIOR], dtype=torch.float32, device=device
+        )
+        self._records = 0
 
     def set_expert_costs(self, cost_ms: torch.Tensor) -> None:
         """Per-expert activation cost (ms), ``[num_moe_layers, num_experts]``."""
@@ -138,6 +161,9 @@ class MoERoutingMemory:
         capturer buffer, whose tokens are ``input_ids``) into the table."""
         if num_tokens == 0:
             return
+        self._records += 1
+        if self._records % _HIT_DECAY_EVERY == 0:
+            self.hit_stats.mul_(0.5)
         _record_kernel[(num_tokens,)](
             self.table,
             input_ids,
@@ -145,6 +171,7 @@ class MoERoutingMemory:
             self.routes.stride(0),
             self.routes.stride(1),
             self.layer_ids,
+            self.hit_stats,
             H=self.buckets,
             NL=self.num_layers,
             KE=self.top_k,
