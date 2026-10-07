@@ -45,9 +45,9 @@ _PRIOR_N = 4.0
 # tracks a drifting workload.
 _DECAY_INTERVAL = 512
 _RING = 4
-# Online step-cost correction: EMA weight per measured step (half-life ~44
-# steps, so it follows drifting costs), and the cap on a measured interval
-# relative to its prediction.
+# Online step-cost correction: EMA weight per measured step once a width has
+# that many samples (half-life ~44 steps, so it follows drifting costs), and
+# the cap on a measured interval relative to its prediction.
 _COST_ALPHA = 1.0 / 64
 _MAX_STEP_RATIO = 3.0
 
@@ -190,6 +190,7 @@ class TreeWidthController:
         # that depend on the real data and drift over time (e.g. which MoE
         # experts the rows reach and whether they are resident).
         self.cost_delta_ms = np.zeros(nl, dtype=np.float64)
+        self._cost_samples = np.zeros(nl, dtype=np.int64)
         self._next_event = torch.cuda.Event(enable_timing=True)
         self._open: tuple[torch.cuda.Event, int, int] | None = None
         self._timed: deque[tuple[torch.cuda.Event, int, int, torch.cuda.Event]] = (
@@ -317,7 +318,11 @@ class TreeWidthController:
         # overstates this width's cost, so one sample moves the estimate by a
         # bounded amount; a real, larger cost still converges.
         ms = min(ms, _MAX_STEP_RATIO * predicted)
-        self.cost_delta_ms[j] += _COST_ALPHA * (ms - predicted)
+        # A running mean over a width's first samples (so a few steps already
+        # correct a badly profiled width), then an EMA that follows drift.
+        self._cost_samples[j] += 1
+        alpha = max(_COST_ALPHA, 1.0 / self._cost_samples[j])
+        self.cost_delta_ms[j] += alpha * (ms - predicted)
 
     def select(self, slots: np.ndarray) -> int:
         """Verify width for a decode batch over request-state ``slots``."""

@@ -99,11 +99,24 @@ def test_measured_step_time_moves_the_width_choice():
     assert ctl.select(np.array([0])) == 2
 
 
-def test_one_outlier_step_moves_the_cost_a_bounded_amount():
-    """An interval spanning other work (say a prefill) counts as at most 3x
-    the prediction."""
+def test_a_badly_profiled_width_is_corrected_within_a_few_steps():
+    """A width's first samples average in fully, so a short run already
+    learns that the profile underpriced it (e.g. MoE rows that reach far more
+    experts than the profile's dummy tokens)."""
     ctl = TreeWidthController([2, 4], max_num_reqs=4, device=DEVICE)
     ctl.set_cost_table(build_cost_table({(2, 1): 1.0, (4, 1): 1.0}, [2, 4], 4))
+    for ms in (2.5, 2.5, 2.5):
+        ctl.observe_step_time(1, 1, ms)
+    assert ctl.cost_delta_ms[1] == pytest.approx(1.5)
+
+
+def test_one_outlier_step_moves_a_settled_cost_a_bounded_amount():
+    """Once a width has settled, an interval spanning other work (say a
+    prefill) counts as at most 3x the prediction, at the EMA weight."""
+    ctl = TreeWidthController([2, 4], max_num_reqs=4, device=DEVICE)
+    ctl.set_cost_table(build_cost_table({(2, 1): 1.0, (4, 1): 1.0}, [2, 4], 4))
+    for _ in range(64):
+        ctl.observe_step_time(0, 1, 1.0)
     ctl.observe_step_time(0, 1, 1000.0)
     assert ctl.cost_delta_ms[0] == pytest.approx((3.0 - 1.0) / 64)
 
