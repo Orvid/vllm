@@ -81,7 +81,10 @@ def _build_commit_kernel(
     j = tl.arange(0, LP)
     arena = tl.load(
         arenas_ptr + r[:, None] * arena_stride + j[None, :],
-        mask=rm[:, None] & (j[None, :] >= 1) & (j[None, :] <= L),
+        mask=rm[:, None]
+        & (j[None, :] >= 1)
+        & (j[None, :] <= L)
+        & (j[None, :] < arena_stride),
         other=-1,
     )
     depth = tl.sum((arena >= 0).to(tl.int32), axis=1)
@@ -148,15 +151,17 @@ class TreeVerifyContext:
         max_width: int | None = None,
     ):
         self.max_num_reqs = max_num_reqs
-        self.max_depth = max_depth
         self.max_width = max_num_tokens - 1 if max_width is None else max_width
+        # A path has at most one node per depth, so a tree deeper than it is
+        # wide (a drafter depth above the node budget) is bounded by its width.
+        self.max_depth = min(max_depth, self.max_width)
         self.row_parent = torch.full(
             (max_num_tokens,), -1, dtype=torch.int32, device=device
         )
         self.tree_width = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
         self.num_reqs = 0
         # Commit buffers, written after each walk.
-        per_req = 1 + max_depth
+        per_req = 1 + self.max_depth
         self._commit_rows = torch.zeros(
             max_num_reqs * per_req, dtype=torch.int64, device=device
         )

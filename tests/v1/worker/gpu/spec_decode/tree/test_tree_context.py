@@ -76,6 +76,25 @@ def test_commit_after_a_larger_step_reads_only_this_steps_rows():
     assert (commit.rows[1:] == 0).all()
 
 
+def test_commit_never_reads_past_a_narrow_trees_arenas():
+    """A drafter deeper than the tree is wide (depth 8, 3 nodes): each
+    request's accepted-arena row has 1 + 3 columns, and reading 1 + 8 of
+    them would take the next request's column 0 for an accepted node."""
+    ctx = TreeVerifyContext(16, 2, max_depth=8, device=DEVICE, max_width=3)
+    assert ctx.max_depth == 3
+    qsl = torch.tensor([0, 4, 8], dtype=torch.int32, device=DEVICE)
+    parents = torch.tensor([[-1, 0, 1], [-1, 0, 1]], dtype=torch.int64, device=DEVICE)
+    widths = torch.tensor([3, 3], dtype=torch.int64, device=DEVICE)
+    ctx.fill(qsl, 2, parents, widths)
+    accepted = torch.full((2, 4), -1, dtype=torch.int64, device=DEVICE)
+    accepted[0, 1:] = torch.tensor([0, 1, 2])  # a full chain
+    accepted[1, 0] = 2  # column 0 is unused; must not count for request 0
+    positions = torch.arange(16, device=DEVICE)
+    commit = ctx.build_commit(accepted, qsl, positions)
+    assert commit.num_rows.tolist() == [4, 1]
+    assert commit.rows[:5].tolist() == [0, 1, 2, 3, 4]
+
+
 class _Recurrent:
     def __init__(self):
         self.stash = None
