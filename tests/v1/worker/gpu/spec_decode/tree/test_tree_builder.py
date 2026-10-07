@@ -171,13 +171,11 @@ def test_children_follow_their_parents_candidate_row():
         assert tokens[: len(greedy)].tolist() == greedy
 
 
-def _routes(token_experts: dict[int, list[list[int]]]) -> torch.Tensor:
+def _routes(row_experts: list[list[list[int]]]) -> torch.Tensor:
     """A capturer buffer with two MoE layers (capturer layers 0 and 2): row i
-    routes to ``token_experts[i-th token] = [layer0 experts, layer1 experts]``."""
-    routes = torch.full(
-        (len(token_experts), 3, 2), -1, dtype=torch.int32, device="cuda"
-    )
-    for i, (l0, l1) in enumerate(token_experts.values()):
+    routes to ``row_experts[i] = [layer0 experts, layer1 experts]``."""
+    routes = torch.full((len(row_experts), 3, 2), -1, dtype=torch.int32, device="cuda")
+    for i, (l0, l1) in enumerate(row_experts):
         routes[i, 0] = torch.tensor(l0)
         routes[i, 2] = torch.tensor(l1)
     return routes
@@ -189,19 +187,28 @@ def _routing(token_experts: dict[int, list[list[int]]], num_experts: int = 8):
     from vllm.v1.worker.gpu.spec_decode.tree.routing import MoERoutingPredictor
 
     class FixedRouting(MoERoutingPredictor):
-        def _topk(self, ids, reqs):
+        def _topk(self, ids, hidden):
             return lookup[ids]
 
     lookup = torch.tensor([0, 1], device="cuda").repeat(512, 2, 1)
     for tok, experts in token_experts.items():
         lookup[tok] = torch.tensor(experts)
     return FixedRouting(
-        _routes(token_experts), [0, 2], num_experts, torch.ones(2), torch.device("cuda")
+        _routes(list(token_experts.values())),
+        [0, 2],
+        num_experts,
+        torch.ones(2),
+        torch.device("cuda"),
     )
 
 
-def _decode_batch(tokens: list[int], qsl: list[int]) -> SimpleNamespace:
-    """A forward of decode requests, request r spanning rows qsl[r]:qsl[r+1]."""
+def _decode_batch(
+    tokens: list[int], qsl: list[int], positions: list[int] | None = None
+) -> SimpleNamespace:
+    """A forward of decode requests, request r spanning rows qsl[r]:qsl[r+1]
+    (consecutive positions unless given)."""
+    if positions is None:
+        positions = list(range(len(tokens)))
     return SimpleNamespace(
         num_reqs=len(qsl) - 1,
         num_tokens=len(tokens),
@@ -210,6 +217,7 @@ def _decode_batch(tokens: list[int], qsl: list[int]) -> SimpleNamespace:
         is_prefilling_np=np.zeros(len(qsl) - 1, dtype=bool),
         idx_mapping=torch.arange(len(qsl) - 1, device="cuda"),
         input_ids=torch.tensor(tokens, device="cuda"),
+        positions=torch.tensor(positions, device="cuda"),
     )
 
 
@@ -217,50 +225,53 @@ def test_routing_meter_totals_each_forwards_distinct_experts():
     """Tokens 7 and 9 share expert 2 of layer 0: the forward reaches 7
     distinct experts at 1 ms each, and a forward of token 7 alone adds 4."""
     mem = _routing({7: [[1, 2], [3, 4]], 9: [[2, 6], [0, 7]]})
-    mem.observe_forward(_decode_batch([7, 9], [0, 2]), None)
+    mem.observe_forward(_decode_batch([7, 9], [0, 2]))
     assert mem.forward_cost_total.item() == 7.0
-    mem.observe_forward(_decode_batch([7], [0, 1]), None)
+    mem.observe_forward(_decode_batch([7], [0, 1]))
     assert mem.forward_cost_total.item() == 11.0
 
 
-def test_online_predictor_learns_routing_from_decode_forwards():
-    """Tokens that always route to the same experts: a few hundred decode
-    forwards teach the predictor to name them, and its measured hit rate
-    follows."""
+def test_online_predictor_tells_draft_positions_apart():
+    """Token 9 drafted at depths 1 and 2 routes to different experts there:
+    trained on decode forwards, the predictor names each from the drafter's
+    hidden state at its position (and the anchor's from its token), and its
+    measured hit rate follows."""
     from vllm.v1.worker.gpu.spec_decode.tree.routing import OnlineRoutingPredictor
 
     torch.manual_seed(0)
-    truth = {5: [[1, 2], [3, 4]], 9: [[6, 7], [0, 8]], 11: [[9, 10], [11, 12]]}
-    tokens = list(truth)
-    embed = torch.nn.Embedding(64, 32).cuda()
+    anchor, depth1, depth2 = [[1, 2], [3, 4]], [[6, 7], [0, 8]], [[9, 10], [11, 12]]
     pred = OnlineRoutingPredictor(
-        embed=embed,
+        embed=torch.nn.Embedding(64, 32).cuda(),
         hidden_size=32,
+        draft_hidden_size=16,
         max_num_reqs=1,
-        routes=_routes(truth),
+        routes=_routes([anchor, depth1, depth2]),
         moe_layer_ids=[0, 2],
         num_experts=16,
         expert_cost_ms=torch.ones(2),
         device=torch.device("cuda"),
     )
-    batch = _decode_batch(tokens, [0, 3])
-    hidden = torch.randn(3, 32, device="cuda")
-    cand = torch.tensor([[tokens]], device="cuda")
+    # The verify of anchor 5 and its chain 9 -> 9 (positions anchor + depth).
+    batch = _decode_batch([5, 9, 9], [0, 3], positions=[10, 11, 12])
+    cand = torch.tensor([[[9], [9]]], device="cuda")
+    draft_hidden = torch.randn(1, 2, 16, device="cuda")
     with torch.inference_mode():
         for _ in range(300):
-            pred.observe_forward(batch, hidden)
+            pred.observe_forward(batch)
+            pred.predict(cand, batch.input_ids[:1], draft_hidden)
             # Paced like decode steps, so the pinned staging slots are free.
             torch.accelerator.synchronize()
         # Both run every decode step: neither may wait on the device.
         torch.cuda.set_sync_debug_mode("error")
         try:
-            pred.observe_forward(batch, hidden)
-            out = pred.predict(cand, batch.input_ids[:1])
+            pred.observe_forward(batch)
+            out = pred.predict(cand, batch.input_ids[:1], draft_hidden)
         finally:
             torch.cuda.set_sync_debug_mode("default")
-    for i, tok in enumerate(tokens):
-        assert sorted(out[0, i].tolist()) == truth[tok][0]
-        assert sorted(out[1, i].tolist()) == truth[tok][1]
+    # Slots: (depth 1, candidate 0), (depth 2, candidate 0), then the anchor.
+    for slot, truth in enumerate([depth1, depth2, anchor]):
+        assert sorted(out[0, slot].tolist()) == truth[0]
+        assert sorted(out[1, slot].tolist()) == truth[1]
     hits, total = pred.hit_stats.tolist()
     assert hits / total > 0.7
 

@@ -12,12 +12,13 @@ The predictor is a small MLP trained online, never to convergence: every
 target forward labels its decode rows with the experts they really routed to
 (from the routed-experts capturer), and one optimizer step on them keeps the
 predictor tracking the workload. Its inputs are the candidate token's target
-embedding and its request's context, the target's last hidden state at the
-request's anchor row. On Qwen3.6-35B-A3B at eight requests it reaches a 0.52
-expert hit rate and orders rows' marginal expert cost with 0.74 pairwise
-accuracy within ~500 steps, against 0.35 and 0.63 for each token's last-seen
-routing; the context is what tells requests apart, since a token alone caps
-the hit rate near 0.45.
+embedding and the drafter's hidden state at the candidate's draft position,
+which carries the request's context as of that exact position. On
+Qwen3.6-35B-A3B with DSpark at eight requests it reaches a 0.52 expert hit
+rate and orders rows' marginal expert cost with 0.69 pairwise accuracy within
+~300 steps (still rising), against 0.34 and 0.61 for each token's last-seen
+routing; a token alone caps the hit rate near 0.46, and the target's hidden
+state at the request's anchor row adds less than the drafter's does.
 """
 
 from collections.abc import Callable
@@ -133,24 +134,34 @@ class MoERoutingPredictor:
                 device=self.device,
             )
 
-    def predict(self, cand: Tensor, anchor_ids: Tensor) -> Tensor:
+    def predict(
+        self, cand: Tensor, anchor_ids: Tensor, hidden: Tensor | None = None
+    ) -> Tensor:
         """Fill and return the slot table for candidates ``cand [R, S, K]``
-        and anchors ``anchor_ids [R]`` (slot ``cand.numel() + r``)."""
-        R = cand.shape[0]
-        per_req = cand[0].numel()
+        and anchors ``anchor_ids [R]`` (slot ``cand.numel() + r``), given the
+        drafter's hidden state per draft position (``[R, S, H]``), if any."""
+        R, S, K = cand.shape
         ids = torch.cat([cand.reshape(-1), anchor_ids.reshape(-1).to(cand.dtype)])
-        reqs = torch.arange(R, device=cand.device)
-        reqs = torch.cat([reqs.repeat_interleave(per_req), reqs])
+        pos_hidden = None
+        if hidden is not None:
+            # Every candidate of a position shares its hidden state; anchors
+            # precede the draft and have none.
+            pos_hidden = torch.cat(
+                [
+                    hidden[:, :, None].expand(R, S, K, -1).reshape(R * S * K, -1),
+                    hidden.new_zeros(R, hidden.shape[-1]),
+                ]
+            )
         n = ids.numel()
         self.reserve_slots(n)
-        top = self._topk(ids, reqs)  # [n, num_layers, top_k]
+        top = self._topk(ids, pos_hidden)  # [n, num_layers, top_k]
         self.pred[:, :n] = top.permute(1, 0, 2).to(torch.int16)
         return self.pred
 
-    def _topk(self, ids: Tensor, reqs: Tensor) -> Tensor:
+    def _topk(self, ids: Tensor, hidden: Tensor | None) -> Tensor:
         raise NotImplementedError
 
-    def observe_forward(self, input_batch: Any, hidden_states: Tensor | None) -> None:
+    def observe_forward(self, input_batch: Any) -> None:
         """Account the forward's routing (``input_batch.num_tokens`` rows of
         the capturer buffer)."""
         n = input_batch.num_tokens
@@ -181,12 +192,14 @@ class _RouterMLP(nn.Module):
 
 
 class OnlineRoutingPredictor(MoERoutingPredictor):
-    """Experts predicted by an MLP over (token embedding, request context),
-    trained on every forward's decode rows.
+    """Experts predicted by an MLP over (token embedding, drafter hidden state
+    at the token's draft position), trained on every forward's decode rows.
 
     Args:
         embed: The target's input embedding (token ids to hidden states).
         hidden_size: The target's hidden size.
+        draft_hidden_size: The drafter's hidden size (its per-position state
+            reads as zeros for a drafter that has none).
         max_num_reqs: Request-state slots.
         **kwargs: ``MoERoutingPredictor`` arguments.
 
@@ -196,14 +209,19 @@ class OnlineRoutingPredictor(MoERoutingPredictor):
         self,
         embed: Callable[[Tensor], Tensor],
         hidden_size: int,
+        draft_hidden_size: int,
         max_num_reqs: int,
         **kwargs: Any,
     ):
         super().__init__(**kwargs)
         self.embed = embed
+        self.draft_hidden_size = draft_hidden_size
         with torch.inference_mode(False):
             self.mlp = _RouterMLP(
-                2 * hidden_size, self.num_layers, self.num_experts, _HIDDEN
+                hidden_size + draft_hidden_size,
+                self.num_layers,
+                self.num_experts,
+                _HIDDEN,
             ).to(self.device)
             self.opt = torch.optim.Adam(
                 self.mlp.parameters(), lr=_LR, fused=self.device.type == "cuda"
@@ -219,20 +237,42 @@ class OnlineRoutingPredictor(MoERoutingPredictor):
         self._host_events = [torch.cuda.Event() for _ in range(_RING)]
         self._host_used = [False] * _RING
         self._host_next = 0
-        # Each request's context (its last hidden state at its anchor row),
-        # by request-state slot, and in this step's batch order for predict.
-        self.ctx = torch.zeros(max_num_reqs, hidden_size, device=self.device)
-        self.batch_ctx = torch.zeros(max_num_reqs, hidden_size, device=self.device)
+        # Each request's latest draft hidden states by request-state slot
+        # ([slots, S, H], allocated at the first draft), which label its next
+        # verify's rows; and the request-state slot of each row of the batch
+        # whose draft comes next.
+        self.max_num_reqs = max_num_reqs
+        self.draft_hidden: Tensor | None = None
+        self._batch_slots = torch.zeros(
+            max_num_reqs, dtype=torch.long, device=self.device
+        )
         self._rng = np.random.default_rng(0)
 
-    def _features(self, ids: Tensor, ctx: Tensor) -> Tensor:
+    def _features(self, ids: Tensor, hidden: Tensor | None) -> Tensor:
         with torch.no_grad():
-            return torch.cat([_rms(self.embed(ids).float()), _rms(ctx)], -1)
+            tok = _rms(self.embed(ids).float())
+            if hidden is None:
+                h = tok.new_zeros(tok.shape[0], self.draft_hidden_size)
+            else:
+                h = _rms(hidden.float())
+            return torch.cat([tok, h], -1)
 
-    def _topk(self, ids: Tensor, reqs: Tensor) -> Tensor:
+    def _topk(self, ids: Tensor, hidden: Tensor | None) -> Tensor:
         with torch.no_grad():
-            logits = self.mlp(self._features(ids, self.batch_ctx[reqs]))
+            logits = self.mlp(self._features(ids, hidden))
         return logits.topk(self.top_k, dim=-1).indices
+
+    def predict(
+        self, cand: Tensor, anchor_ids: Tensor, hidden: Tensor | None = None
+    ) -> Tensor:
+        if hidden is not None:
+            R, S, H = hidden.shape
+            if self.draft_hidden is None:
+                self.draft_hidden = torch.zeros(
+                    self.max_num_reqs, S, H, dtype=hidden.dtype, device=self.device
+                )
+            self.draft_hidden[self._batch_slots[:R]] = hidden
+        return super().predict(cand, anchor_ids, hidden)
 
     def _train_rows(self, input_batch: Any) -> tuple[np.ndarray, np.ndarray]:
         """Rows of the batch's decode requests and their batch index."""
@@ -248,9 +288,9 @@ class OnlineRoutingPredictor(MoERoutingPredictor):
             rows, reqs = rows[keep], reqs[keep]
         return rows, reqs
 
-    def observe_forward(self, input_batch: Any, hidden_states: Tensor | None) -> None:
-        super().observe_forward(input_batch, hidden_states)
-        if hidden_states is None or input_batch.num_tokens == 0:
+    def observe_forward(self, input_batch: Any) -> None:
+        super().observe_forward(input_batch)
+        if input_batch.num_tokens == 0:
             return
         rows_np, reqs_np = self._train_rows(input_batch)
         k = self._host_next
@@ -264,20 +304,33 @@ class OnlineRoutingPredictor(MoERoutingPredictor):
             self._host_events[k].record()
             self._host_used[k] = True
             rows, reqs = dev[0], dev[1]
-            slots = input_batch.idx_mapping[reqs].long()
-            self._train(input_batch.input_ids[rows], self.ctx[slots], rows)
-        # The next selection prices this batch's candidates against each
-        # request's freshest context: its anchor row of this forward.
+            self._train(input_batch, rows, reqs)
+        # The draft that follows this forward is for this batch's requests.
         num_reqs = input_batch.num_reqs
-        anchor_h = hidden_states[input_batch.query_start_loc[:num_reqs]].float()
-        self.ctx[input_batch.idx_mapping] = anchor_h
-        self.batch_ctx[:num_reqs] = anchor_h
+        self._batch_slots[:num_reqs] = input_batch.idx_mapping
 
-    def _train(self, ids: Tensor, ctx: Tensor, rows: Tensor) -> None:
+    def _row_hidden(
+        self, input_batch: Any, rows: Tensor, reqs: Tensor
+    ) -> Tensor | None:
+        """The draft hidden state each verify row was predicted with: a row
+        at depth ``d`` (its position past its request's anchor row) is draft
+        position ``d - 1``; the anchor has none."""
+        if self.draft_hidden is None:
+            return None
+        pos = input_batch.positions
+        depth = pos[rows] - pos[input_batch.query_start_loc[reqs]]
+        S = self.draft_hidden.shape[1]
+        slots = input_batch.idx_mapping[reqs].long()
+        h = self.draft_hidden[slots, (depth - 1).clamp(0, S - 1)]
+        return torch.where(((depth >= 1) & (depth <= S))[:, None], h, 0)
+
+    def _train(self, input_batch: Any, rows: Tensor, reqs: Tensor) -> None:
+        ids = input_batch.input_ids[rows]
+        hidden = self._row_hidden(input_batch, rows, reqs)
         labels = self.routes[rows].index_select(1, self.layer_ids).long().clamp_(min=0)
         with torch.inference_mode(False), torch.enable_grad():
             # The forward ran under inference mode; train on ordinary copies.
-            feats = self._features(ids, ctx).clone()
+            feats = self._features(ids, hidden).clone()
             labels = labels.clone()
             target = torch.zeros(
                 labels.shape[0], self.num_layers, self.num_experts, device=self.device
@@ -365,6 +418,9 @@ def build_moe_routing_predictor(
     return OnlineRoutingPredictor(
         embed=model.embed_input_ids,
         hidden_size=vllm_config.model_config.get_hidden_size(),
+        draft_hidden_size=(
+            vllm_config.speculative_config.draft_model_config.get_hidden_size()
+        ),
         max_num_reqs=max_num_reqs,
         routes=capturer.device_buffer,
         moe_layer_ids=[r.layer_id for r in runners],

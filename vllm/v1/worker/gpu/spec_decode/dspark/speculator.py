@@ -50,6 +50,7 @@ class DSparkProposal(DraftProposal):
             the draft vocab), or None for a full-vocab draft.
         draft_topk: Backbone tokens the sequential head re-ranks per position
             (``dspark_draft_topk``), or None for the whole draft vocab.
+        hidden: ``[R, S, H]`` the backbone's hidden state per position.
 
     """
 
@@ -60,9 +61,11 @@ class DSparkProposal(DraftProposal):
         anchor_ids: torch.Tensor,
         target_to_draft: torch.Tensor | None,
         draft_topk: int | None = None,
+        hidden: torch.Tensor | None = None,
     ):
         self._model = model
         self._base = base_logits
+        self._hidden = hidden
         self._anchor_ids = anchor_ids
         self._target_to_draft = target_to_draft
         self._draft_topk = draft_topk
@@ -365,9 +368,10 @@ class DSparkSpeculator(DFlashSpeculator):
             cudagraph_runtime_mode,
         )
         num_sample = num_reqs * self.num_speculative_steps
-        base_logits = self.model.compute_draft_logits(
-            head_hidden[self.sample_indices[:num_sample]]
-        ).view(num_reqs, self.num_speculative_steps, -1)
+        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+        base_logits = self.model.compute_draft_logits(sample_hidden).view(
+            num_reqs, self.num_speculative_steps, -1
+        )
         anchor_ids = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
         return DSparkProposal(
             self.model,
@@ -375,6 +379,7 @@ class DSparkSpeculator(DFlashSpeculator):
             anchor_ids,
             self._target_to_draft,
             self._draft_topk,
+            hidden=sample_hidden.view(num_reqs, self.num_speculative_steps, -1),
         )
 
     def _generate_draft(

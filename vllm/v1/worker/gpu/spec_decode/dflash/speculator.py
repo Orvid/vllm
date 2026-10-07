@@ -328,10 +328,10 @@ class DFlashSpeculator(DraftModelSpeculator):
             cudagraph_runtime_mode,
         )
         num_sample = num_reqs * self.num_speculative_steps
-        logits = self.model.compute_logits(
-            last_hidden_states[self.sample_indices[:num_sample]]
-        )
-        return DraftProposal(logits.view(num_reqs, self.num_speculative_steps, -1))
+        sample_hidden = last_hidden_states[self.sample_indices[:num_sample]]
+        logits = self.model.compute_logits(sample_hidden)
+        shape = (num_reqs, self.num_speculative_steps, -1)
+        return DraftProposal(logits.view(shape), sample_hidden.view(shape))
 
     def _num_graph_context_tokens(self, num_reqs: int) -> int:
         # Context rows a captured draft step stores: one full verify per request.

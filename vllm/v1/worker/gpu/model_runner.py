@@ -3594,7 +3594,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             aux_hidden_states = None
             output_intermediate_tensors = model_output
         if self._moe_routing is not None and not dummy_run:
-            self._moe_routing.observe_forward(input_batch, hidden_states)
+            self._moe_routing.observe_forward(input_batch)
 
         finished_req_ids = scheduler_output.finished_req_ids
         self.execute_model_state = ExecuteModelState(

@@ -21,15 +21,23 @@ class DraftProposal:
 
     Args:
         logits: ``[R, S, V]`` target-vocab logits per draft position.
+        hidden: ``[R, S, H]`` the drafter's hidden state per draft position,
+            if it has one.
 
     """
 
-    def __init__(self, logits: torch.Tensor):
+    def __init__(self, logits: torch.Tensor, hidden: torch.Tensor | None = None):
         self._logits = logits
+        self._hidden = hidden
 
     @property
     def num_positions(self) -> int:
         return self._logits.shape[1]
+
+    def position_hidden(self) -> torch.Tensor | None:
+        """``[R, S, H]`` the drafter's hidden state per draft position (what
+        its logits are computed from), or ``None``."""
+        return self._hidden
 
     def marginal_logits(self) -> torch.Tensor | None:
         """``[R, S, V]`` target-vocab logits per position, if the drafter
@@ -58,12 +66,20 @@ class CandidateHeadProposal(DraftProposal):
         ids: ``[R, S, K]`` the head's candidates.
         scores: ``[R, S, K, K]`` conditional logits between them (row ``i`` at
             ``s = 0`` follows the anchor).
+        hidden: ``[R, S, H]`` the drafter's hidden state per draft position,
+            if it has one.
 
     """
 
-    def __init__(self, ids: torch.Tensor, scores: torch.Tensor):
+    def __init__(
+        self,
+        ids: torch.Tensor,
+        scores: torch.Tensor,
+        hidden: torch.Tensor | None = None,
+    ):
         self._ids = ids
         self._scores = scores
+        self._hidden = hidden
 
     @property
     def num_positions(self) -> int:

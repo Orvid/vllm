@@ -641,10 +641,15 @@ class TreeBuilder:
         scores = proposal.conditional(cand)
         if scores is None:
             scores = unary.float().unsqueeze(-2).expand(*unary.shape[:2], self.K, -1)
-        return self.build(scores, cand, anchor_ids)
+        hidden = proposal.position_hidden() if self.routing is not None else None
+        return self.build(scores, cand, anchor_ids, hidden)
 
     def build(
-        self, scores: Tensor, cand: Tensor, anchor_ids: Tensor | None = None
+        self,
+        scores: Tensor,
+        cand: Tensor,
+        anchor_ids: Tensor | None = None,
+        hidden: Tensor | None = None,
     ) -> TreeDraft:
         """Populate the tree for each request.
 
@@ -654,6 +659,8 @@ class TreeBuilder:
             cand: [R, L, K] successor token ids per (depth, rank).
             anchor_ids: [R] the batch's anchor tokens; required once
                 expert-aware selection is bound.
+            hidden: [R, L, H] the drafter's hidden state per draft position,
+                for expert-aware selection's routing prediction.
 
         Returns:
             A TreeDraft in emit order (emit index == arena index): token_ids,
@@ -674,7 +681,7 @@ class TreeBuilder:
             assert cand.shape[1] == self.num_steps
             self._active.zero_()
             self._own[:R].zero_()
-            pred = routing.predict(cand, anchor_ids)
+            pred = routing.predict(cand, anchor_ids, hidden)
             route_args = (
                 pred,
                 self._active,
