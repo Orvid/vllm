@@ -84,21 +84,28 @@ def test_select_trades_acceptance_against_cost(narrow_cost, expected):
     assert ctl.select(np.array([0, 1])) == expected
 
 
-def test_measured_step_time_corrects_the_profiled_cost():
-    """The profile claims 0.1 ms steps; real steps take longer. The chosen
-    width's estimate rises with what is measured, which then makes the
-    uncorrected width look cheaper, so it gets tried and corrected too."""
+def test_measured_step_time_moves_the_width_choice():
+    """The profile prices both widths at 1 ms, so width 4 wins on expected
+    tokens; measured 3 ms steps at width 4 correct its cost until width 2
+    is the better trade."""
     ctl = TreeWidthController([2, 4], max_num_reqs=4, device=DEVICE)
-    ctl.set_cost_table(build_cost_table({(2, 1): 0.1, (4, 1): 0.1}, [2, 4], 4))
+    ctl.set_cost_table(build_cost_table({(2, 1): 1.0, (4, 1): 1.0}, [2, 4], 4))
     _record(ctl, [0])
-    chosen = set()
+    assert ctl.select(np.array([0])) == 4
     for _ in range(300):
-        chosen.add(ctl.select(np.array([0])))
-        torch.cuda._sleep(2_000_000)  # about a millisecond of GPU work
-    torch.accelerator.synchronize()
-    ctl.select(np.array([0]))
-    assert chosen == {2, 4}
-    assert (ctl.cost_delta_ms > 0.2).all()
+        ctl.observe_step_time(1, 1, 3.0)
+    assert ctl.cost_delta_ms[1] == pytest.approx(2.0, abs=0.05)
+    assert ctl.cost_delta_ms[0] == 0.0
+    assert ctl.select(np.array([0])) == 2
+
+
+def test_one_outlier_step_moves_the_cost_a_bounded_amount():
+    """An interval spanning other work (say a prefill) counts as at most 3x
+    the prediction."""
+    ctl = TreeWidthController([2, 4], max_num_reqs=4, device=DEVICE)
+    ctl.set_cost_table(build_cost_table({(2, 1): 1.0, (4, 1): 1.0}, [2, 4], 4))
+    ctl.observe_step_time(0, 1, 1000.0)
+    assert ctl.cost_delta_ms[0] == pytest.approx((3.0 - 1.0) / 64)
 
 
 def test_new_request_never_reads_previous_occupant_curve():

@@ -307,12 +307,17 @@ class TreeWidthController:
         self._next_event = torch.cuda.Event(enable_timing=True)
         while self._timed and self._timed[0][3].query():
             start, pj, pn, end = self._timed.popleft()
-            predicted = self.step_cost_ms(pn)[pj]
-            # An interval spanning other work (a prefill, an idle engine)
-            # overstates this width's cost, so one sample moves the estimate
-            # by a bounded amount; a real, larger cost still converges.
-            ms = min(start.elapsed_time(end), _MAX_STEP_RATIO * predicted)
-            self.cost_delta_ms[pj] += _COST_ALPHA * (ms - predicted)
+            self.observe_step_time(pj, pn, start.elapsed_time(end))
+
+    def observe_step_time(self, j: int, n: int, ms: float) -> None:
+        """Fold a measured step time (``widths[j]``, ``n`` requests) into the
+        width's cost correction."""
+        predicted = self.step_cost_ms(n)[j]
+        # An interval spanning other work (a prefill, an idle engine)
+        # overstates this width's cost, so one sample moves the estimate by a
+        # bounded amount; a real, larger cost still converges.
+        ms = min(ms, _MAX_STEP_RATIO * predicted)
+        self.cost_delta_ms[j] += _COST_ALPHA * (ms - predicted)
 
     def select(self, slots: np.ndarray) -> int:
         """Verify width for a decode batch over request-state ``slots``."""
