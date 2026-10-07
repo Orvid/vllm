@@ -24,17 +24,13 @@ from torch import Tensor
 
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.spec_decode.tree.proposal import DraftProposal
-from vllm.v1.worker.gpu.spec_decode.tree.routing import (
-    MoERoutingMemory,
-    routing_bucket,
-)
+from vllm.v1.worker.gpu.spec_decode.tree.routing import MoERoutingPredictor
 from vllm.v1.worker.gpu.spec_decode.tree.tree_metadata import TreeDraft
 
 
 @triton.jit
-def _predicted_experts(tok, table_ptr, H, NL, KE, NLP: tl.constexpr, KEP: tl.constexpr):
-    """``tok``'s last-seen experts per MoE layer: (layers, experts, valid)."""
-    b = routing_bucket(tok, H)
+def _predicted_experts(b, table_ptr, H, NL, KE, NLP: tl.constexpr, KEP: tl.constexpr):
+    """Slot ``b``'s predicted experts per MoE layer: (layers, experts, valid)."""
     nl = tl.arange(0, NLP)[:, None]
     kj = tl.arange(0, KEP)[None, :]
     m = (nl < NL) & (kj < KE)
@@ -44,7 +40,7 @@ def _predicted_experts(tok, table_ptr, H, NL, KE, NLP: tl.constexpr, KEP: tl.con
 
 @triton.jit
 def _new_expert_costs(
-    toks,  # [M] candidate tokens
+    keys,  # [M] candidate prediction slots
     live,  # [M] which candidates exist
     table_ptr,
     shared_ptr,
@@ -61,11 +57,11 @@ def _new_expert_costs(
     KEP: tl.constexpr,
 ):
     """Expected cost (ms) per candidate of the experts it needs that the
-    active set (shared | own) does not have yet: its last-seen experts count
+    active set (shared | own) does not have yet: its predicted experts count
     at the predictor's hit rate and the rest at ``unknown_cost``, which is
-    also the whole charge for a token never seen. All candidates are priced
+    also the whole charge for an unpredicted slot. All candidates are priced
     in one gather."""
-    b = routing_bucket(toks, H)[:, None, None]
+    b = keys[:, None, None]
     nl = tl.arange(0, NLP)[None, :, None]
     kj = tl.arange(0, KEP)[None, None, :]
     m = live[:, None, None] & (nl < NL) & (kj < KE)
@@ -99,9 +95,9 @@ def _mass_order_pick(valid, mass, pmass, path, slot, UMSB, CAP: tl.constexpr):
 
 @triton.jit
 def _activate_experts(
-    tok, table_ptr, act_ptr, H, NL, KE, EW, NLP: tl.constexpr, KEP: tl.constexpr
+    key, table_ptr, act_ptr, H, NL, KE, EW, NLP: tl.constexpr, KEP: tl.constexpr
 ):
-    nl, e, ok = _predicted_experts(tok, table_ptr, H, NL, KE, NLP, KEP)
+    nl, e, ok = _predicted_experts(key, table_ptr, H, NL, KE, NLP, KEP)
     bit = tl.full(e.shape, 1, tl.int32) << (e & 31)
     tl.atomic_or(act_ptr + nl * EW + (e >> 5), bit, mask=ok)
 
@@ -119,15 +115,15 @@ def _build_one(
     UMSB,  # int64 constant 1 << 63 for unsigned path comparison
     PAD,  # token id written to the inert tail past the live node count
     # Expert-aware selection only (EXPERT_AWARE):
-    table_ptr,  # [NL, H, KE] i16 last-seen experts per (layer, token bucket)
+    table_ptr,  # [NL, H, KE] i16 predicted experts per (layer, slot)
     active_ptr,  # [NL, EW] i32 the batch's shared active-expert bitmask
     own_ptr,  # [R, NL, EW] i32 each request's own active-expert additions
     cost_ptr,  # [NL, E] f32 ms to activate each expert
-    anchor_ptr,  # [num_anchors] the batch's anchor tokens (rows always verified)
+    anchor_base,  # slot of the first anchor (rows always verified)
     lam_ptr,  # f32 tokens per ms: the exchange rate between cost and mass
     aware_ptr,  # i32 how many of each tree's nodes are chosen expert-aware
     num_anchors,
-    unknown_cost,  # ms expected for experts the table cannot predict
+    unknown_cost,  # ms expected for experts the predictor cannot predict
     hit_rate,  # share of a token's predicted experts it really uses
     H,
     NL,
@@ -253,7 +249,7 @@ def _build_one(
                 # the tree prefix-closed.
                 tv = tl.arange(0, TOPM)
                 remaining = valid
-                toks = tl.zeros([TOPM], dtype=tl.int64)
+                keys = tl.zeros([TOPM], dtype=tl.int64)
                 cand_mass = tl.full([TOPM], float("-inf"), tl.float64)
                 cand_slot = tl.full([TOPM], CAP, tl.int32)
                 for t in tl.static_range(TOPM):
@@ -262,24 +258,24 @@ def _build_one(
                         tl.where(remaining & (mass == m_mass), slot, CAP), axis=0
                     )
                     ms = slot == m_slot
-                    m_row = (tl.sum(tl.where(ms, depth, 0), axis=0) - 1) * K + tl.sum(
-                        tl.where(ms, prank, 0), axis=0
-                    )
-                    m_tok = tl.load(
-                        sorted_cand_ptr
+                    m_depth = tl.sum(tl.where(ms, depth, 0), axis=0)
+                    m_row = (m_depth - 1) * K + tl.sum(tl.where(ms, prank, 0), axis=0)
+                    m_idx = tl.load(
+                        sorted_idx_ptr
                         + sorted_row
                         + m_row * K
                         + tl.sum(tl.where(ms, rank, 0), axis=0),
                         mask=m_slot < CAP,
                         other=0,
                     )
-                    toks = tl.where(tv == t, m_tok, toks)
+                    m_key = (row * S + m_depth - 1) * K + m_idx
+                    keys = tl.where(tv == t, m_key, keys)
                     cand_mass = tl.where(tv == t, m_mass, cand_mass)
                     cand_slot = tl.where(tv == t, m_slot, cand_slot)
                     remaining = remaining & ~ms
                 live = cand_slot < CAP
                 costs = _new_expert_costs(
-                    toks,
+                    keys,
                     live,
                     table_ptr,
                     active_ptr,
@@ -317,12 +313,13 @@ def _build_one(
         has_sib = sib_rank < K
         has_child = top_depth < L
         token = tl.load(sorted_cand_ptr + sorted_row + drow * K + top_rank)
-        if EXPERT_AWARE:  # noqa: SIM102 (constexpr branch)
-            if emit < aware_n:
-                _activate_experts(token, table_ptr, write_ptr, H, NL, KE, EW, NLP, KEP)
-                tl.debug_barrier()
         # The popped node's own candidate index picks its children's row.
         top_idx = tl.load(sorted_idx_ptr + sorted_row + drow * K + top_rank)
+        if EXPERT_AWARE:  # noqa: SIM102 (constexpr branch)
+            if emit < aware_n:
+                key = (row * S + top_depth - 1) * K + top_idx
+                _activate_experts(key, table_ptr, write_ptr, H, NL, KE, EW, NLP, KEP)
+                tl.debug_barrier()
         crow = top_depth * K + top_idx
         sib_logp = tl.load(
             sorted_logp_ptr + sorted_row + drow * K + sib_rank, mask=has_sib, other=0.0
@@ -394,7 +391,7 @@ def _tree_builder_kernel(
     active_ptr,
     own_ptr,
     cost_ptr,
-    anchor_ptr,
+    anchor_base,
     lam_ptr,
     aware_ptr,
     num_anchors,
@@ -430,7 +427,7 @@ def _tree_builder_kernel(
     if PHASE == 1:
         for a in range(num_anchors):
             _activate_experts(
-                tl.load(anchor_ptr + a), table_ptr, active_ptr, H, NL, KE, EW, NLP, KEP
+                anchor_base + a, table_ptr, active_ptr, H, NL, KE, EW, NLP, KEP
             )
         tl.debug_barrier()
         row = 0
@@ -453,7 +450,7 @@ def _tree_builder_kernel(
         active_ptr,
         own_ptr,
         cost_ptr,
-        anchor_ptr,
+        anchor_base,
         lam_ptr,
         aware_ptr,
         num_anchors,
@@ -566,19 +563,20 @@ class TreeBuilder:
             .contiguous()
         )
         # Expert-aware selection (bind_routing); None selects by mass alone.
-        self.routing: MoERoutingMemory | None = None
+        self.routing: MoERoutingPredictor | None = None
         self.lam: Tensor | None = None
         self._active: Tensor | None = None
         self._own: Tensor | None = None
         self.top_m = 4
 
-    def bind_routing(self, routing: MoERoutingMemory, lam: Tensor) -> None:
+    def bind_routing(self, routing: MoERoutingPredictor, lam: Tensor) -> None:
         """Select expert-aware: weigh each node's acceptance mass against the
         cost of the MoE experts it would add to the verify step, converted to
         tokens by ``lam`` (a persistent 1-element f32 tensor, tokens per ms,
         that the caller keeps current)."""
         self.routing = routing
         self.lam = lam
+        routing.reserve_slots(self.max_num_reqs * (self.num_steps * self.K + 1))
         words = (routing.num_experts + 31) // 32
         dev = self.packed.device
         self._active = torch.zeros(
@@ -673,20 +671,22 @@ class TreeBuilder:
         else:
             assert anchor_ids is not None and self.lam is not None
             assert self._active is not None and self._own is not None
+            assert cand.shape[1] == self.num_steps
             self._active.zero_()
             self._own[:R].zero_()
+            pred = routing.predict(cand, anchor_ids)
             route_args = (
-                routing.table,
+                pred,
                 self._active,
                 self._own,
                 routing.cost_ms,
-                anchor_ids,
+                cand.numel(),
                 self.lam,
                 self.aware_nodes,
                 anchor_ids.shape[0],
                 routing.unknown_cost_ms,
                 routing.hit_stats,
-                routing.buckets,
+                pred.shape[1],
                 routing.num_layers,
                 routing.top_k,
                 routing.num_experts,

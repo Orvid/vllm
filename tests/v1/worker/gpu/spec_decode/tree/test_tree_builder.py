@@ -7,6 +7,9 @@ internally, exactly like the kernel, so both are fed the same raw rows whose
 per-predecessor orders differ. ``torch.equal`` is the bit-identical gate.
 """
 
+from types import SimpleNamespace
+
+import numpy as np
 import pytest
 import torch
 
@@ -168,41 +171,89 @@ def test_children_follow_their_parents_candidate_row():
         assert tokens[: len(greedy)].tolist() == greedy
 
 
-def _routing(token_experts: dict[int, list[list[int]]], num_experts: int = 8):
-    """A routing memory with two MoE layers (capturer layers 0 and 2) whose
-    table holds ``token_experts[token] = [layer0 experts, layer1 experts]``,
-    each expert costing 1 ms."""
-    from vllm.v1.worker.gpu.spec_decode.tree.routing import MoERoutingMemory
-
-    tokens = list(token_experts)
-    routes = torch.full((len(tokens), 3, 2), -1, dtype=torch.int32, device="cuda")
-    for i, tok in enumerate(tokens):
-        routes[i, 0] = torch.tensor(token_experts[tok][0])
-        routes[i, 2] = torch.tensor(token_experts[tok][1])
-    mem = MoERoutingMemory(
-        routes, [0, 2], num_experts, torch.ones(2), torch.device("cuda")
+def _routes(token_experts: dict[int, list[list[int]]]) -> torch.Tensor:
+    """A capturer buffer with two MoE layers (capturer layers 0 and 2): row i
+    routes to ``token_experts[i-th token] = [layer0 experts, layer1 experts]``."""
+    routes = torch.full(
+        (len(token_experts), 3, 2), -1, dtype=torch.int32, device="cuda"
     )
-    mem.record(torch.tensor(tokens, device="cuda"), len(tokens))
-    return mem
+    for i, (l0, l1) in enumerate(token_experts.values()):
+        routes[i, 0] = torch.tensor(l0)
+        routes[i, 2] = torch.tensor(l1)
+    return routes
 
 
-def test_routing_memory_records_each_moe_layer_by_token_bucket():
-    from vllm.v1.worker.gpu.spec_decode.tree.routing import _HASH_MULT
+def _routing(token_experts: dict[int, list[list[int]]], num_experts: int = 8):
+    """A predictor that names ``token_experts[token]`` (experts 0 and 1 for
+    any other token), each expert costing 1 ms."""
+    from vllm.v1.worker.gpu.spec_decode.tree.routing import MoERoutingPredictor
 
-    mem = _routing({7: [[1, 2], [3, 4]], 9: [[5, 6], [0, 7]]})
-    for tok, (l0, l1) in {7: ([1, 2], [3, 4]), 9: ([5, 6], [0, 7])}.items():
-        b = (tok * _HASH_MULT) & (mem.buckets - 1)
-        assert mem.table[0, b].tolist() == l0
-        assert mem.table[1, b].tolist() == l1  # capturer layer 2
+    class FixedRouting(MoERoutingPredictor):
+        def _topk(self, ids, reqs):
+            return lookup[ids]
+
+    lookup = torch.tensor([0, 1], device="cuda").repeat(512, 2, 1)
+    for tok, experts in token_experts.items():
+        lookup[tok] = torch.tensor(experts)
+    return FixedRouting(
+        _routes(token_experts), [0, 2], num_experts, torch.ones(2), torch.device("cuda")
+    )
 
 
-def test_routing_memory_totals_each_forwards_distinct_experts():
+def _decode_batch(tokens: list[int], qsl: list[int]) -> SimpleNamespace:
+    """A forward of decode requests, request r spanning rows qsl[r]:qsl[r+1]."""
+    return SimpleNamespace(
+        num_reqs=len(qsl) - 1,
+        num_tokens=len(tokens),
+        query_start_loc_np=np.array(qsl),
+        query_start_loc=torch.tensor(qsl, device="cuda"),
+        is_prefilling_np=np.zeros(len(qsl) - 1, dtype=bool),
+        idx_mapping=torch.arange(len(qsl) - 1, device="cuda"),
+        input_ids=torch.tensor(tokens, device="cuda"),
+    )
+
+
+def test_routing_meter_totals_each_forwards_distinct_experts():
     """Tokens 7 and 9 share expert 2 of layer 0: the forward reaches 7
-    distinct experts at 1 ms each, and the next forward adds its own."""
+    distinct experts at 1 ms each, and a forward of token 7 alone adds 4."""
     mem = _routing({7: [[1, 2], [3, 4]], 9: [[2, 6], [0, 7]]})
+    mem.observe_forward(_decode_batch([7, 9], [0, 2]), None)
     assert mem.forward_cost_total.item() == 7.0
-    mem.record(torch.tensor([7], device="cuda"), 1)
+    mem.observe_forward(_decode_batch([7], [0, 1]), None)
     assert mem.forward_cost_total.item() == 11.0
+
+
+def test_online_predictor_learns_routing_from_decode_forwards():
+    """Tokens that always route to the same experts: a few hundred decode
+    forwards teach the predictor to name them, and its measured hit rate
+    follows."""
+    from vllm.v1.worker.gpu.spec_decode.tree.routing import OnlineRoutingPredictor
+
+    torch.manual_seed(0)
+    truth = {5: [[1, 2], [3, 4]], 9: [[6, 7], [0, 8]], 11: [[9, 10], [11, 12]]}
+    tokens = list(truth)
+    embed = torch.nn.Embedding(64, 32).cuda()
+    pred = OnlineRoutingPredictor(
+        embed=embed,
+        hidden_size=32,
+        max_num_reqs=1,
+        routes=_routes(truth),
+        moe_layer_ids=[0, 2],
+        num_experts=16,
+        expert_cost_ms=torch.ones(2),
+        device=torch.device("cuda"),
+    )
+    batch = _decode_batch(tokens, [0, 3])
+    hidden = torch.randn(3, 32, device="cuda")
+    with torch.inference_mode():
+        for _ in range(300):
+            pred.observe_forward(batch, hidden)
+        out = pred.predict(torch.tensor([[tokens]], device="cuda"), batch.input_ids[:1])
+    for i, tok in enumerate(tokens):
+        assert sorted(out[0, i].tolist()) == truth[tok][0]
+        assert sorted(out[1, i].tolist()) == truth[tok][1]
+    hits, total = pred.hit_stats.tolist()
+    assert hits / total > 0.7
 
 
 def _two_way_choice():
@@ -253,17 +304,6 @@ def test_expert_aware_selection_shares_experts_across_the_batch():
     tb.bind_routing(routing, torch.tensor([1.0], device="cuda"))
     out = tb.build(scores, cand, torch.tensor([5, 5], device="cuda"))
     assert out.token_ids[:, 0].tolist() == [20, 31]
-
-
-def test_routing_memory_measures_its_hit_rate():
-    """Replacing a token's entry scores it as a prediction: of 4 predicted
-    experts, the token's new routing uses 3."""
-    mem = _routing({7: [[1, 2], [3, 4]]})
-    before = mem.hit_stats.clone()
-    mem.routes[0, 0] = torch.tensor([1, 9])
-    mem.routes[0, 2] = torch.tensor([3, 4])
-    mem.record(torch.tensor([7], device="cuda"), 1)
-    assert (mem.hit_stats - before).tolist() == [3.0, 4.0]
 
 
 def test_expert_aware_selection_without_cost_is_the_mass_order():
