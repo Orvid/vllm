@@ -187,8 +187,8 @@ def _routing(token_experts: dict[int, list[list[int]]], num_experts: int = 8):
     from vllm.v1.worker.gpu.spec_decode.tree.routing import MoERoutingPredictor
 
     class FixedRouting(MoERoutingPredictor):
-        def _topk(self, ids, hidden):
-            return lookup[ids]
+        def _predict_into(self, ids, hidden, pred):
+            pred[:, : ids.numel()] = lookup[ids].permute(1, 0, 2)
 
     lookup = torch.tensor([0, 1], device="cuda").repeat(512, 2, 1)
     for tok, experts in token_experts.items():
@@ -219,6 +219,20 @@ def _decode_batch(
         input_ids=torch.tensor(tokens, device="cuda"),
         positions=torch.tensor(positions, device="cuda"),
     )
+
+
+def test_top_experts_kernel_matches_topk_into_a_slot_table():
+    """The fused top-k names each (row, layer)'s best experts, best first,
+    and writes them straight into a [layers, slots, k] table."""
+    from vllm.v1.worker.gpu.spec_decode.tree.routing import _top_experts
+
+    logits = torch.randn(5, 3, 200, device="cuda")
+    ref = logits.topk(8, dim=-1).indices
+    assert torch.equal(_top_experts(logits, 8), ref)
+    table = torch.full((3, 9, 8), -1, dtype=torch.int16, device="cuda")
+    _top_experts(logits, 8, out=table)
+    assert torch.equal(table[:, :5].long(), ref.permute(1, 0, 2))
+    assert (table[:, 5:] == -1).all()
 
 
 def test_routing_meter_totals_each_forwards_distinct_experts():

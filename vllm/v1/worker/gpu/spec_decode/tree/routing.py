@@ -29,6 +29,7 @@ import torch
 from torch import Tensor, nn
 
 from vllm.logger import init_logger
+from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_pin_memory_available
 
 logger = init_logger(__name__)
@@ -44,16 +45,61 @@ _LR = 1e-3
 _MAX_TRAIN_ROWS = 512
 _RING = 4
 _TRAIN_BUCKETS = (16, 32, 64, 128, 256, _MAX_TRAIN_ROWS)
+# Forwards trained on before training thins to every _TRAIN_EVERY-th: fewer
+# early steps measurably slow the predictor's learning.
+_TRAIN_WARMUP = 1024
+_TRAIN_EVERY = 4
 
 
 def _rms(x: Tensor) -> Tensor:
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)
 
 
-def _top_experts(logits: Tensor, k: int) -> Tensor:
-    # Bitonic-sorting each layer's few hundred logits beats topk's radix
-    # select across tens of thousands of rows.
-    return logits.sort(dim=-1, descending=True).indices[..., :k]
+@triton.jit
+def _top_experts_kernel(
+    logits_ptr,  # [rows, NL, E]
+    out_ptr,  # element (l, r, j) at l * stride_l + r * stride_r + j
+    stride_l,
+    stride_r,
+    NL,
+    E,
+    EP: tl.constexpr,
+    K: tl.constexpr,
+):
+    r = tl.program_id(0).to(tl.int64)
+    layer = tl.program_id(1)
+    e = tl.arange(0, EP)
+    x = tl.load(
+        logits_ptr + (r * NL + layer) * E + e, mask=e < E, other=float("-inf")
+    ).to(tl.float32)
+    for j in tl.static_range(K):
+        top = tl.max(x, axis=0)
+        idx = tl.min(tl.where(x == top, e, EP), axis=0)
+        tl.store(out_ptr + layer * stride_l + r * stride_r + j, idx)
+        x = tl.where(e == idx, float("-inf"), x)
+
+
+def _top_experts(logits: Tensor, k: int, out: Tensor | None = None) -> Tensor:
+    """Each (row, layer)'s ``k`` best experts of ``logits [rows, NL, E]``,
+    written to ``out`` (any integer dtype; ``[rows, NL, k]`` or a
+    ``[NL, >= rows, k]`` slot table) or a new ``[rows, NL, k]`` int64."""
+    rows, nl, e = logits.shape
+    if out is None:
+        out = torch.empty(rows, nl, k, dtype=torch.int64, device=logits.device)
+        stride_l, stride_r = out.stride(1), out.stride(0)
+    else:
+        stride_l, stride_r = out.stride(0), out.stride(1)
+    _top_experts_kernel[(rows, nl)](
+        logits.contiguous(),
+        out,
+        stride_l,
+        stride_r,
+        nl,
+        e,
+        EP=triton.next_power_of_2(e),
+        K=k,
+    )
+    return out
 
 
 class MoERoutingPredictor:
@@ -159,13 +205,13 @@ class MoERoutingPredictor:
                     hidden.new_zeros(R, hidden.shape[-1]),
                 ]
             )
-        n = ids.numel()
-        self.reserve_slots(n)
-        top = self._topk(ids, pos_hidden)  # [n, num_layers, top_k]
-        self.pred[:, :n] = top.permute(1, 0, 2).to(torch.int16)
+        self.reserve_slots(ids.numel())
+        self._predict_into(ids, pos_hidden, self.pred)
         return self.pred
 
-    def _topk(self, ids: Tensor, hidden: Tensor | None) -> Tensor:
+    def _predict_into(self, ids: Tensor, hidden: Tensor | None, pred: Tensor) -> None:
+        """Write slot ``i``'s experts for token ``ids[i]`` (at draft position
+        state ``hidden[i]``) into ``pred[:, i]``."""
         raise NotImplementedError
 
     def observe_forward(self, input_batch: Any) -> None:
@@ -237,6 +283,14 @@ class OnlineRoutingPredictor(MoERoutingPredictor):
             self.opt = torch.optim.Adam(
                 self.mlp.parameters(), lr=_LR, fused=cuda, capturable=cuda
             )
+            # bf16 copies the predictions run on, refreshed by each training
+            # step (so predicting never casts the fp32 weights).
+            m = self.mlp
+            self._params = (m.l1.weight, m.l1.bias, m.l2.weight, m.l2.bias)
+            self._infer_weights = tuple(
+                p.detach().to(torch.bfloat16) for p in self._params
+            )
+        self._num_trained = 0
         # Training steps by padded row count, each captured at first use.
         self._steps: dict[int, _TrainStep] = {}
         # Training rows reach the device through a ring of pinned buffers: a
@@ -270,10 +324,17 @@ class OnlineRoutingPredictor(MoERoutingPredictor):
                 h = _rms(hidden.float())
             return torch.cat([tok, h], -1)
 
-    def _topk(self, ids: Tensor, hidden: Tensor | None) -> Tensor:
-        with torch.no_grad():
-            logits = self.mlp(self._features(ids, hidden))
-        return _top_experts(logits, self.top_k)
+    def _predict_into(self, ids: Tensor, hidden: Tensor | None, pred: Tensor) -> None:
+        w1, b1, w2, b2 = self._infer_weights
+        x = self._features(ids, hidden).to(torch.bfloat16)
+        x = nn.functional.gelu(nn.functional.linear(x, w1, b1))
+        logits = nn.functional.linear(x, w2, b2).view(-1, *self.mlp.shape)
+        _top_experts(logits, self.top_k, out=pred)
+
+    @torch.no_grad()
+    def refresh_infer_weights(self) -> None:
+        for dst, src in zip(self._infer_weights, self._params):
+            dst.copy_(src)
 
     def predict(
         self, cand: Tensor, anchor_ids: Tensor, hidden: Tensor | None = None
@@ -305,10 +366,14 @@ class OnlineRoutingPredictor(MoERoutingPredictor):
         super().observe_forward(input_batch)
         if input_batch.num_tokens == 0:
             return
+        # Every forward teaches it while it is young; after that, every few
+        # are enough to track drift.
+        train = self._num_trained < _TRAIN_WARMUP or self._observed % _TRAIN_EVERY == 0
         rows_np, reqs_np = self._train_rows(input_batch)
         k = self._host_next
         n = len(rows_np)
-        if n and (not self._host_used[k] or self._host_events[k].query()):
+        if train and n and (not self._host_used[k] or self._host_events[k].query()):
+            self._num_trained += 1
             self._host_next = (k + 1) % _RING
             host = self._host_rows[k]
             host[0, :n] = torch.from_numpy(rows_np)
@@ -391,8 +456,9 @@ class _TrainStep:
         p.opt.zero_grad(set_to_none=True)
         (per_row * self.weight).sum().backward()
         p.opt.step()
+        p.refresh_infer_weights()
         with torch.no_grad():
-            top = _top_experts(logits, p.top_k)
+            top = _top_experts(logits.detach(), p.top_k)
             hit = (top[..., :, None] == self.labels[..., None, :]).any(-1)
             real = self.weight > 0
             p.hit_stats[0] += (hit.sum(dim=(1, 2)) * real).sum()
