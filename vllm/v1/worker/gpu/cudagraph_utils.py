@@ -734,10 +734,15 @@ class ModelCudaGraphManager(CudaGraphManager):
                 # later replay a mixed/prefill batch at a different query
                 # layout, so it must never bake this mask. df2t mixed batches
                 # run eager instead (see GPUModelRunner dispatch).
+                assert attn_metadata is not None
                 tree_mask_attach(attn_metadata)
 
             # Capture with dummy rows marked as padding.
             input_buffers.is_padding.fill_(True)
+            if tree_verify is not None and desc.cg_mode == CUDAGraphMode.FULL:
+                # This graph verifies uniform trees of its query width.
+                query_len = desc.max_query_len or num_tokens // max(num_reqs, 1)
+                tree_verify.step_width = query_len - 1
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
                 batch_descriptor = None

@@ -155,6 +155,10 @@ class TreeVerifyContext:
         # A path has at most one node per depth, so a tree deeper than it is
         # wide (a drafter depth above the node budget) is bounded by its width.
         self.max_depth = min(max_depth, self.max_width)
+        # Widest tree the current step verifies (host value; adaptive width
+        # verifies fewer nodes than drafted), so mixers size kernels for this
+        # step's verify block. Each width runs its own captured graph.
+        self.step_width = self.max_width
         self.row_parent = torch.full(
             (max_num_tokens,), -1, dtype=torch.int32, device=device
         )

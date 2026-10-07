@@ -1329,7 +1329,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             apply_l2norm=True,
             output_g_exp=False,
         )
-        max_rows = tree.max_width + 1
+        max_rows = tree.step_width + 1
         if max_rows <= TREE_CHUNK_MAX_ROWS:
             out = tree_gated_delta_rule_chunk(
                 query,

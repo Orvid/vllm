@@ -1235,6 +1235,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Create a dummy scheduler output.
         num_reqs = min(num_tokens, self.max_num_reqs)
+        if self._tree_ctx is not None:
+            # A dummy step fills no trees; size tree kernels for its widest.
+            self._tree_ctx.step_width = (
+                uniform_query_len - 1
+                if uniform_query_len is not None
+                else self._tree_ctx.max_width
+            )
         if uniform_query_len is not None:
             # A uniform decode at a query length other than decode_query_len
             # (an adaptive df2t verify width).
@@ -2145,6 +2152,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 ),
             )
             if self._tree_ctx is not None and tree_batch is not None:
+                self._tree_ctx.step_width = int(tree_batch.widths_np.max())
                 self._tree_ctx.fill(
                     query_start_loc, num_reqs, tree_batch.parents, tree_batch.widths
                 )
