@@ -28,6 +28,7 @@ import torch
 from torch import Tensor, nn
 
 from vllm.logger import init_logger
+from vllm.utils.platform_utils import is_pin_memory_available
 
 logger = init_logger(__name__)
 
@@ -37,8 +38,10 @@ _HIT_PRIOR = 1000.0
 _HIT_DECAY_EVERY = 256
 _HIDDEN = 512
 _LR = 1e-3
-# Rows trained on per forward (a random subset past it).
+# Rows trained on per forward (a random subset past it), and the pinned
+# staging buffers they cycle through.
 _MAX_TRAIN_ROWS = 512
+_RING = 4
 
 
 def _rms(x: Tensor) -> Tensor:
@@ -202,7 +205,20 @@ class OnlineRoutingPredictor(MoERoutingPredictor):
             self.mlp = _RouterMLP(
                 2 * hidden_size, self.num_layers, self.num_experts, _HIDDEN
             ).to(self.device)
-            self.opt = torch.optim.Adam(self.mlp.parameters(), lr=_LR)
+            self.opt = torch.optim.Adam(
+                self.mlp.parameters(), lr=_LR, fused=self.device.type == "cuda"
+            )
+        # Training rows reach the device through a ring of pinned buffers: a
+        # pageable copy would wait for the forward still running. A slot
+        # whose copy is still in flight skips that forward's training.
+        pin = is_pin_memory_available()
+        self._host_rows = [
+            torch.zeros(2, _MAX_TRAIN_ROWS, dtype=torch.int64, pin_memory=pin)
+            for _ in range(_RING)
+        ]
+        self._host_events = [torch.cuda.Event() for _ in range(_RING)]
+        self._host_used = [False] * _RING
+        self._host_next = 0
         # Each request's context (its last hidden state at its anchor row),
         # by request-state slot, and in this step's batch order for predict.
         self.ctx = torch.zeros(max_num_reqs, hidden_size, device=self.device)
@@ -237,9 +253,17 @@ class OnlineRoutingPredictor(MoERoutingPredictor):
         if hidden_states is None or input_batch.num_tokens == 0:
             return
         rows_np, reqs_np = self._train_rows(input_batch)
-        if len(rows_np):
-            rows = torch.from_numpy(rows_np).to(self.device, non_blocking=True)
-            reqs = torch.from_numpy(reqs_np).to(self.device, non_blocking=True)
+        k = self._host_next
+        n = len(rows_np)
+        if n and (not self._host_used[k] or self._host_events[k].query()):
+            self._host_next = (k + 1) % _RING
+            host = self._host_rows[k]
+            host[0, :n] = torch.from_numpy(rows_np)
+            host[1, :n] = torch.from_numpy(reqs_np)
+            dev = host[:, :n].to(self.device, non_blocking=True)
+            self._host_events[k].record()
+            self._host_used[k] = True
+            rows, reqs = dev[0], dev[1]
             slots = input_batch.idx_mapping[reqs].long()
             self._train(input_batch.input_ids[rows], self.ctx[slots], rows)
         # The next selection prices this batch's candidates against each

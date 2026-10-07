@@ -245,10 +245,19 @@ def test_online_predictor_learns_routing_from_decode_forwards():
     )
     batch = _decode_batch(tokens, [0, 3])
     hidden = torch.randn(3, 32, device="cuda")
+    cand = torch.tensor([[tokens]], device="cuda")
     with torch.inference_mode():
         for _ in range(300):
             pred.observe_forward(batch, hidden)
-        out = pred.predict(torch.tensor([[tokens]], device="cuda"), batch.input_ids[:1])
+            # Paced like decode steps, so the pinned staging slots are free.
+            torch.accelerator.synchronize()
+        # Both run every decode step: neither may wait on the device.
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            pred.observe_forward(batch, hidden)
+            out = pred.predict(cand, batch.input_ids[:1])
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
     for i, tok in enumerate(tokens):
         assert sorted(out[0, i].tolist()) == truth[tok][0]
         assert sorted(out[1, i].tolist()) == truth[tok][1]
