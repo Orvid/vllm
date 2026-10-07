@@ -181,6 +181,10 @@ from vllm.v1.worker.gpu.spec_decode.tree.budget import BudgetPolicy
 from vllm.v1.worker.gpu.spec_decode.tree.compaction import TreeKVCompaction
 from vllm.v1.worker.gpu.spec_decode.tree.context import TreeVerifyContext
 from vllm.v1.worker.gpu.spec_decode.tree.mixers import TreeRecurrentLayers
+from vllm.v1.worker.gpu.spec_decode.tree.routing import (
+    MoERoutingMemory,
+    build_moe_routing_memory,
+)
 from vllm.v1.worker.gpu.spec_decode.tree.tree_metadata import (
     TreeBatch,
     TreeDraft,
@@ -821,6 +825,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     ),
                     self.device,
                 )
+
+        # Expert-aware tree selection: record the target's MoE routing every
+        # forward and let the tree builder price nodes by the experts they add,
+        # at the adaptive width controller's tokens-per-ms rate.
+        self._moe_routing: MoERoutingMemory | None = None
+        self._tree_lam: torch.Tensor | None = None
+        if spec is not None and spec.tree_selection == "df2t_moe":
+            self._moe_routing = build_moe_routing_memory(
+                self.model, self.vllm_config, self.max_num_tokens, self.device
+            )
+            self._tree_lam = torch.zeros(1, dtype=torch.float32, device=self.device)
+            self.speculator.tree_selector.bind_routing(  # type: ignore[union-attr]
+                self._moe_routing, self._tree_lam
+            )
 
         if self.parallel_config.enable_batch_sharded_sampling:
             if hasattr(self.model, "compute_logits_local"):
@@ -1556,6 +1574,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             count=len(draft_tokens),
         )
         width = ctl.select(slots)
+        lam = getattr(self, "_tree_lam", None)
+        if lam is not None:
+            lam.fill_(ctl.throughput)
         if all(len(drafts) <= width for drafts in draft_tokens.values()):
             return scheduler_output
         num_scheduled_tokens = dict(scheduler_output.num_scheduled_tokens)
@@ -3547,6 +3568,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
+        if self._moe_routing is not None and not dummy_run:
+            self._moe_routing.record(
+                self.input_buffers.input_ids, input_batch.num_tokens
+            )
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:

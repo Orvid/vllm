@@ -27,7 +27,8 @@ def make_tree_selector(
     pad_token_id: int,
     device: torch.device,
 ) -> TreeBuilder:
-    if config.tree_selection == "df2t":
+    # df2t_moe is the same builder; the runner binds its routing memory.
+    if config.tree_selection in ("df2t", "df2t_moe"):
         assert config.max_tree_depth is not None
         return TreeBuilder(
             max_num_reqs,

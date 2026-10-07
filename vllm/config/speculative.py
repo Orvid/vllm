@@ -75,7 +75,7 @@ DSparkModelTypes = Literal["dspark"]
 # Deprecated alias: ``method="df2t"`` is ``method="dflash"`` with
 # ``tree_selection="df2t"``.
 DF2TModelTypes = Literal["df2t"]
-TreeSelectionMethod = Literal["df2t"]
+TreeSelectionMethod = Literal["df2t", "df2t_moe"]
 # Methods whose drafters propose every draft position in parallel, so their
 # per-position candidates can be selected into a tree.
 _TREE_DRAFT_METHODS = frozenset({"dflash", "dspark"})
@@ -576,6 +576,10 @@ class SpeculativeConfig:
 
     - ``"df2t"``: lazy k-best expansion over the drafter's per-position
       transition scores, emitting nodes best-first by path probability.
+    - ``"df2t_moe"``: df2t for MoE targets, weighing each node's path
+      probability against the cost of the experts it would add to the verify
+      step, predicted from the routing its token last got. Requires
+      ``adaptive_tree_width``, whose throughput estimate prices the trade.
     """
     tree_budget: int | None = Field(default=None, ge=1)
     """Policy node count B at s=1.0; also the static decode shape 1+B."""
@@ -2140,6 +2144,11 @@ class SpeculativeConfig:
         self.parallel_drafting = True
         if self.num_speculative_tokens is None:
             raise ValueError("tree verification requires num_speculative_tokens")
+        if self.tree_selection == "df2t_moe" and not self.adaptive_tree_width:
+            raise ValueError(
+                "tree_selection 'df2t_moe' requires adaptive_tree_width: its "
+                "throughput estimate converts expert cost into tokens."
+            )
         if self.tree_budget is None:
             self.tree_budget = self.max_tree_budget
         if self.tree_budget > self.max_tree_budget:

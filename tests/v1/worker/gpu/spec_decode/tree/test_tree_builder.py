@@ -166,3 +166,70 @@ def test_children_follow_their_parents_candidate_row():
         # Best-first: the greedy chain's nodes are emitted first, in order.
         assert depths[: len(greedy)].tolist() == [1, 2, 3, 4]
         assert tokens[: len(greedy)].tolist() == greedy
+
+
+def _routing(token_experts: dict[int, list[list[int]]], num_experts: int = 8):
+    """A routing memory with two MoE layers (capturer layers 0 and 2) whose
+    table holds ``token_experts[token] = [layer0 experts, layer1 experts]``,
+    each expert costing 1 ms."""
+    from vllm.v1.worker.gpu.spec_decode.tree.routing import MoERoutingMemory
+
+    tokens = list(token_experts)
+    routes = torch.full((len(tokens), 3, 2), -1, dtype=torch.int32, device="cuda")
+    for i, tok in enumerate(tokens):
+        routes[i, 0] = torch.tensor(token_experts[tok][0])
+        routes[i, 2] = torch.tensor(token_experts[tok][1])
+    mem = MoERoutingMemory(
+        routes, [0, 2], num_experts, torch.ones(2), torch.device("cuda")
+    )
+    mem.record(torch.tensor(tokens, device="cuda"), len(tokens))
+    return mem
+
+
+def test_routing_memory_records_each_moe_layer_by_token_bucket():
+    from vllm.v1.worker.gpu.spec_decode.tree.routing import _HASH_MULT
+
+    mem = _routing({7: [[1, 2], [3, 4]], 9: [[5, 6], [0, 7]]})
+    for tok, (l0, l1) in {7: ([1, 2], [3, 4]), 9: ([5, 6], [0, 7])}.items():
+        b = (tok * _HASH_MULT) & (mem.buckets - 1)
+        assert mem.table[0, b].tolist() == l0
+        assert mem.table[1, b].tolist() == l1  # capturer layer 2
+
+
+def _two_way_choice():
+    """Under the anchor, candidate 10 (mass 0.55) needs four new experts and
+    candidate 11 (mass 0.45) only experts the anchor (token 5) already uses."""
+    L, K = 1, 2
+    cand = torch.tensor([[[10, 11]]], device="cuda")
+    scores = torch.zeros(1, L, K, K, device="cuda")
+    scores[0, 0, :, 0] = torch.log(torch.tensor(0.55))
+    scores[0, 0, :, 1] = torch.log(torch.tensor(0.45))
+    routing = _routing(
+        {5: [[0, 1], [0, 1]], 10: [[2, 3], [2, 3]], 11: [[0, 1], [0, 1]]}
+    )
+    return scores, cand, routing
+
+
+@pytest.mark.parametrize("lam, first", [(0.0, 10), (1.0, 11)])
+def test_expert_aware_selection_trades_mass_for_resident_experts(lam, first):
+    """With lam = 0 the likelier node comes first; once a ms is worth a token,
+    the node reusing the anchor's experts does."""
+    scores, cand, routing = _two_way_choice()
+    tb = TreeBuilder(1, 1, 2, 2, "cuda")
+    tb.bind_routing(routing, torch.tensor([lam], device="cuda"))
+    out = tb.build(scores, cand, torch.tensor([5], device="cuda"))
+    assert out.token_ids[0].tolist()[0] == first
+    assert sorted(out.token_ids[0].tolist()) == [10, 11]
+
+
+def test_expert_aware_selection_without_cost_is_the_mass_order():
+    """With costs priced at zero, expert-aware selection builds the same tree
+    as ranking by mass alone."""
+    R, L, K, B = 3, 4, 4, 24
+    scores, cand = _raw_inputs(R, L, K, B, seed=3)
+    plain = TreeBuilder(R, L, K, B, "cuda").build(scores, cand)
+    aware = TreeBuilder(R, L, K, B, "cuda")
+    aware.bind_routing(_routing({1: [[0, 1], [2, 3]]}), torch.zeros(1, device="cuda"))
+    out = aware.build(scores, cand, torch.tensor([1, 1, 1], device="cuda"))
+    assert torch.equal(out.token_ids, plain.token_ids)
+    assert torch.equal(out.parents, plain.parents)

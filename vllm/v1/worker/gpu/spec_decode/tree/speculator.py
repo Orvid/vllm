@@ -31,6 +31,8 @@ class TreeSpeculatorMixin:
     max_num_reqs: int
     top_k: int
     num_speculative_steps: int
+    num_query_per_req: int
+    input_buffers: Any
     parallel_drafting_token_id: int
 
     def __init__(self, vllm_config, device):
@@ -100,7 +102,13 @@ class TreeSpeculatorMixin:
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
-        tree = self.tree_selector.select(proposal)
+        anchor_ids = None
+        if self.tree_selector.routing is not None:
+            # Each request's first query row holds its anchor (bonus) token,
+            # the row its next verify starts from.
+            nq = self.num_query_per_req
+            anchor_ids = self.input_buffers.input_ids[: num_reqs * nq : nq].contiguous()
+        tree = self.tree_selector.select(proposal, anchor_ids)
         self._last_tree = tree
         self._last_built_rows = num_reqs
         # The selector pads columns past a tree's node count with the

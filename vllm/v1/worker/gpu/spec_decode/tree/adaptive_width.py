@@ -190,6 +190,7 @@ class TreeWidthController:
         # that depend on the real data and drift over time (e.g. which MoE
         # experts the rows reach and whether they are resident).
         self.cost_delta_ms = np.zeros(nl, dtype=np.float64)
+        self.throughput = 0.0
         self._cost_samples = np.zeros(nl, dtype=np.int64)
         self._next_event = torch.cuda.Event(enable_timing=True)
         self._open: tuple[torch.cuda.Event, int, int] | None = None
@@ -342,7 +343,11 @@ class TreeWidthController:
             self._time_step(len(self.widths) - 1, n)
             return self.B
         expected = known.sum(axis=0) + self._mean_curve * (n - len(known))
-        j = int(np.argmax((n + expected) / self.step_cost_ms(n)))
+        rate = (n + expected) / self.step_cost_ms(n)
+        j = int(np.argmax(rate))
+        # Expected tokens per ms at the chosen width: what a ms of verify cost
+        # is worth in tokens (expert-aware tree selection prices with it).
+        self.throughput = float(rate[j])
         self._time_step(j, n)
         return self.widths[j]
 
