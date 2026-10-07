@@ -112,7 +112,8 @@ class TreeCommit:
     become part of its sequence this step, in order: the anchor, then the
     accepted nodes from shallowest to deepest. Requests without a tree commit
     nothing here (their layers committed in the forward). Sizes are device
-    values; ``rows`` is sized for the worst case.
+    values; ``rows`` is sized for the worst case, and its entries past this
+    step's rows are 0 (a valid row), so any prefix of it can be gathered.
     """
 
     rows: torch.Tensor
@@ -208,6 +209,10 @@ class TreeVerifyContext:
         depth ``d``, -1 = none) and the batch rows' sequence ``positions``."""
         num_reqs = self.num_reqs
         if num_reqs:
+            # Past this step's rows the buffer would keep earlier steps' rows,
+            # which can lie outside a smaller batch; consumers gather a
+            # worst-case prefix, so make every entry a valid row.
+            self._commit_rows.zero_()
             _build_commit_kernel[(1,)](
                 self._commit_rows,
                 self._commit_positions,

@@ -71,6 +71,9 @@ def test_commit_after_a_larger_step_reads_only_this_steps_rows():
     torch.accelerator.synchronize()
     assert commit.cu_rows.tolist() == [0, 1]
     assert commit.positions[:1].tolist() == [40]
+    # The earlier step's rows (4, 5) are gone, so gathering any prefix of the
+    # buffer stays inside this batch.
+    assert (commit.rows[1:] == 0).all()
 
 
 class _Recurrent:
