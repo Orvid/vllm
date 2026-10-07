@@ -39,10 +39,11 @@ _HIT_PRIOR = 1000.0
 _HIT_DECAY_EVERY = 256
 _HIDDEN = 512
 _LR = 1e-3
-# Rows trained on per forward (a random subset past it), and the pinned
-# staging buffers they cycle through.
+# Rows trained on per forward (a random subset past it), the pinned staging
+# buffers they cycle through, and the padded row counts training runs at.
 _MAX_TRAIN_ROWS = 512
 _RING = 4
+_TRAIN_BUCKETS = (16, 32, 64, 128, 256, _MAX_TRAIN_ROWS)
 
 
 def _rms(x: Tensor) -> Tensor:
@@ -223,9 +224,12 @@ class OnlineRoutingPredictor(MoERoutingPredictor):
                 self.num_experts,
                 _HIDDEN,
             ).to(self.device)
+            cuda = self.device.type == "cuda"
             self.opt = torch.optim.Adam(
-                self.mlp.parameters(), lr=_LR, fused=self.device.type == "cuda"
+                self.mlp.parameters(), lr=_LR, fused=cuda, capturable=cuda
             )
+        # Training steps by padded row count, each captured at first use.
+        self._steps: dict[int, _TrainStep] = {}
         # Training rows reach the device through a ring of pinned buffers: a
         # pageable copy would wait for the forward still running. A slot
         # whose copy is still in flight skips that forward's training.
@@ -325,27 +329,83 @@ class OnlineRoutingPredictor(MoERoutingPredictor):
         return torch.where(((depth >= 1) & (depth <= S))[:, None], h, 0)
 
     def _train(self, input_batch: Any, rows: Tensor, reqs: Tensor) -> None:
-        ids = input_batch.input_ids[rows]
+        n = rows.shape[0]
+        bucket = next(b for b in _TRAIN_BUCKETS if b >= n)
+        step = self._steps.get(bucket)
+        if step is None:
+            step = self._steps[bucket] = _TrainStep(self, bucket)
         hidden = self._row_hidden(input_batch, rows, reqs)
-        labels = self.routes[rows].index_select(1, self.layer_ids).long().clamp_(min=0)
-        with torch.inference_mode(False), torch.enable_grad():
-            # The forward ran under inference mode; train on ordinary copies.
-            feats = self._features(ids, hidden).clone()
-            labels = labels.clone()
-            target = torch.zeros(
-                labels.shape[0], self.num_layers, self.num_experts, device=self.device
+        step.load(
+            self._features(input_batch.input_ids[rows], hidden),
+            self.routes[rows].index_select(1, self.layer_ids),
+            n,
+        )
+        step.run()
+
+
+class _TrainStep:
+    """One optimizer step on up to ``rows`` (padded) rows, replayed as a CUDA
+    graph: issued eagerly, the step's few dozen small kernels cost more host
+    time than the GPU spends on them."""
+
+    def __init__(self, pred: OnlineRoutingPredictor, rows: int):
+        self.pred = pred
+        self.rows = rows
+        dev = pred.device
+        d_in = pred.mlp.l1.in_features
+        with torch.inference_mode(False):
+            self.feats = torch.zeros(rows, d_in, device=dev)
+            self.labels = torch.zeros(
+                rows, pred.num_layers, pred.top_k, dtype=torch.long, device=dev
             )
-            target.scatter_(2, labels, 1.0)
-            logits = self.mlp(feats)
-            loss = nn.functional.binary_cross_entropy_with_logits(logits, target)
-            self.opt.zero_grad(set_to_none=True)
-            loss.backward()
-            self.opt.step()
-            with torch.no_grad():
-                top = logits.topk(self.top_k, dim=-1).indices
-                hits = (top[..., :, None] == labels[..., None, :]).any(-1).sum()
-                self.hit_stats[0] += hits
-                self.hit_stats[1] += top.numel()
+            # 1/n on the n real rows, 0 on the padding.
+            self.weight = torch.zeros(rows, device=dev)
+        self.graph: torch.cuda.CUDAGraph | None = None
+
+    def load(self, feats: Tensor, labels: Tensor, n: int) -> None:
+        self.feats[:n] = feats
+        self.feats[n:] = 0
+        self.labels[:n] = labels.clamp(min=0)
+        self.labels[n:] = 0
+        self.weight.fill_(0)
+        self.weight[:n] = 1.0 / n
+
+    def _step(self) -> None:
+        p = self.pred
+        target = torch.zeros(
+            self.rows, p.num_layers, p.num_experts, device=self.feats.device
+        ).scatter_(2, self.labels, 1.0)
+        logits = p.mlp(self.feats)
+        per_row = nn.functional.binary_cross_entropy_with_logits(
+            logits, target, reduction="none"
+        ).mean(dim=(1, 2))
+        p.opt.zero_grad(set_to_none=True)
+        (per_row * self.weight).sum().backward()
+        p.opt.step()
+        with torch.no_grad():
+            top = logits.topk(p.top_k, dim=-1).indices
+            hit = (top[..., :, None] == self.labels[..., None, :]).any(-1)
+            real = self.weight > 0
+            p.hit_stats[0] += (hit.sum(dim=(1, 2)) * real).sum()
+            p.hit_stats[1] += real.sum() * (p.num_layers * p.top_k)
+
+    def run(self) -> None:
+        with torch.inference_mode(False), torch.enable_grad():
+            if self.pred.device.type != "cuda":
+                self._step()
+                return
+            if self.graph is None:
+                # Warm up on a side stream (autograd and the optimizer state
+                # come up there), then capture.
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    self._step()
+                torch.cuda.current_stream().wait_stream(side)
+                self.graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(self.graph):
+                    self._step()
+            self.graph.replay()
 
 
 def _read_bandwidth_gb_s(device: torch.device) -> float:
