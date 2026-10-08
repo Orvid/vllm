@@ -180,6 +180,7 @@ from vllm.v1.worker.gpu.spec_decode.tree.adaptive_width import (
 from vllm.v1.worker.gpu.spec_decode.tree.budget import BudgetPolicy
 from vllm.v1.worker.gpu.spec_decode.tree.compaction import TreeKVCompaction
 from vllm.v1.worker.gpu.spec_decode.tree.context import TreeVerifyContext
+from vllm.v1.worker.gpu.spec_decode.tree.indexed import tree_accept_depth_cap
 from vllm.v1.worker.gpu.spec_decode.tree.mixers import TreeRecurrentLayers
 from vllm.v1.worker.gpu.spec_decode.tree.routing import (
     MoERoutingPredictor,
@@ -654,10 +655,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.fast_prefill: FastPrefillHelper | None = None
         if self.use_pp:
+            tree_nodes = 0
+            if (
+                self.speculative_config is not None
+                and self.speculative_config.use_tree()
+            ):
+                tree_nodes = BudgetPolicy.from_config(
+                    self.speculative_config
+                ).resolve_nodes_max()
+            # Earlier stages build the same trees (packed rows) and compact
+            # their own KV after each verify (accepted arenas).
             self.pp_handler = PPHandler(
                 max_num_reqs=self.max_num_reqs,
                 num_speculative_steps=self.num_speculative_steps,
                 device=self.device,
+                num_draft_tokens=self._draft_carry_width(),
+                tree_packed_width=4 * tree_nodes + 1 if tree_nodes else 0,
+                tree_arena_width=tree_nodes + 1 if tree_nodes else 0,
             )
 
         # Samplers and decode_query_len created in load_model() after
@@ -818,6 +832,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if isinstance(layer, MambaBase) and name not in draft_layers
             }
             if recurrent:
+                if self.use_pp:
+                    raise NotImplementedError(
+                        "tree verification of recurrent layers under pipeline "
+                        "parallelism (earlier stages do not commit their state)"
+                    )
                 self._tree_recurrent = TreeRecurrentLayers(
                     recurrent,
                     min(
@@ -1881,7 +1900,61 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.req_states.draft_tokens
             )
             if outputs is not None:
+                tree = outputs.pop("tree", None)
+                if tree is not None:
+                    self._apply_relayed_trees(**tree)
                 self.postprocess_sampled(**outputs)
+
+    def _apply_relayed_trees(
+        self,
+        keep_np: np.ndarray,
+        idx_mapping: torch.Tensor,
+        idx_mapping_np: np.ndarray,
+        num_sampled: torch.Tensor,
+        tree_packed: torch.Tensor | None,
+        accepted_arenas: torch.Tensor | None,
+        tree_batch: Any,
+        tree_anchors: torch.Tensor | None,
+    ) -> None:
+        """Earlier PP stage, tree verification: commit a verify the last
+        stage walked and keep the trees it drafted next.
+
+        Compacts this stage's tree KV with the last stage's accepted arenas
+        (as ``_compact_tree_accepted_kv`` does there), then stores the next
+        trees for this stage's ``_load_trees``. Requests freed since the
+        verify (``keep_np`` false) are skipped: their blocks may be reused.
+        """
+        keep = torch.as_tensor(keep_np, device=self.device)
+        if accepted_arenas is not None and tree_batch is not None:
+            assert tree_anchors is not None
+            compaction = self._tree_compaction
+            if compaction is not None:
+                num_reqs = idx_mapping.shape[0]
+                block_tables = self.block_tables.gather_block_tables(
+                    idx_mapping, num_reqs_padded=num_reqs
+                )
+                compaction.compact(
+                    torch.where(keep, num_sampled, 1),
+                    accepted_arenas,
+                    tree_batch.drafts,
+                    tree_anchors,
+                    block_tables,
+                    num_reqs,
+                    tree_batch=tree_batch,
+                )
+        if tree_packed is not None:
+            if self._tree_store is None:
+                self._tree_store = torch.zeros(
+                    self.max_num_reqs,
+                    tree_packed.shape[1],
+                    dtype=tree_packed.dtype,
+                    device=self.device,
+                )
+            rows = idx_mapping_np[keep_np]
+            self._tree_store[torch.as_tensor(rows, device=self.device)] = tree_packed[
+                keep
+            ]
+            self._tree_valid[rows] = True
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
         for new_req_data in scheduler_output.scheduled_new_reqs:
@@ -2902,11 +2975,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config, self.get_kv_cache_spec()
         )
         nodes_max = BudgetPolicy.from_config(spec).resolve_nodes_max()
+        layer_segments, scratch_ratios, _ = self._tree_compaction_layout()
         nbytes = TreeKVCompaction.reserved_bytes(
             max_num_reqs=self.max_num_reqs,
             nodes_max=nodes_max,
             chain_w=self._tree_chain_width(),
             kv_cache_groups=kv_cache_groups,
+            layer_segments=layer_segments,
+            scratch_ratios=scratch_ratios,
         )
         self._tree_compaction_storage = torch.empty(
             nbytes, dtype=torch.uint8, device=self.device
@@ -2935,6 +3011,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "df2t compaction has no profiling-phase reservation: the "
                 "memory-profiling pass must run before the KV cache is built"
             )
+        layer_segments, scratch_ratios, max_nodes = self._tree_compaction_layout()
         self._tree_compaction = TreeKVCompaction(
             self.max_num_reqs,
             self._tree_chain_width(),
@@ -2943,7 +3020,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.device,
             storage=storage,
             arena_span=BudgetPolicy.from_config(spec).resolve_nodes_max(),
+            layer_segments=layer_segments,
+            scratch_ratios=scratch_ratios,
+            max_nodes=max_nodes,
         )
+
+    def _tree_compaction_layout(
+        self,
+    ) -> tuple[dict[str, tuple[int, ...]], tuple[int, ...], int]:
+        """What the tree KV compactor needs beyond the cache views: layers'
+        slot layouts that are not one contiguous run (their
+        ``tree_kv_segments``), the compression ratios whose in-tree entries
+        trees keep in scratch, and the node budget the scratch is based on."""
+        layer_segments: dict[str, tuple[int, ...]] = {}
+        forward_context = self.compilation_config.static_forward_context
+        for name, layer in forward_context.items():
+            segments = getattr(layer, "tree_kv_segments", None)
+            if segments is not None and (runs := segments()) is not None:
+                layer_segments[name] = runs
+        spec = self.speculative_config
+        if spec is None or not spec.use_tree():
+            return layer_segments, (), 0
+        return layer_segments, spec.tree_scratch_ratios, spec.num_draft_rows_per_req
 
     def _compact_tree_accepted_kv(self, input_batch: InputBatch) -> None:
         """Relocate accepted-tree KV to canonical slots (df2t KV compaction).
@@ -3119,6 +3217,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             token_ids = tree_batch.token_ids
             parents = tree_batch.parents
             num_nodes = tree_batch.num_nodes
+            cap = self._tree_accept_depth_cap(input_batch)
+            if cap is not None:
+                # Nodes past a request's cap hold no token, so the walk stops
+                # before them.
+                token_ids = torch.where(tree_batch.depths > cap[:, None], -1, token_ids)
         else:
             token_ids = torch.zeros(
                 num_reqs, b_max, dtype=torch.long, device=self.device
@@ -3151,6 +3254,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         return self._tree_finish_verify(
             logits, processed, input_batch, sampled, num_sampled, cu
+        )
+
+    def _tree_accept_depth_cap(self, input_batch: InputBatch) -> torch.Tensor | None:
+        """Deepest depth each tree request may accept this step, for targets
+        with chunk-compressed KV (``tree_accept_depth_cap``); None otherwise."""
+        spec = self.speculative_config
+        if spec is None or not spec.tree_compress_ratios:
+            return None
+        return tree_accept_depth_cap(
+            self.req_states.num_computed_tokens.gpu[input_batch.idx_mapping],
+            spec.tree_compress_ratios,
+            spec.tree_scratch_ratios,
+            spec.num_draft_rows_per_req,
+            self.max_model_len,
         )
 
     def _tree_finish_verify(
@@ -3679,7 +3796,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # IntermediateTensors instead of final hidden states. Receive the
             # sampled tokens broadcast from the last rank and update local state.
             assert self.pp_handler is not None
-            all_decode_next = self.pp_handler.receive(input_batch)
+            tree_anchors = None
+            if input_batch.tree_batch is not None:
+                # The verify's anchor positions, before the optimistic update
+                # below: this stage compacts its tree KV from them once the
+                # last stage's accepted arenas arrive.
+                tree_anchors = self.req_states.num_computed_tokens.gpu[
+                    input_batch.idx_mapping
+                ].clone()
+            all_decode_next = self.pp_handler.receive(input_batch, tree_anchors)
             # Optimistically update num_computed_tokens for entire batch here.
             # Will be adjusted for rejections if necessary in update_requests.
             self.postprocess_num_computed_tokens(input_batch)
@@ -3715,6 +3840,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_sampled,
                 num_rejected,
                 input_batch,
+                accepted_arenas=(
+                    self.tree_verifier.accepted_arenas
+                    if self.tree_verifier is not None
+                    else None
+                ),
             )
 
         assert self.prompt_logprobs_worker is not None
@@ -3852,7 +3982,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             if self.pp_handler is not None:
                 self.pp_handler.broadcast_drafts(
-                    self.req_states.draft_tokens, input_batch
+                    self.req_states.draft_tokens, input_batch, tree_packed
                 )
 
         # Post-step KV connector related operations.

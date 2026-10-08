@@ -4,6 +4,7 @@
 
 from collections import deque
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
@@ -33,6 +34,13 @@ class PendingRecv:
     # detect requests aborted since then.
     gen_at_receive_np: np.ndarray  # [num_reqs]
     draft_tokens: torch.Tensor | None = None  # [num_reqs, num_speculative_steps]
+    # Tree verification: the trees drafted for the next step (packed rows),
+    # and the step's verified trees, accepted arenas and anchor positions,
+    # which this stage's KV compaction needs.
+    tree_packed: torch.Tensor | None = None  # [num_reqs, packed width]
+    accepted_arenas: torch.Tensor | None = None  # [num_reqs, 1 + W]
+    tree_batch: Any = None
+    tree_anchors: torch.Tensor | None = None  # [num_reqs]
 
 
 def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
@@ -58,12 +66,33 @@ class PPHandler:
     """
 
     def __init__(
-        self, max_num_reqs: int, num_speculative_steps: int, device: torch.device
+        self,
+        max_num_reqs: int,
+        num_speculative_steps: int,
+        device: torch.device,
+        num_draft_tokens: int | None = None,
+        tree_packed_width: int = 0,
+        tree_arena_width: int = 0,
     ):
+        """Args:
+        max_num_reqs: Most requests in a step.
+        num_speculative_steps: Draft positions per step.
+        device: This rank's device.
+        num_draft_tokens: Draft tokens carried per request, when it
+            differs from ``num_speculative_steps`` (tree width).
+        tree_packed_width: Width of a packed drafted tree (0 = no trees).
+        tree_arena_width: Columns of the tree verifier's accepted arenas.
+
+        """
         self.is_last_rank = get_pp_group().is_last_rank
         self.last_rank = get_pp_group().last_rank
         self.max_sample_len = num_speculative_steps + 1
         self.num_speculative_steps = num_speculative_steps
+        self.num_draft_tokens = (
+            num_speculative_steps if num_draft_tokens is None else num_draft_tokens
+        )
+        self.tree_packed_width = tree_packed_width
+        self.tree_arena_width = tree_arena_width
         self.device = device
         self.main_stream = torch.cuda.current_stream(device)
         self.broadcast_stream = torch.cuda.Stream(device)
@@ -119,7 +148,7 @@ class PPHandler:
 
     def get_prev_sampled_outputs(
         self, draft_tokens_to_update: torch.Tensor | None = None
-    ) -> dict[str, torch.Tensor] | None:
+    ) -> dict[str, Any] | None:
         """Consume the entry from pp_size steps ago and wait for its recv event,
         then filter out entries whose request was freed since `receive`.
         """
@@ -157,17 +186,33 @@ class PPHandler:
                 )
             draft_tokens_to_update[draft_idx_mapping] = draft_tokens
 
-        return dict(
+        outputs: dict[str, Any] = dict(
             sampled_tokens=slot.sampled_tokens,
             num_sampled=slot.num_sampled,
             num_rejected=slot.num_rejected,
             idx_mapping=idx_mapping,
         )
+        if slot.tree_packed is not None or slot.accepted_arenas is not None:
+            outputs["tree"] = dict(
+                keep_np=~exclude_mask,
+                idx_mapping=slot.idx_mapping,
+                idx_mapping_np=slot.idx_mapping_np,
+                num_sampled=slot.num_sampled,
+                tree_packed=slot.tree_packed,
+                accepted_arenas=slot.accepted_arenas,
+                tree_batch=slot.tree_batch,
+                tree_anchors=slot.tree_anchors,
+            )
+        return outputs
 
     def broadcast_drafts(
-        self, draft_tokens: torch.Tensor, input_batch: InputBatch
+        self,
+        draft_tokens: torch.Tensor,
+        input_batch: InputBatch,
+        tree_packed: torch.Tensor | None = None,
     ) -> None:
-        """Broadcast draft proposals so non-last ranks can embed real token ids."""
+        """Broadcast draft proposals so non-last ranks can embed real token ids
+        (and, for tree verification, build the same trees)."""
         assert self.is_last_rank
         if compute_need_sampled_mask(input_batch) is None:
             return
@@ -180,15 +225,37 @@ class PPHandler:
             torch.distributed.broadcast(
                 send, src=self.last_rank, group=self.broadcast_group
             )
+            if self.tree_packed_width:
+                if tree_packed is None:
+                    trees = send.new_zeros(send.shape[0], self.tree_packed_width)
+                else:
+                    # A copy: the selector rewrites its buffer next step.
+                    trees = tree_packed.to(torch.int64, copy=True)
+                    tree_packed.record_stream(self.broadcast_stream)
+                torch.distributed.broadcast(
+                    trees, src=self.last_rank, group=self.broadcast_group
+                )
 
-    def receive(self, input_batch: InputBatch) -> bool:
+    def receive(
+        self, input_batch: InputBatch, tree_anchors: torch.Tensor | None = None
+    ) -> bool:
         """Returns True iff sampled tokens need to be gathered from *all*
-        requests in the batch."""
+        requests in the batch.
+
+        Args:
+            input_batch: This step's batch.
+            tree_anchors: ``[num_reqs]`` anchor positions of this step's tree
+                verify (when it verified trees).
+
+        """
         assert not self.is_last_rank
         need_sampled_mask = compute_need_sampled_mask(input_batch)
         if need_sampled_mask is None:
             # Leave this step's reserved slot as None.
             return False
+        verifies_trees = (
+            self.tree_arena_width > 0 and input_batch.tree_batch is not None
+        )
 
         # Snapshot the per-slot generation counter so a later free of any of
         # these RequestStates request indices is detectable at consume time.
@@ -207,25 +274,48 @@ class PPHandler:
             torch.distributed.broadcast(
                 combined, src=self.last_rank, group=self.broadcast_group
             )
+            accepted_arenas = None
+            if verifies_trees:
+                accepted_arenas = torch.empty(
+                    num_reqs,
+                    self.tree_arena_width,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                torch.distributed.broadcast(
+                    accepted_arenas, src=self.last_rank, group=self.broadcast_group
+                )
             draft_tokens = None
+            tree_packed = None
             if self.num_speculative_steps > 0:
                 draft_tokens = torch.empty(
                     num_reqs,
-                    self.num_speculative_steps,
+                    self.num_draft_tokens,
                     dtype=torch.int64,
                     device=self.device,
                 )
                 torch.distributed.broadcast(
                     draft_tokens, src=self.last_rank, group=self.broadcast_group
                 )
+                if self.tree_packed_width:
+                    tree_packed = torch.empty(
+                        num_reqs,
+                        self.tree_packed_width,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                    torch.distributed.broadcast(
+                        tree_packed, src=self.last_rank, group=self.broadcast_group
+                    )
             event = self.broadcast_stream.record_event()
             num_sampled, num_rejected = combined.unbind(dim=0)
             # Must record_stream since these were allocated on broadcast stream but
             # later used on the main stream.
-            sampled_tokens.record_stream(self.main_stream)
-            combined.record_stream(self.main_stream)
-            if draft_tokens is not None:
-                draft_tokens.record_stream(self.main_stream)
+            for t in (sampled_tokens, combined, accepted_arenas, draft_tokens):
+                if t is not None:
+                    t.record_stream(self.main_stream)
+            if tree_packed is not None:
+                tree_packed.record_stream(self.main_stream)
         self.queue[-1] = PendingRecv(
             event,
             sampled_tokens,
@@ -236,6 +326,10 @@ class PPHandler:
             need_sampled_mask,
             gen_at_receive_np,
             draft_tokens,
+            tree_packed=tree_packed,
+            accepted_arenas=accepted_arenas,
+            tree_batch=input_batch.tree_batch if verifies_trees else None,
+            tree_anchors=tree_anchors if verifies_trees else None,
         )
         return bool(need_sampled_mask.all())
 
@@ -245,11 +339,17 @@ class PPHandler:
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
         input_batch: InputBatch,
+        accepted_arenas: torch.Tensor | None = None,
     ) -> None:
+        """Broadcast the step's sampled tokens (and, after a tree verify, the
+        accepted arenas, ``[>= num_reqs, 1 + W]``)."""
         assert self.is_last_rank
         if compute_need_sampled_mask(input_batch) is None:
             # No request needs sampled outputs for a subsequent decode step.
             return
+        verifies_trees = (
+            self.tree_arena_width > 0 and input_batch.tree_batch is not None
+        )
 
         assert sampled_token_ids.dtype == torch.int64
 
@@ -271,5 +371,14 @@ class PPHandler:
             torch.distributed.broadcast(
                 combined, src=self.last_rank, group=self.broadcast_group
             )
+            if verifies_trees:
+                assert accepted_arenas is not None
+                assert accepted_arenas.shape[1] == self.tree_arena_width
+                # A copy: the verifier rewrites its buffer next step.
+                arenas = accepted_arenas[: input_batch.num_reqs].clone()
+                torch.distributed.broadcast(
+                    arenas, src=self.last_rank, group=self.broadcast_group
+                )
+                accepted_arenas.record_stream(self.broadcast_stream)
             for tensor in (sampled_token_ids, num_sampled, num_rejected):
                 tensor.record_stream(self.broadcast_stream)

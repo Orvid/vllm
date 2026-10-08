@@ -850,6 +850,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # [B, H=1, N, C] -> [B, N, C]
         self.kv_cache = kv_cache.squeeze(1)
 
+    def tree_kv_segments(self) -> tuple[int, ...] | None:
+        """Byte runs a block stores for all its entries in turn (tree KV
+        compaction): fp8_ds_mla keeps every entry's 576 B, then its scales."""
+        if self.kv_cache_dtype != "fp8_ds_mla":
+            return None
+        return (576, 8)
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.backend_cls
 
@@ -902,6 +909,12 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         # [B, H=1, N, C] -> [B, N, C]
         self.kv_cache = kv_cache.squeeze(1)
+
+    def tree_kv_segments(self) -> tuple[int, ...]:
+        """Byte runs a block stores for all its entries in turn (tree KV
+        compaction): every entry's quantized values, then its 4 B of scales
+        (FP8: one fp32 scale; MXFP4: four UE8M0 scales)."""
+        return (self.head_dim - 4, 4)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # head_dim already carries the fp8 scale padding

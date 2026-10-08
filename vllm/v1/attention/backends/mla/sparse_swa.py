@@ -112,6 +112,16 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         # [B, H=1, N, C] -> [B, N, C]
         self.kv_cache = kv_cache.squeeze(1)
 
+    def tree_kv_segments(self) -> tuple[int, ...] | None:
+        """Byte runs a block stores for all its tokens in turn (tree KV
+        compaction): fp8_ds_mla keeps every token's 576 B of NoPE + RoPE,
+        then every token's 8 B of scales."""
+        if self.cache_config.cache_dtype == "nvfp4_ds_mla":
+            raise NotImplementedError("tree verification with nvfp4_ds_mla")
+        if self.cache_config.cache_dtype != "fp8_ds_mla":
+            return None
+        return (self.packed_bytes_per_token - 8, 8)
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # fp8_ds_mla's UE8M0 paged layout rounds its page up to the decode
         # kernel's TMA stride; contiguous bf16/fp8 cache uses the natural

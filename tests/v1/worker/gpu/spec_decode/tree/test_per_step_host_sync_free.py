@@ -49,8 +49,7 @@ def _tree_on(tokens, parents, depths, device) -> TreeDraft:
 class _CountingSync:
     """Context manager counting CUDA-aware host round-trips and sync calls: any
     ``.item()``/``.tolist()``/``.cpu()``/``.numpy()`` invoked on (or returning
-    from) a CUDA tensor, or an explicit
-    ``torch.cuda.synchronize``/``torch.accelerator.synchronize``, increments a
+    from) a CUDA tensor, or an explicit device or accelerator synchronize, increments a
     counter so the per-step path can fail closed if one reappears. CPU tensors
     are not counted (their reads are free host memory)."""
 
@@ -169,6 +168,7 @@ def _fake_runner(device, tree_verifier, batch_size, vocab):
         ),
         device=device,
         max_num_reqs=batch_size,
+        speculative_config=None,
         _kv_cache_views_by_name={"layer.0": kv_view},
         kv_cache_config=SimpleNamespace(
             kv_cache_groups=[
@@ -190,6 +190,9 @@ def _fake_runner(device, tree_verifier, batch_size, vocab):
     )
     fake._tree_chain_width = MethodType(GPUModelRunner._tree_chain_width, fake)
     fake._tree_finish_verify = MethodType(GPUModelRunner._tree_finish_verify, fake)
+    fake._tree_accept_depth_cap = MethodType(
+        GPUModelRunner._tree_accept_depth_cap, fake
+    )
     return fake
 
 

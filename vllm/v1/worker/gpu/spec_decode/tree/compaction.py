@@ -16,10 +16,21 @@ import torch
 from torch import Tensor
 
 from vllm.triton_utils import tl, triton
-from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import MambaSpec
 
 _CopyBlock = 256
+# The batched compactor copies bytes.
+_CopyBlockBytes = 1024
+
+
+def _byte_view(t: Tensor) -> Tensor:
+    """A uint8 tensor starting at ``t``'s first element (the batched
+    kernels address every layer in bytes from it)."""
+    storage = t.untyped_storage()
+    offset = t.storage_offset() * t.element_size()
+    return torch.empty(0, dtype=torch.uint8, device=t.device).set_(
+        storage, offset, (storage.nbytes() - offset,), (1,)
+    )
 
 
 @triton.jit
@@ -89,7 +100,8 @@ def _plan_kernel(
     bt_ptrs,  # [G] int64 base pointer of each group's [R, nb] table
     bt_strides,  # [G] int64 row stride of each group's block table
     bt_nbs,  # [G] int64 blocks per request row
-    bt_bss,  # [G] int64 tokens per block
+    bt_bss,  # [G] int64 slots per block (0 = nothing to relocate)
+    ratios,  # [G] int64 positions per slot (1 = per-token slots)
     out_src,  # [G, max_a] int64 source phys slot per entry
     out_dst,  # [G, max_a] int64 destination phys slot per entry
     out_enter,  # [G, max_a] int8 1 when the entry must move
@@ -99,10 +111,17 @@ def _plan_kernel(
     depth_w,  # arenas below this have a depth entry (others read 0)
     astride,  # row stride of accepted_arenas (1 + W)
     max_a,  # persistent stride of the [G, max_a] plan buffers
+    max_nodes,  # tree node budget (fixes compressed groups' scratch base)
     BT_INT64: tl.constexpr,  # block tables hold int64 (else int32) ids
 ):
     """One (entry, kv-cache group) plan cell: the source/destination phys
     slots of accepted node ``j`` of request ``r`` and whether it moves.
+
+    Per-token groups move the node's KV from slot ``C + 1 + arena`` to ``C +
+    depth``. Chunk-compressed groups (``ratio`` positions per entry) move an
+    accepted boundary node's entry from its scratch entry
+    (``tree_scratch_entry``) to entry ``(C + depth) // ratio``; scratch is
+    never read as context, so it is not zeroed.
 
     Aliasing protection mirrors the reference's per-request semantics: a
     source is stale only when it is not the destination of any valid
@@ -128,6 +147,7 @@ def _plan_kernel(
         tl.store(out_enter + base + i, 0)
         tl.store(out_stale + base + i, 0)
         return
+    ratio = tl.load(ratios + g)
     n_acc = tl.load(num_sampled_ptr + r) - 1
     ht = tl.load(has_tree_ptr + r) != 0
     valid = (j < n_acc) & ht
@@ -135,15 +155,20 @@ def _plan_kernel(
     ar = tl.maximum(arena, 0)
     depth = tl.load(depth_ptr + r * depth_stride + ar, mask=ar < depth_w, other=0)
     c = tl.load(c_ptr + tl.load(idx_ptr + r)).to(tl.int64)
-    s_block = c + 1 + arena
-    d_block = c + depth
+    if ratio == 1:
+        s_block = c + 1 + arena
+        d_block = c + depth
+    else:
+        s_block = (c + 1 + max_nodes) // ratio + 1 + arena
+        d_block = (c + depth) // ratio
+        valid = valid & ((c + depth + 1) % ratio == 0)
     s_bidx = tl.minimum(s_block // bs, nb - 1)
     d_bidx = tl.minimum(d_block // bs, nb - 1)
     row = bt_ptr + r * bstride
     src_phys = tl.load(row + s_bidx).to(tl.int64) * bs + s_block % bs
     dst_phys = tl.load(row + d_bidx).to(tl.int64) * bs + d_block % bs
     move = src_phys != dst_phys
-    stale = move & valid
+    stale = move & valid & (ratio == 1)
     for k in tl.range(0, W):
         vk = (k < n_acc) & ht
         ark = tl.maximum(tl.load(arenas_ptr + r * astride + 1 + k), 0)
@@ -382,6 +407,31 @@ def _is_attention_like(spec: Any) -> bool:
     )
 
 
+def _layer_spec(group_spec: Any, name: str) -> Any:
+    specs = getattr(group_spec, "kv_cache_specs", None)
+    return specs[name] if specs else group_spec
+
+
+def _group_slot_ratio(group_spec: Any, scratch_ratios: Sequence[int]) -> int:
+    """Positions per relocated slot of a kv-cache group: 1 for per-token KV,
+    a compression ratio whose in-tree entries a tree keeps in scratch (the
+    accepted ones move to their canonical entries), 0 for nothing to move
+    (recurrent state, ratios verified as chains)."""
+    if isinstance(group_spec, MambaSpec):
+        return 0
+    specs = getattr(group_spec, "kv_cache_specs", None)
+    spec = next(iter(specs.values())) if specs else group_spec
+    ratio = getattr(spec, "tokens_per_state", 1)
+    if ratio == 1:
+        return 1
+    return int(ratio) if ratio in scratch_ratios else 0
+
+
+def _spec_segments(spec: Any) -> tuple[int, ...]:
+    """Default slot layout: one contiguous run of the slot's bytes."""
+    return (spec.num_heads * spec.state_content_size_bytes,)
+
+
 def _buffer_layout(
     *,
     G: int,
@@ -477,6 +527,9 @@ class TreeKVCompaction:
         device: torch.device,
         storage: Tensor | None = None,
         arena_span: int | None = None,
+        layer_segments: dict[str, tuple[int, ...]] | None = None,
+        scratch_ratios: Sequence[int] = (),
+        max_nodes: int = 0,
     ):
         """Persist the layer metadata and plan/scratch buffers.
 
@@ -508,17 +561,35 @@ class TreeKVCompaction:
                 the depth table is indexed by arena (up to ``nodes_max``), the
                 plan columns by chain depth. Defaults to ``W`` when the two
                 coincide (unit tests).
+            layer_segments: Per-layer slot layouts that are not one
+                contiguous run: the byte widths of the runs a block stores
+                for all its slots in turn (e.g. every slot's values, then
+                every slot's scales).
+            scratch_ratios: Compression ratios whose in-tree entries a tree
+                keeps in per-node scratch entries (see
+                ``tree.indexed.tree_scratch_entry``); their groups move the
+                accepted boundary entries to their canonical entries.
+            max_nodes: The tree node budget the scratch entries are based on.
 
         """
         self._W = W
         self._arena_w = W if arena_span is None else arena_span
         self._max_a = max_num_reqs * W
+        self._max_nodes = max_nodes
         self._device = device
+        layer_segments = layer_segments or {}
+        # Per group: slots per block (0 = nothing moves) and positions per
+        # slot. Per relocated (layer, segment): its group, byte offset of its
+        # run within a block, bytes per slot, slots per block, block stride.
         self.block_sizes: list[int] = []
-        layers: list[tuple[int, Tensor]] = []
+        self.slot_ratios: list[int] = []
+        segments: list[tuple[int, Tensor, int, int, int]] = []
         for g, group in enumerate(kv_cache_groups):
-            if isinstance(group.kv_cache_spec, MambaSpec):
-                # Recurrent state commits through its layers (TreeCommit).
+            ratio = _group_slot_ratio(group.kv_cache_spec, scratch_ratios)
+            self.slot_ratios.append(max(ratio, 1))
+            if ratio == 0:
+                # Recurrent state commits through its layers (TreeCommit);
+                # compressed entries of chain-verified ratios stay put.
                 self.block_sizes.append(0)
                 continue
             bs = getattr(group.kv_cache_spec, "block_size", None)
@@ -526,77 +597,58 @@ class TreeKVCompaction:
                 raise ValueError(
                     "df2t compaction needs a uniform block_size on every kv-cache group"
                 )
-            if not isinstance(bs, int):
-                # UniformTypeKVCacheSpecs resolves to an int block_size.
-                bs = int(bs)
-            self.block_sizes.append(bs)
+            # UniformTypeKVCacheSpecs resolves to an int block_size.
+            slots_per_block = int(bs) // ratio
+            self.block_sizes.append(slots_per_block)
             for name in group.layer_names:
                 layer = views_by_name.get(name)
                 if layer is None:
                     continue
-                if layer.ndim != 4:
+                # The view's own blocks (kernel blocks) address its slots.
+                view_slots = layer.shape[-2]
+                block_bytes = layer.stride(0) * layer.element_size()
+                runs = layer_segments.get(name)
+                if runs is None:
+                    runs = (self._contiguous_slot_bytes(name, layer),)
+                if block_bytes < view_slots * sum(runs):
                     raise ValueError(
-                        "df2t compaction needs 4D [B, H, N, C] per-layer "
-                        f"caches; got shape {tuple(layer.shape)}"
+                        f"tree compaction: layer {name}'s blocks "
+                        f"({block_bytes} B) cannot hold {view_slots} "
+                        f"slots of {sum(runs)} B"
                     )
-                _, num_heads, tokens_per_block, content = layer.shape
-                elems = num_heads * content
-                # A slot's KV must be one contiguous run (LBNHC within a
-                # block); blocks may be padded (hybrid models pad attention
-                # pages to the recurrent state's page size).
-                stride = layer.stride()
-                if not (
-                    stride[3] == 1
-                    and stride[2] == elems
-                    and (num_heads == 1 or stride[1] == content)
-                    and stride[0] >= tokens_per_block * elems
-                ):
-                    raise ValueError(
-                        "tree compaction requires per-slot-contiguous "
-                        f"(LBNHC) layer caches; layer {name} has shape "
-                        f"{tuple(layer.shape)}, strides {stride}"
-                    )
-                layers.append((g, layer))
+                run_off = 0
+                for run in runs:
+                    segments.append((g, layer, run_off, run, view_slots))
+                    run_off += view_slots * run
 
         self._G = len(kv_cache_groups)
-        self._L = len(layers)
+        self._L = len(segments)
         if self._L == 0:
             self._empty = True
             return
         self._empty = False
-        if any(layer.device.type != device.type for _, layer in layers):
+        if any(layer.device.type != device.type for _, layer, *_ in segments):
             raise ValueError("df2t compaction views must live on one device")
-        dtype = layers[0][1].dtype
-        if any(layer.dtype != dtype for _, layer in layers):
-            raise ValueError(
-                "df2t compaction requires one dtype across the layer caches; "
-                f"got {dtype} and mixed dtypes"
-            )
 
-        base_layer = min(layers, key=lambda gl: gl[1].data_ptr())[1]
-        itemsize = base_layer.element_size()
-        layer_info = []
-        for idx, (g, layer) in enumerate(layers):
-            _, num_heads, _, content = layer.shape
-            layer_info.append((g, num_heads, content, layer))
-        self._max_el = max(
-            num_heads * content for _, num_heads, content, _ in layer_info
-        )
-        self._kv_base = base_layer
+        # Byte addressing from the lowest view: layers of any dtypes and
+        # layouts share one gather/scatter launch.
+        base_layer = min((s[1] for s in segments), key=lambda t: t.data_ptr())
+        self._kv_base = _byte_view(base_layer)
         self._base_ptr = base_layer.data_ptr()
+        self._max_el = max(run for _, _, _, run, _ in segments)
 
         # Persistent plan + scratch. Rows [G, max_a]; details via g_stride.
         max_a = self._max_a
-        row_bytes = self._L * self._max_el * itemsize
+        row_bytes = self._L * self._max_el
         # Precise scratch sizing: by default the scratch covers the whole
         # ``max_num_reqs`` batch in ONE slab (a single ``(slab, L)``-grid
         # gather -> scatter pair per step), sized from the model's real
-        # ``L * MAX_EL * itemsize`` per-slot bytes and the ``max_num_reqs``-
-        # scaled plan -- never a blanket constant. ``_ScratchBudgetBytes`` only
-        # caps the scratch on unusually large (rows x per-slot bytes) models;
-        # the capped slab still tiles at whole-request boundaries (a
-        # W-multiple) so a request's aliased src/dst pairs never straddle two
-        # gather->scatter slabs.
+        # per-slot bytes and the ``max_num_reqs``-scaled plan -- never a
+        # blanket constant. ``_ScratchBudgetBytes`` only caps the scratch on
+        # unusually large (rows x per-slot bytes) models; the capped slab
+        # still tiles at whole-request boundaries (a W-multiple) so a
+        # request's aliased src/dst pairs never straddle two gather->scatter
+        # slabs.
         scratch_slots = max_a
         if max_a * row_bytes > self._ScratchBudgetBytes:
             raw_slab = max(1, self._ScratchBudgetBytes // row_bytes)
@@ -611,7 +663,7 @@ class TreeKVCompaction:
             W=self._arena_w,
             L=self._L,
             max_el=self._max_el,
-            itemsize=itemsize,
+            itemsize=1,
             slab=scratch_slots,
         )
         self._storage: Tensor | None
@@ -648,14 +700,12 @@ class TreeKVCompaction:
         self._layer_off = carve("layer_off", (self._L,), torch.int64)
         self._block_tokens = carve("block_tokens", (self._L,), torch.int32)
         self._block_el = carve("block_el", (self._L,), torch.int64)
-        for idx, (g, num_heads, content, layer) in enumerate(layer_info):
+        for idx, (g, layer, run_off, run, slots_per_block) in enumerate(segments):
             self._group_of[idx] = g
-            self._elems[idx] = num_heads * content
-            self._layer_off[idx] = (
-                layer.data_ptr() - base_layer.data_ptr()
-            ) // itemsize
-            self._block_tokens[idx] = layer.shape[2]
-            self._block_el[idx] = layer.stride(0)
+            self._elems[idx] = run
+            self._layer_off[idx] = layer.data_ptr() - self._base_ptr + run_off
+            self._block_tokens[idx] = slots_per_block
+            self._block_el[idx] = layer.stride(0) * layer.element_size()
         self._src = carve("src", (self._G, max_a), torch.int64)
         self._dst = carve("dst", (self._G, max_a), torch.int64)
         self._enter = carve("enter", (self._G, max_a), torch.int8)
@@ -665,11 +715,33 @@ class TreeKVCompaction:
         )
         self._has_tree = carve("has_tree", (max_num_reqs,), torch.bool)
         self._scratch = carve(
-            "scratch",
-            (scratch_slots * self._L * self._max_el,),
-            base_layer.dtype,
+            "scratch", (scratch_slots * self._L * self._max_el,), torch.uint8
         )
         self._g_stride = max_a
+
+    @staticmethod
+    def _contiguous_slot_bytes(name: str, layer: Tensor) -> int:
+        """Bytes of a slot stored as one run: a ``[B, H, N, C]`` view whose
+        slot is contiguous (LBNHC within a block; blocks may be padded, e.g.
+        hybrid models pad attention pages to the recurrent state's), or a
+        ``[B, N, C]`` view."""
+        stride = layer.stride()
+        if layer.ndim == 4:
+            _, num_heads, _, content = layer.shape
+            ok = stride[3] == 1 and stride[2] == num_heads * content
+            ok = ok and (num_heads == 1 or stride[1] == content)
+        elif layer.ndim == 3:
+            num_heads, content = 1, layer.shape[2]
+            ok = stride[2] == 1 and stride[1] == content
+        else:
+            ok = False
+        if not ok:
+            raise ValueError(
+                "tree compaction requires per-slot-contiguous "
+                f"(LBNHC) layer caches; layer {name} has shape "
+                f"{tuple(layer.shape)}, strides {stride}"
+            )
+        return num_heads * content * layer.element_size()
 
     @staticmethod
     def _buffer_layout_bytes(
@@ -706,17 +778,19 @@ class TreeKVCompaction:
         kv_cache_groups: Sequence[Any],
         chain_w: int | None = None,
         scratch_budget_bytes: int | None = None,
+        layer_segments: dict[str, tuple[int, ...]] | None = None,
+        scratch_ratios: Sequence[int] = (),
     ) -> int:
         """Precise GPU bytes the compactor will hold, from KV cache group specs.
 
         Mirrors :meth:`__init__`'s sizing from the model's real per-slot bytes
-        (``num_heads * content`` per layer, the itemsize, and the layer count)
-        and the ``max_num_reqs``-scaled plan, with no KV cache tensors needed,
-        so the memory-profiling phase can reserve the exact amount before the
-        KV cache is allocated. Attention-like layers contribute their real
-        ``elems = num_heads * state_content_bytes // itemsize``; layers without
-        a derivable layout contribute zero, and :meth:`__init__` fails closed
-        if a real view would need more than the reservation.
+        (one run of ``num_heads * state_content_bytes`` per layer unless
+        ``layer_segments`` splits it, and the run count) and the
+        ``max_num_reqs``-scaled plan, with no KV cache tensors needed, so the
+        memory-profiling phase can reserve the exact amount before the KV
+        cache is allocated. Layers without a derivable layout contribute zero,
+        and :meth:`__init__` fails closed if a real view would need more than
+        the reservation.
 
         Args:
             max_num_reqs: Upper bound on requests in a step.
@@ -730,6 +804,8 @@ class TreeKVCompaction:
                 chain depth); defaults to ``nodes_max`` when the two coincide.
             scratch_budget_bytes: Upper cap on the scratch; defaults to
                 :attr:`_ScratchBudgetBytes`.
+            layer_segments: As for :meth:`__init__`.
+            scratch_ratios: As for :meth:`__init__`.
 
         """
         budget = (
@@ -737,26 +813,27 @@ class TreeKVCompaction:
             if scratch_budget_bytes is not None
             else cls._ScratchBudgetBytes
         )
+        layer_segments = layer_segments or {}
         L = 0
         max_el = 0
-        itemsize = 0
         for group in kv_cache_groups:
-            spec = group.kv_cache_spec
-            if not _is_attention_like(spec):
+            if _group_slot_ratio(group.kv_cache_spec, scratch_ratios) == 0:
                 continue
-            el = spec.num_heads * (
-                spec.state_content_size_bytes // get_dtype_size(spec.dtype)
-            )
-            if el <= 0:
-                continue
-            L += len(group.layer_names)
-            max_el = max(max_el, el)
-            itemsize = get_dtype_size(spec.dtype)
+            for name in group.layer_names:
+                runs = layer_segments.get(name)
+                if runs is None:
+                    spec = _layer_spec(group.kv_cache_spec, name)
+                    if not _is_attention_like(spec):
+                        continue
+                    runs = _spec_segments(spec)
+                runs = tuple(run for run in runs if run > 0)
+                L += len(runs)
+                max_el = max(max_el, *runs, 0)
         if L == 0:
             return 0
         cw = nodes_max if chain_w is None else chain_w
         max_a = max_num_reqs * cw
-        row_bytes = L * max_el * itemsize
+        row_bytes = L * max_el
         slab = max_a
         if max_a * row_bytes > budget:
             raw_slab = max(1, budget // row_bytes)
@@ -770,15 +847,15 @@ class TreeKVCompaction:
             W=nodes_max,
             L=L,
             max_el=max_el,
-            itemsize=itemsize,
+            itemsize=1,
             slab=slab,
         )
 
     def _block_table_args(
         self, block_tables: Sequence[Tensor]
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Per-group device pointer/stride/width/block-size tables for the
-        plan kernel, cached by the block tables' addresses and shapes."""
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Per-group device pointer/stride/width/block-size/ratio tables for
+        the plan kernel, cached by the block tables' addresses and shapes."""
         assert len(block_tables) == self._G, (len(block_tables), self._G)
         assert len({bt.dtype for bt in block_tables}) == 1
         key = tuple((bt.data_ptr(), bt.stride(0), bt.shape[1]) for bt in block_tables)
@@ -793,6 +870,7 @@ class TreeKVCompaction:
                 [k[1] for k in key],
                 [k[2] for k in key],
                 list(self.block_sizes),
+                list(self.slot_ratios),
             )
         )
         self._bt_args = (key, args)
@@ -868,7 +946,9 @@ class TreeKVCompaction:
             depth_w = self._arena_w
         if idx_mapping is None:
             idx_mapping = torch.arange(R, dtype=torch.int32, device=num_sampled.device)
-        bt_ptrs, bt_strides, bt_nbs, bt_bss = self._block_table_args(block_tables)
+        bt_ptrs, bt_strides, bt_nbs, bt_bss, ratios = self._block_table_args(
+            block_tables
+        )
         _plan_kernel[(a, self._G)](
             num_sampled,
             has_tree,
@@ -880,6 +960,7 @@ class TreeKVCompaction:
             bt_strides,
             bt_nbs,
             bt_bss,
+            ratios,
             self._src,
             self._dst,
             self._enter,
@@ -889,6 +970,7 @@ class TreeKVCompaction:
             depth_w,
             accepted_arenas.shape[1],
             self._g_stride,
+            self._max_nodes,
             BT_INT64=block_tables[0].dtype == torch.int64,
         )
 
@@ -912,7 +994,7 @@ class TreeKVCompaction:
                 g_stride,
                 L,
                 MAX_EL=self._max_el,
-                BLOCK=_CopyBlock,
+                BLOCK=_CopyBlockBytes,
             )
             _scatter_zero_all_kernel[grid](
                 self._kv_base,
@@ -931,5 +1013,5 @@ class TreeKVCompaction:
                 g_stride,
                 L,
                 MAX_EL=self._max_el,
-                BLOCK=_CopyBlock,
+                BLOCK=_CopyBlockBytes,
             )

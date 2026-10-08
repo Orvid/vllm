@@ -1084,3 +1084,96 @@ def test_batched_compaction_chain_width_vs_arena_span():
         )
         == compactor._reserved_bytes
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compaction_moves_split_slots_and_accepted_scratch_entries():
+    """Slots whose block stores each part for all slots in turn (values,
+    then scales: DeepSeek-V4's fp8_ds_mla / indexer caches) move part by
+    part; a compressed group (2 positions per entry, in-tree entries in
+    per-node scratch) moves only the accepted boundary node's scratch entry
+    to its canonical entry.
+
+    Anchor C = 9, nodes: arena 0 and 1 at depth 1, arena 2 under arena 1 at
+    depth 2; the walk accepts arenas 1, 2. Per-token slots 11, 12 move to 10,
+    11 (slot 12 is zeroed). Arena 2 completes entry (9 + 2) // 2 = 5; with 3
+    nodes its scratch entry is (9 + 1 + 3) // 2 + 1 + 2 = 9.
+    """
+    from vllm.v1.worker.gpu.spec_decode.tree.compaction import TreeKVCompaction
+
+    torch.manual_seed(0)
+    token_runs, entry_runs = (8, 4), (4, 2)
+    token_cache = torch.randint(0, 256, (4, 4, 12), dtype=torch.uint8, device="cuda")
+    entry_cache = torch.randint(0, 256, (4, 4, 6), dtype=torch.uint8, device="cuda")
+    groups = [
+        SimpleNamespace(
+            layer_names=["tok"], kv_cache_spec=SimpleNamespace(block_size=4)
+        ),
+        SimpleNamespace(
+            layer_names=["ent"],
+            kv_cache_spec=SimpleNamespace(block_size=8, tokens_per_state=2),
+        ),
+    ]
+    token_table = torch.tensor([[3, 1, 0, 2]], dtype=torch.int32, device="cuda")
+    entry_table = torch.tensor([[2, 0, 3, 1]], dtype=torch.int32, device="cuda")
+
+    def slot_bytes(cache, runs, table, slot):
+        """Byte views of each run of ``slot`` (one block = 4 slots)."""
+        block = cache[int(table[0, slot // 4])].flatten()
+        out, off = [], 0
+        for run in runs:
+            out.append(block[off + (slot % 4) * run : off + (slot % 4 + 1) * run])
+            off += 4 * run
+        return out
+
+    def slot_value(cache, runs, table, slot):
+        return torch.cat(slot_bytes(cache, runs, table, slot)).clone()
+
+    expected_token = token_cache.clone()
+    for src, dst in ((11, 10), (12, 11)):
+        for d, s in zip(
+            slot_bytes(expected_token, token_runs, token_table, dst),
+            slot_bytes(token_cache, token_runs, token_table, src),
+        ):
+            d.copy_(s)
+    for part in slot_bytes(expected_token, token_runs, token_table, 12):
+        part.zero_()
+    expected_entry = entry_cache.clone()
+    for d, s in zip(
+        slot_bytes(expected_entry, entry_runs, entry_table, 5),
+        slot_bytes(entry_cache, entry_runs, entry_table, 9),
+    ):
+        d.copy_(s)
+
+    compactor = TreeKVCompaction(
+        1,
+        2,
+        {"tok": token_cache, "ent": entry_cache},
+        groups,
+        torch.device("cuda"),
+        arena_span=3,
+        layer_segments={"tok": token_runs, "ent": entry_runs},
+        scratch_ratios=(2,),
+        max_nodes=3,
+    )
+    compactor.compact(
+        torch.tensor([3], dtype=torch.int32, device="cuda"),
+        torch.tensor([[-1, 1, 2]], device="cuda"),
+        [SimpleNamespace(depths=torch.tensor([1, 1, 2], device="cuda"))],
+        torch.tensor([9], dtype=torch.int32, device="cuda"),
+        [token_table, entry_table],
+        1,
+    )
+    assert torch.equal(token_cache, expected_token)
+    assert torch.equal(entry_cache, expected_entry)
+    assert (
+        TreeKVCompaction.reserved_bytes(
+            max_num_reqs=1,
+            nodes_max=3,
+            chain_w=2,
+            kv_cache_groups=groups,
+            layer_segments={"tok": token_runs, "ent": entry_runs},
+            scratch_ratios=(2,),
+        )
+        == compactor._reserved_bytes
+    )

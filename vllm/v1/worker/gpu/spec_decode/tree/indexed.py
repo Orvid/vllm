@@ -17,8 +17,8 @@ at each boundary depth on every branch, so each node at a boundary keeps its
 entry in a per-node **scratch entry** past anything the step otherwise
 touches (:func:`tree_scratch_entry`), and a row's in-tree entries are those
 of its path. Compression ratios too large to give every node its own entry
-are handled by verifying a request as a chain on the steps whose tree would
-complete one of their entries.
+are handled by stopping a request's walk short of the depth completing one
+of their entries (:func:`tree_accept_depth_cap`).
 """
 
 import torch
@@ -35,6 +35,44 @@ def tree_scratch_entry(c, arena, max_nodes, R: tl.constexpr):
     return (c + 1 + max_nodes) // R + 1 + arena
 
 
+def tree_accept_depth_cap(
+    anchors: torch.Tensor,
+    compress_ratios: tuple[int, ...],
+    scratch_ratios: tuple[int, ...],
+    max_nodes: int,
+    max_model_len: int,
+) -> torch.Tensor | None:
+    """Deepest depth each request's tree walk may accept (``[R]``), or None
+    without compressed caches.
+
+    A tree completing an entry of a ratio without scratch would share it
+    between siblings, and so would one whose scratch entries run past the
+    request's blocks (``max_model_len``): the walk then stops short of the
+    first depth completing such an entry. The rows past it compute but are
+    never accepted, and the next step's anchor writes the entry for real.
+
+    Args:
+        anchors: ``[R]`` anchor positions.
+        compress_ratios: The target's compression ratios.
+        scratch_ratios: Those keeping in-tree entries in scratch.
+        max_nodes: Most nodes a tree can have (fixes the scratch base).
+        max_model_len: The model's context length.
+
+    """
+    cap = None
+    c = anchors.to(torch.int64)
+    for r in compress_ratios:
+        first = torch.remainder(-(c + 1), r)
+        first = torch.where(first == 0, r, first)
+        limit = first - 1
+        if r in scratch_ratios:
+            last_entry = (c + 1 + max_nodes) // r + 1 + max_nodes
+            fits = (last_entry + 1) * r <= max_model_len
+            limit = torch.where(fits, torch.iinfo(torch.int64).max, limit)
+        cap = limit if cap is None else torch.minimum(cap, limit)
+    return cap
+
+
 @triton.jit
 def _tree_compressed_slots_kernel(
     slots_ptr,  # [num_tokens] int64 compressed slot each row writes (-1 = none)
@@ -45,6 +83,7 @@ def _tree_compressed_slots_kernel(
     block_table_ptr,  # [R, max_blocks] int32 (blocks of entries)
     block_table_stride,
     block_size,  # entries per block
+    max_blocks,
     max_nodes,
     RATIO: tl.constexpr,
     SCRATCH: tl.constexpr,
@@ -55,20 +94,19 @@ def _tree_compressed_slots_kernel(
         return
     anchor = tl.load(row_anchor_ptr + row).to(tl.int64)
     pos = tl.load(positions_ptr + row)
-    # Without scratch, a row whose slot is its position (every row of a
-    # chain) writes its entry like any speculative row.
-    slot = tl.load(slots_ptr + row).to(tl.int64)
-    slot = tl.where(row - anchor == depth, slot, -1)
-    if SCRATCH:
-        slot = tl.full((), -1, tl.int64)
+    slot = tl.full((), -1, tl.int64)
+    if SCRATCH:  # noqa: SIM102 (a constexpr branch)
         if (pos + 1) % RATIO == 0:
             c = tl.load(positions_ptr + anchor)
             entry = tree_scratch_entry(c, row - anchor - 1, max_nodes, RATIO)
-            req = tl.load(token_to_req_ptr + row).to(tl.int64)
-            blk = tl.load(
-                block_table_ptr + req * block_table_stride + entry // block_size
-            )
-            slot = blk.to(tl.int64) * block_size + entry % block_size
+            # Scratch past the request's blocks (near max_model_len) is not
+            # written; the walk never accepts this row then.
+            if entry // block_size < max_blocks:
+                req = tl.load(token_to_req_ptr + row).to(tl.int64)
+                blk = tl.load(
+                    block_table_ptr + req * block_table_stride + entry // block_size
+                )
+                slot = blk.to(tl.int64) * block_size + entry % block_size
     tl.store(slots_ptr + row, slot)
 
 
@@ -86,9 +124,9 @@ def apply_tree_compressed_slots(
 ) -> None:
     """Point the compressed-entry writes of the tree rows among the first
     ``num_rows`` rows at their nodes' scratch entries (``scratch``), or else
-    at nothing unless the row sits at its linear position (a ratio verified
-    as a chain whenever its entry would complete inside a tree). Other rows
-    keep their positional slots.
+    at nothing (no accepted tree row completes an entry of a ratio without
+    scratch: the walk stops short of it, and the next step's anchor writes
+    it). Other rows keep their positional slots.
 
     Args:
         slots: ``[num_tokens]`` compressed slot per row, -1 = no write.
@@ -114,6 +152,7 @@ def apply_tree_compressed_slots(
         block_table,
         block_table.stride(0),
         block_size,
+        block_table.shape[1],
         max_nodes,
         RATIO=ratio,
         SCRATCH=scratch,
@@ -132,6 +171,7 @@ def tree_path_entry_slot(
     block_table_ptr,
     block_table_stride,
     block_size,
+    max_blocks,
     max_nodes,
     D: tl.constexpr,
     RATIO: tl.constexpr,
@@ -139,7 +179,8 @@ def tree_path_entry_slot(
     """Slot of the ``k``-th compressed entry a tree row's path completes
     inside the tree: the entry of its node at boundary depth ``first + k *
     RATIO`` (``first`` the shallowest depth whose position ends an entry),
-    kept in that node's scratch entry."""
+    kept in that node's scratch entry. Scratch past the request's blocks
+    (rows the walk never accepts) reads slot 0."""
     first = (RATIO - (c + 1) % RATIO) % RATIO
     first = tl.where(first == 0, RATIO, first)
     depth_k = first + k * RATIO
@@ -149,7 +190,7 @@ def tree_path_entry_slot(
     entry = tree_scratch_entry(c, node - anchor - 1, max_nodes, RATIO)
     blk = tl.load(
         block_table_ptr + req * block_table_stride + entry // block_size,
-        mask=valid,
+        mask=valid & (entry // block_size < max_blocks),
         other=0,
     ).to(tl.int64)
     return blk * block_size + entry % block_size
@@ -170,6 +211,7 @@ def _tree_remap_compressed_kernel(
     block_table_ptr,
     block_table_stride,
     block_size,
+    max_blocks,
     max_nodes,
     D: tl.constexpr,
     RATIO: tl.constexpr,
@@ -199,6 +241,7 @@ def _tree_remap_compressed_kernel(
             block_table_ptr,
             block_table_stride,
             block_size,
+            max_blocks,
             max_nodes,
             D,
             RATIO,
@@ -256,6 +299,7 @@ def remap_tree_compressed_indices(
         block_table,
         block_table.stride(0),
         block_size,
+        block_table.shape[1],
         max_nodes,
         D=d,
         RATIO=ratio,
@@ -433,6 +477,7 @@ def _tree_indexer_logits_kernel(
     token_to_req_ptr,
     block_table_ptr,
     block_table_stride,
+    max_blocks,
     max_nodes,
     H: tl.constexpr,
     HP: tl.constexpr,
@@ -471,6 +516,7 @@ def _tree_indexer_logits_kernel(
                 block_table_ptr,
                 block_table_stride,
                 kv_block_size,
+                max_blocks,
                 max_nodes,
                 D,
                 RATIO,
@@ -543,6 +589,7 @@ def tree_indexer_logits(
         token_to_req,
         block_table,
         block_table.stride(0),
+        block_table.shape[1],
         max_nodes,
         H=num_heads,
         HP=triton.next_power_of_2(num_heads),

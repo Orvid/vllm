@@ -17,6 +17,7 @@ from vllm.v1.worker.gpu.spec_decode.tree.indexed import (
     apply_tree_compressed_slots,
     fill_tree_window_indices,
     remap_tree_compressed_indices,
+    tree_accept_depth_cap,
     tree_indexer_logits,
 )
 
@@ -123,9 +124,8 @@ def _entry_slot(entry_table, req, entry):
 def test_tree_rows_write_compressed_entries_only_where_unshared(scratch):
     """Siblings completing an entry at the same position must not share it.
     With scratch, each boundary node writes its own scratch entry and other
-    tree rows none. Without (a ratio verified as a chain whenever an entry
-    would complete inside a tree), only rows at their linear position (every
-    row of a chain) write, positionally. Chain rows always keep theirs."""
+    tree rows none. Without, no tree row writes (the walk never accepts one
+    completing such an entry). Chain rows always keep theirs."""
     ctx, positions, token_to_req, entry_table = _ratio2_tree()
     slots = torch.arange(100, 107, device=DEVICE)
     apply_tree_compressed_slots(
@@ -144,8 +144,22 @@ def test_tree_rows_write_compressed_entries_only_where_unshared(scratch):
         e = [_entry_slot(entry_table, 1, n) for n in (8, 10, 11)]
         assert slots.tolist() == [100, 101, 102, e[0], -1, e[1], e[2]]
     else:
-        # Nodes 0 and 1 sit at the arena slots their depths give; 2, 3 not.
-        assert slots.tolist() == [100, 101, 102, 103, 104, -1, -1]
+        assert slots.tolist() == [100, 101, 102, -1, -1, -1, -1]
+
+
+def test_tree_walk_stops_short_of_entries_it_cannot_keep_apart():
+    """Anchors at 10, 125, 2000 with ratios 4 (scratch) and 128 (none), 4
+    nodes, max_model_len 2020: anchor 125 completes a 128-entry at depth 2,
+    so its walk accepts depth 1 at most; anchor 2000's ratio-4 scratch would
+    pass max_model_len, so it stops before depth 3 (position 2003)."""
+    cap = tree_accept_depth_cap(
+        torch.tensor([10, 125, 2000], device=DEVICE), (4, 128), (4,), 4, 2020
+    )
+    assert cap is not None
+    assert cap[1].item() == 1
+    assert cap[2].item() == 2
+    # Anchor 10's next 128-entry ends at depth 117.
+    assert cap[0].item() == 116
 
 
 def test_tree_rows_select_their_paths_in_tree_entries():

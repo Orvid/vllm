@@ -2039,15 +2039,21 @@ class SpeculativeConfig:
         return 1 + self.max_tree_budget + self.tree_scratch_positions
 
     @property
-    def tree_scratch_ratios(self) -> tuple[int, ...]:
-        """KV compression ratios (DeepSeek-V4 style compressed attention) whose
-        entries a tree can complete inside itself and so keeps in per-node
-        scratch entries; larger ratios rarely complete one inside a tree, and
-        a request whose tree would is verified as a chain that step."""
+    def tree_compress_ratios(self) -> tuple[int, ...]:
+        """The target's KV compression ratios (DeepSeek-V4 style compressed
+        attention: one cache entry per ``r`` positions), above 1."""
         if self.target_model_config is None:
             return ()
         ratios = getattr(self.target_model_config.hf_config, "compress_ratios", None)
-        return tuple(sorted({r for r in ratios or () if 1 < r <= 8}))
+        return tuple(sorted({r for r in ratios or () if r > 1}))
+
+    @property
+    def tree_scratch_ratios(self) -> tuple[int, ...]:
+        """Compression ratios whose entries a tree can complete inside itself
+        and so keeps in per-node scratch entries. A tree rarely completes an
+        entry of a larger ratio; when one would, its walk stops short of the
+        completing depth (see ``tree.indexed.tree_accept_depth_cap``)."""
+        return tuple(r for r in self.tree_compress_ratios if r <= 8)
 
     @property
     def tree_scratch_positions(self) -> int:

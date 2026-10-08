@@ -421,6 +421,26 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
 
+    def markov_transition_bias(
+        self, prev_token_ids: torch.Tensor, index: torch.Tensor
+    ) -> torch.Tensor:
+        """Markov bias from each previous token to each candidate.
+
+        Args:
+            prev_token_ids: ``[..., P]`` previous tokens.
+            index: ``[..., C]`` candidate tokens.
+
+        Returns:
+            ``[..., P, C]`` bias, as the sequential head would add it.
+
+        """
+        head = self.model.markov_head
+        embed = head.embed(prev_token_ids)
+        weight = head.gathered_weight(index, embed.dtype)
+        return self.logits_processor.scale * torch.matmul(
+            embed, weight.transpose(-1, -2)
+        )
+
     def compute_confidence(
         self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
     ) -> torch.Tensor:
