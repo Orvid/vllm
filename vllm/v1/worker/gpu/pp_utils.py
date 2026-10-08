@@ -275,7 +275,7 @@ class PPHandler:
                 combined, src=self.last_rank, group=self.broadcast_group
             )
             accepted_arenas = None
-            if verifies_trees:
+            if self.tree_arena_width:
                 accepted_arenas = torch.empty(
                     num_reqs,
                     self.tree_arena_width,
@@ -327,7 +327,7 @@ class PPHandler:
             gen_at_receive_np,
             draft_tokens,
             tree_packed=tree_packed,
-            accepted_arenas=accepted_arenas,
+            accepted_arenas=accepted_arenas if verifies_trees else None,
             tree_batch=input_batch.tree_batch if verifies_trees else None,
             tree_anchors=tree_anchors if verifies_trees else None,
         )
@@ -371,14 +371,24 @@ class PPHandler:
             torch.distributed.broadcast(
                 combined, src=self.last_rank, group=self.broadcast_group
             )
-            if verifies_trees:
-                assert accepted_arenas is not None
-                assert accepted_arenas.shape[1] == self.tree_arena_width
-                # A copy: the verifier rewrites its buffer next step.
-                arenas = accepted_arenas[: input_batch.num_reqs].clone()
+            if self.tree_arena_width:
+                # Sent on every step, so every rank runs the same broadcasts
+                # whether or not it verified trees this step (-1: none).
+                if verifies_trees:
+                    assert accepted_arenas is not None
+                    assert accepted_arenas.shape[1] == self.tree_arena_width
+                    # A copy: the verifier rewrites its buffer next step.
+                    arenas = accepted_arenas[: input_batch.num_reqs].clone()
+                    accepted_arenas.record_stream(self.broadcast_stream)
+                else:
+                    arenas = torch.full(
+                        (input_batch.num_reqs, self.tree_arena_width),
+                        -1,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
                 torch.distributed.broadcast(
                     arenas, src=self.last_rank, group=self.broadcast_group
                 )
-                accepted_arenas.record_stream(self.broadcast_stream)
             for tensor in (sampled_token_ids, num_sampled, num_rejected):
                 tensor.record_stream(self.broadcast_stream)
