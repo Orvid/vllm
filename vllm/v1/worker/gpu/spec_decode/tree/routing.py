@@ -40,15 +40,16 @@ _HIT_PRIOR = 1000.0
 _HIT_DECAY_EVERY = 256
 _HIDDEN = 512
 _LR = 1e-3
-# Rows trained on per forward (a random subset past it), the pinned staging
+# Rows taken per forward (a random subset past it), the pinned staging
 # buffers they cycle through, and the padded row counts training runs at.
 _MAX_TRAIN_ROWS = 512
 _RING = 4
 _TRAIN_BUCKETS = (16, 32, 64, 128, 256, _MAX_TRAIN_ROWS)
-# Forwards trained on before training thins to every _TRAIN_EVERY-th: fewer
-# early steps measurably slow the predictor's learning.
-_TRAIN_WARMUP = 1024
-_TRAIN_EVERY = 4
+# Forwards' rows accumulate until an optimizer step has this many (or the
+# oldest is this many forwards old): the step's cost is mostly the optimizer
+# pass over the weights, which does not grow with its rows.
+_TRAIN_BATCH_ROWS = 256
+_TRAIN_MAX_STALE = 16
 
 
 def _rms(x: Tensor) -> Tensor:
@@ -290,7 +291,21 @@ class OnlineRoutingPredictor(MoERoutingPredictor):
             self._infer_weights = tuple(
                 p.detach().to(torch.bfloat16) for p in self._params
             )
-        self._num_trained = 0
+            # Rows awaiting the next optimizer step: their inputs (computed
+            # when they are verified, before their draft state is replaced)
+            # and their experts.
+            self._buf_feats = torch.zeros(
+                _MAX_TRAIN_ROWS, hidden_size + draft_hidden_size, device=self.device
+            )
+            self._buf_labels = torch.zeros(
+                _MAX_TRAIN_ROWS,
+                self.num_layers,
+                self.top_k,
+                dtype=torch.long,
+                device=self.device,
+            )
+        self._buf_rows = 0
+        self._buf_forwards = 0
         # Training steps by padded row count, each captured at first use.
         self._steps: dict[int, _TrainStep] = {}
         # Training rows reach the device through a ring of pinned buffers: a
@@ -366,14 +381,10 @@ class OnlineRoutingPredictor(MoERoutingPredictor):
         super().observe_forward(input_batch)
         if input_batch.num_tokens == 0:
             return
-        # Every forward teaches it while it is young; after that, every few
-        # are enough to track drift.
-        train = self._num_trained < _TRAIN_WARMUP or self._observed % _TRAIN_EVERY == 0
         rows_np, reqs_np = self._train_rows(input_batch)
         k = self._host_next
         n = len(rows_np)
-        if train and n and (not self._host_used[k] or self._host_events[k].query()):
-            self._num_trained += 1
+        if n and (not self._host_used[k] or self._host_events[k].query()):
             self._host_next = (k + 1) % _RING
             host = self._host_rows[k]
             host[0, :n] = torch.from_numpy(rows_np)
@@ -382,7 +393,7 @@ class OnlineRoutingPredictor(MoERoutingPredictor):
             self._host_events[k].record()
             self._host_used[k] = True
             rows, reqs = dev[0], dev[1]
-            self._train(input_batch, rows, reqs)
+            self._collect(input_batch, rows, reqs)
         # The draft that follows this forward is for this batch's requests.
         num_reqs = input_batch.num_reqs
         self._batch_slots[:num_reqs] = input_batch.idx_mapping
@@ -402,45 +413,57 @@ class OnlineRoutingPredictor(MoERoutingPredictor):
         h = self.draft_hidden[slots, (depth - 1).clamp(0, S - 1)]
         return torch.where(((depth >= 1) & (depth <= S))[:, None], h, 0)
 
-    def _train(self, input_batch: Any, rows: Tensor, reqs: Tensor) -> None:
+    def _collect(self, input_batch: Any, rows: Tensor, reqs: Tensor) -> None:
+        """Buffer this forward's rows, and take an optimizer step once enough
+        rows (or forwards) have accumulated."""
         n = rows.shape[0]
+        if self._buf_rows + n > _MAX_TRAIN_ROWS:
+            self._train_buffered()
+        start, end = self._buf_rows, self._buf_rows + n
+        hidden = self._row_hidden(input_batch, rows, reqs)
+        self._buf_feats[start:end] = self._features(input_batch.input_ids[rows], hidden)
+        self._buf_labels[start:end] = (
+            self.routes[rows].index_select(1, self.layer_ids).clamp(min=0)
+        )
+        self._buf_rows = end
+        self._buf_forwards += 1
+        if (
+            self._buf_rows >= _TRAIN_BATCH_ROWS
+            or self._buf_forwards >= _TRAIN_MAX_STALE
+        ):
+            self._train_buffered()
+
+    def _train_buffered(self) -> None:
+        n = self._buf_rows
+        if n == 0:
+            return
         bucket = next(b for b in _TRAIN_BUCKETS if b >= n)
         step = self._steps.get(bucket)
         if step is None:
             step = self._steps[bucket] = _TrainStep(self, bucket)
-        hidden = self._row_hidden(input_batch, rows, reqs)
-        step.load(
-            self._features(input_batch.input_ids[rows], hidden),
-            self.routes[rows].index_select(1, self.layer_ids),
-            n,
-        )
+        step.weigh(n)
         step.run()
+        self._buf_rows = 0
+        self._buf_forwards = 0
 
 
 class _TrainStep:
-    """One optimizer step on up to ``rows`` (padded) rows, replayed as a CUDA
+    """One optimizer step on the first ``rows`` rows of the predictor's
+    buffer (the real ones weighted, the rest ignored), replayed as a CUDA
     graph: issued eagerly, the step's few dozen small kernels cost more host
     time than the GPU spends on them."""
 
     def __init__(self, pred: OnlineRoutingPredictor, rows: int):
         self.pred = pred
         self.rows = rows
-        dev = pred.device
-        d_in = pred.mlp.l1.in_features
+        self.feats = pred._buf_feats[:rows]
+        self.labels = pred._buf_labels[:rows]
         with torch.inference_mode(False):
-            self.feats = torch.zeros(rows, d_in, device=dev)
-            self.labels = torch.zeros(
-                rows, pred.num_layers, pred.top_k, dtype=torch.long, device=dev
-            )
-            # 1/n on the n real rows, 0 on the padding.
-            self.weight = torch.zeros(rows, device=dev)
+            # 1/n on the n real rows, 0 past them.
+            self.weight = torch.zeros(rows, device=pred.device)
         self.graph: torch.cuda.CUDAGraph | None = None
 
-    def load(self, feats: Tensor, labels: Tensor, n: int) -> None:
-        self.feats[:n] = feats
-        self.feats[n:] = 0
-        self.labels[:n] = labels.clamp(min=0)
-        self.labels[n:] = 0
+    def weigh(self, n: int) -> None:
         self.weight.fill_(0)
         self.weight[:n] = 1.0 / n
 
@@ -469,18 +492,19 @@ class _TrainStep:
             if self.pred.device.type != "cuda":
                 self._step()
                 return
-            if self.graph is None:
-                # Warm up on a side stream (autograd and the optimizer state
-                # come up there), then capture.
-                side = torch.cuda.Stream()
-                side.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(side):
-                    self._step()
-                torch.cuda.current_stream().wait_stream(side)
-                self.graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(self.graph):
-                    self._step()
-            self.graph.replay()
+            if self.graph is not None:
+                self.graph.replay()
+                return
+            # This step runs eagerly on a side stream (autograd and the
+            # optimizer state come up there); capturing it executes nothing.
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                self._step()
+            torch.cuda.current_stream().wait_stream(side)
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph):
+                self._step()
 
 
 def _read_bandwidth_gb_s(device: torch.device) -> float:

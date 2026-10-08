@@ -245,30 +245,59 @@ def test_routing_meter_totals_each_forwards_distinct_experts():
     assert mem.forward_cost_total.item() == 11.0
 
 
-def test_online_predictor_tells_draft_positions_apart():
-    """Token 9 drafted at depths 1 and 2 routes to different experts there:
-    trained on decode forwards, the predictor names each from the drafter's
-    hidden state at its position (and the anchor's from its token), and its
-    measured hit rate follows."""
+# Experts of anchor 5 and of token 9 drafted after it at depths 1 and 2.
+_CHAIN_ROUTES = ([[1, 2], [3, 4]], [[6, 7], [0, 8]], [[9, 10], [11, 12]])
+
+
+def _chain_predictor():
+    """An online predictor over the verify of anchor 5 and its chain 9 -> 9
+    (positions anchor + depth), the draft's candidates and hidden states."""
     from vllm.v1.worker.gpu.spec_decode.tree.routing import OnlineRoutingPredictor
 
     torch.manual_seed(0)
-    anchor, depth1, depth2 = [[1, 2], [3, 4]], [[6, 7], [0, 8]], [[9, 10], [11, 12]]
     pred = OnlineRoutingPredictor(
         embed=torch.nn.Embedding(64, 32).cuda(),
         hidden_size=32,
         draft_hidden_size=16,
         max_num_reqs=1,
-        routes=_routes([anchor, depth1, depth2]),
+        routes=_routes(list(_CHAIN_ROUTES)),
         moe_layer_ids=[0, 2],
         num_experts=16,
         expert_cost_ms=torch.ones(2),
         device=torch.device("cuda"),
     )
-    # The verify of anchor 5 and its chain 9 -> 9 (positions anchor + depth).
     batch = _decode_batch([5, 9, 9], [0, 3], positions=[10, 11, 12])
     cand = torch.tensor([[[9], [9]]], device="cuda")
-    draft_hidden = torch.randn(1, 2, 16, device="cuda")
+    return pred, batch, cand, torch.randn(1, 2, 16, device="cuda")
+
+
+def test_online_predictor_batches_forwards_into_one_update(monkeypatch):
+    """With a 6-row batch, the 3-row forwards are buffered and every second
+    one takes a single optimizer step over both."""
+    from vllm.v1.worker.gpu.spec_decode.tree import routing
+
+    monkeypatch.setattr(routing, "_TRAIN_BATCH_ROWS", 6)
+    pred, batch, cand, draft_hidden = _chain_predictor()
+    graded = []  # predicted experts graded so far (rows x layers x top-k)
+    with torch.inference_mode():
+        for _ in range(4):
+            pred.observe_forward(batch)
+            pred.predict(cand, batch.input_ids[:1], draft_hidden)
+            graded.append(pred.hit_stats[1].item() - routing._HIT_PRIOR)
+    assert graded == [0.0, 24.0, 24.0, 48.0]
+
+
+def test_online_predictor_tells_draft_positions_apart(monkeypatch):
+    """Token 9 drafted at depths 1 and 2 routes to different experts there:
+    trained on decode forwards, the predictor names each from the drafter's
+    hidden state at its position (and the anchor's from its token), and its
+    measured hit rate follows."""
+    from vllm.v1.worker.gpu.spec_decode.tree import routing
+
+    # An optimizer step every forward, to learn within the test.
+    monkeypatch.setattr(routing, "_TRAIN_MAX_STALE", 1)
+    anchor, depth1, depth2 = _CHAIN_ROUTES
+    pred, batch, cand, draft_hidden = _chain_predictor()
     with torch.inference_mode():
         for _ in range(300):
             pred.observe_forward(batch)
