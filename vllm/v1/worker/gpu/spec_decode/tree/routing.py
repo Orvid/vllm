@@ -22,6 +22,7 @@ state at the request's anchor row adds less than the drafter's does.
 """
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -529,16 +530,29 @@ def _read_bandwidth_gb_s(device: torch.device) -> float:
     return 5 * x.numel() / 1e9 / (start.elapsed_time(end) / 1e3)
 
 
-def build_moe_routing_predictor(
-    model: torch.nn.Module,
-    vllm_config: Any,
-    max_num_tokens: int,
-    max_num_reqs: int,
-    device: torch.device,
-) -> OnlineRoutingPredictor:
-    """Capture the target's MoE routing every forward, price each layer's
-    experts by their weight bytes over the device's read bandwidth, and
-    predict routing online.
+@dataclass
+class MoERoutingCapture:
+    """The target's MoE routing, captured every forward.
+
+    Attributes:
+        routes: ``[max_num_tokens, num_layers, top_k]`` the capture buffer,
+            indexed by (global) layer id; this rank's MoE layers fill theirs.
+        layers: ``(layer id, bytes per expert)`` of every MoE layer whose
+            routes reach ``routes`` (this rank's, plus earlier pipeline
+            stages' when they are relayed in).
+        num_experts: Experts per MoE layer.
+
+    """
+
+    routes: torch.Tensor
+    layers: list[tuple[int, float]]
+    num_experts: int
+
+
+def bind_moe_routing_capture(
+    model: torch.nn.Module, vllm_config: Any, max_num_tokens: int
+) -> MoERoutingCapture:
+    """Capture this rank's MoE routing every forward.
 
     Raises:
         ValueError: if the model has no MoE layers, or its routers already
@@ -564,18 +578,36 @@ def build_moe_routing_predictor(
         )
     capturer = RoutedExpertsCapturer(max_num_tokens, vllm_config)
     bind_routed_experts_capturer(model, capturer)
-
-    bandwidth = _read_bandwidth_gb_s(device)
-    expert_bytes = [
-        sum(p.numel() * p.element_size() for p in r.routed_experts.parameters())
-        / r.moe_config.num_local_experts
+    layers = [
+        (
+            r.layer_id,
+            sum(p.numel() * p.element_size() for p in r.routed_experts.parameters())
+            / r.moe_config.num_local_experts,
+        )
         for r in runners
     ]
+    return MoERoutingCapture(
+        capturer.device_buffer, layers, runners[0].moe_config.num_experts
+    )
+
+
+def build_moe_routing_predictor(
+    model: torch.nn.Module,
+    vllm_config: Any,
+    capture: MoERoutingCapture,
+    max_num_reqs: int,
+    device: torch.device,
+) -> OnlineRoutingPredictor:
+    """Price each captured layer's experts by their weight bytes over the
+    device's read bandwidth, and predict routing online."""
+    bandwidth = _read_bandwidth_gb_s(device)
+    layers = sorted(capture.layers)
+    expert_bytes = [b for _, b in layers]
     cost_ms = [b / (bandwidth * 1e9) * 1e3 for b in expert_bytes]
     logger.info(
         "Expert-aware tree selection: %d MoE layers, %.2f MB per expert, "
         "%.0f GB/s read bandwidth (%.1f us per expert activation)",
-        len(runners),
+        len(layers),
         sum(expert_bytes) / len(expert_bytes) / 1e6,
         bandwidth,
         sum(cost_ms) / len(cost_ms) * 1e3,
@@ -587,9 +619,9 @@ def build_moe_routing_predictor(
             vllm_config.speculative_config.draft_model_config.get_hidden_size()
         ),
         max_num_reqs=max_num_reqs,
-        routes=capturer.device_buffer,
-        moe_layer_ids=[r.layer_id for r in runners],
-        num_experts=runners[0].moe_config.num_experts,
+        routes=capture.routes,
+        moe_layer_ids=[layer_id for layer_id, _ in layers],
+        num_experts=capture.num_experts,
         expert_cost_ms=torch.tensor(cost_ms),
         device=device,
     )

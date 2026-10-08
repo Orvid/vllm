@@ -2099,8 +2099,12 @@ class SpeculativeConfig:
             return [nodes_max]
         widths = self.tree_verify_widths
         if widths is None:
-            # The anchor plus 2^k - 1 nodes fills whole power-of-two row tiles.
-            widths = [(1 << i) - 1 for i in range(3, 7) if (1 << i) - 1 < nodes_max]
+            # The anchor plus 2^k - 1 nodes fills whole power-of-two row tiles;
+            # the drafter's depth verifies as many rows as its chain would
+            # (on MoE targets, where every row adds expert reads, the best
+            # width is often near it).
+            widths = [(1 << i) - 1 for i in range(2, 7)]
+            widths.append(self.num_speculative_tokens)
         return sorted({w for w in widths if 1 <= w < nodes_max} | {nodes_max})
 
     @property

@@ -183,7 +183,9 @@ from vllm.v1.worker.gpu.spec_decode.tree.context import TreeVerifyContext
 from vllm.v1.worker.gpu.spec_decode.tree.indexed import tree_accept_depth_cap
 from vllm.v1.worker.gpu.spec_decode.tree.mixers import TreeRecurrentLayers
 from vllm.v1.worker.gpu.spec_decode.tree.routing import (
+    MoERoutingCapture,
     MoERoutingPredictor,
+    bind_moe_routing_capture,
     build_moe_routing_predictor,
 )
 from vllm.v1.worker.gpu.spec_decode.tree.tree_metadata import (
@@ -209,6 +211,10 @@ from vllm.v1.worker.utils import (
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
+
+# Intermediate-tensor key carrying expert-aware tree selection's MoE routes
+# between pipeline stages.
+_MOE_ROUTES_KEY = "tree_moe_routes"
 
 
 def _tree_ensure_staged(
@@ -851,21 +857,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Expert-aware tree selection: learn the target's MoE routing from
         # every forward and let the tree builder price nodes by the experts
         # they add, at the adaptive width controller's tokens-per-ms rate,
-        # scaled by the expert cost it learns from measured step times. Only
-        # the drafting (last PP) stage builds trees; under pipeline
-        # parallelism it learns and prices its own stage's MoE layers, the
-        # learned cost scale standing in for the other stages'.
+        # scaled by the expert cost it learns from measured step times. Every
+        # stage captures its own MoE layers' routing; under pipeline
+        # parallelism each stage relays the routes so far on with its hidden
+        # states (_relay_moe_routes), so the drafting (last) stage, which
+        # builds the trees, learns and prices every MoE layer.
         self._moe_routing: MoERoutingPredictor | None = None
+        self._moe_capture: MoERoutingCapture | None = None
         self._tree_lam: torch.Tensor | None = None
+        if spec is not None and spec.tree_selection == "df2t_moe":
+            capture = bind_moe_routing_capture(
+                self.model, self.vllm_config, self.max_num_tokens
+            )
+            if self.use_pp:
+                pp_group = get_pp_group()
+                stage_layers: list[Any] = [None] * pp_group.world_size
+                torch.distributed.all_gather_object(
+                    stage_layers, capture.layers, group=pp_group.cpu_group
+                )
+                capture.layers = sorted({x for layers in stage_layers for x in layers})
+                self._moe_capture = capture
         if (
-            spec is not None
-            and spec.tree_selection == "df2t_moe"
-            and self.speculator is not None
+            self.speculator is not None
+            and spec is not None
+            and (spec.tree_selection == "df2t_moe")
         ):
             self._moe_routing = build_moe_routing_predictor(
                 self.model,
                 self.vllm_config,
-                self.max_num_tokens,
+                capture,
                 self.max_num_reqs,
                 self.device,
             )
@@ -3699,6 +3719,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 for k, v in self.intermediate_tensors.tensors.items()
             }
             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
+            routes = intermediate_tensors.tensors.get(_MOE_ROUTES_KEY)
+            if self._moe_capture is not None and routes is not None and not dummy_run:
+                # Earlier stages' MoE routing for these rows; this stage's
+                # forward fills its own layers' columns.
+                self._moe_capture.routes[:n].copy_(routes[:n])
             del intermediate_tensors
 
         # Update the EPLB meta.
@@ -3808,9 +3833,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Non-last PP rank: return IntermediateTensors for sending.
             assert output_intermediate_tensors is not None
             assert self.pp_handler is not None
-            return self.pp_handler.relay_aux_hidden_states(
+            output = self.pp_handler.relay_aux_hidden_states(
                 model_inputs["intermediate_tensors"], output_intermediate_tensors
             )
+            if self._moe_capture is not None:
+                # The MoE routing of every layer so far, for the drafting
+                # stage's expert-aware tree selection. (The send completes
+                # before this stage's next forward rewrites the buffer.)
+                output = IntermediateTensors(
+                    output.tensors
+                    | {
+                        _MOE_ROUTES_KEY: self._moe_capture.routes[
+                            : input_batch.num_tokens_after_padding
+                        ]
+                    }
+                )
+            return output
         return None
 
     @torch.inference_mode()

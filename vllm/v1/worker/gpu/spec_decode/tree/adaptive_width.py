@@ -31,8 +31,11 @@ from collections import deque
 import numpy as np
 import torch
 
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_pin_memory_available
+
+logger = init_logger(__name__)
 
 # Calibration bins over the node path log-probability, [-NUM_BINS * BIN_W, 0],
 # per node depth (deeper nodes share the last depth's bins).
@@ -59,6 +62,8 @@ _FIT_PRIOR_STEPS = 64
 _FIT_MAX_RATIO = 1.5
 _MAX_EXPERT_SCALE = 8.0
 _SNAP_RING = 64
+# Log the width choice's inputs this often (in selections).
+_LOG_EVERY = 256
 
 
 @triton.jit
@@ -220,6 +225,8 @@ class TreeWidthController:
         self._fit_xr = 0.0
         self._fit_n = 0
         self.expert_cost_scale = 1.0
+        self._num_selects = 0
+        self._num_blind = 0
 
     def set_expert_meter(self, total: torch.Tensor) -> None:
         self._expert_meter = total
@@ -407,14 +414,35 @@ class TreeWidthController:
             else:
                 self._mean_curve += 0.05 * (known_mean - self._mean_curve)
         elif self._mean_curve is None:
+            self._num_blind += 1
+            if self._num_blind % _LOG_EVERY == 1:
+                logger.info(
+                    "Tree width: no acceptance curve on the host yet (%d steps); "
+                    "verifying the full width",
+                    self._num_blind,
+                )
             self._time_step(len(self.widths) - 1, n)
             return self.B
         expected = known.sum(axis=0) + self._mean_curve * (n - len(known))
-        rate = (n + expected) / self.step_cost_ms(n)
+        cost = self.step_cost_ms(n)
+        rate = (n + expected) / cost
         j = int(np.argmax(rate))
         # Expected tokens per ms at the chosen width: what a ms of verify cost
         # is worth in tokens (expert-aware tree selection prices with it).
         self.throughput = float(rate[j])
+        self._num_selects += 1
+        if self._num_selects % _LOG_EVERY == 0:
+            logger.info(
+                "Tree width: %d reqs, widths %s, expected tokens %s, step ms %s "
+                "(measured steps %s), chose %d; expert cost scale %.2f",
+                n,
+                self.widths,
+                np.round(n + expected, 2).tolist(),
+                np.round(cost, 1).tolist(),
+                self._cost_samples.tolist(),
+                self.widths[j],
+                self.expert_cost_scale,
+            )
         self._time_step(j, n)
         return self.widths[j]
 
