@@ -848,10 +848,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Expert-aware tree selection: learn the target's MoE routing from
         # every forward and let the tree builder price nodes by the experts
         # they add, at the adaptive width controller's tokens-per-ms rate,
-        # scaled by the expert cost it learns from measured step times.
+        # scaled by the expert cost it learns from measured step times. Only
+        # the drafting (last PP) stage builds trees; under pipeline
+        # parallelism it learns and prices its own stage's MoE layers, the
+        # learned cost scale standing in for the other stages'.
         self._moe_routing: MoERoutingPredictor | None = None
         self._tree_lam: torch.Tensor | None = None
-        if spec is not None and spec.tree_selection == "df2t_moe":
+        if (
+            spec is not None
+            and spec.tree_selection == "df2t_moe"
+            and self.speculator is not None
+        ):
             self._moe_routing = build_moe_routing_predictor(
                 self.model,
                 self.vllm_config,
