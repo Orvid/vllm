@@ -171,6 +171,9 @@ def _trim(width: int, sched: SchedulerOutput, structured: bool = False):
         _tree_width_ctl=types.SimpleNamespace(select=lambda slots: width),
         req_states=types.SimpleNamespace(req_id_to_index={"a": 0, "b": 1, "c": 2}),
     )
+    runner._select_tree_width = types.MethodType(
+        GPUModelRunner._select_tree_width, runner
+    )
     return GPUModelRunner._tree_trim_verify_width(runner, sched)
 
 

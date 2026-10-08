@@ -804,7 +804,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if spec is not None and spec.use_tree() and spec.adaptive_tree_width:
             ladder = spec.tree_verify_width_ladder
             self._decode_query_lens = {1 + w for w in ladder}
-            if len(ladder) > 1:
+            # Under pipeline parallelism the drafting (last) stage chooses
+            # the width and reports only that many drafts to the scheduler,
+            # so every stage verifies the same width.
+            if len(ladder) > 1 and self.is_last_pp_rank:
                 self._tree_width_ctl = TreeWidthController(
                     ladder, self.max_num_reqs, self.device
                 )
@@ -1634,20 +1637,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
         if (
             ctl is None
+            or getattr(self, "use_pp", False)
             or not draft_tokens
             or scheduler_output.has_structured_output_requests
         ):
+            # (Under pipeline parallelism the drafts were already cut to the
+            # width when reported; see _select_tree_width.)
             return scheduler_output
         slots = np.fromiter(
             map(self.req_states.req_id_to_index.__getitem__, draft_tokens),
             dtype=np.int64,
             count=len(draft_tokens),
         )
-        width = ctl.select(slots)
-        lam = getattr(self, "_tree_lam", None)
-        if lam is not None:
-            lam.fill_(ctl.throughput * ctl.expert_cost_scale)
-            self.speculator.tree_selector.aware_nodes.fill_(width)  # type: ignore[union-attr]
+        width = self._select_tree_width(slots)
         if all(len(drafts) <= width for drafts in draft_tokens.values()):
             return scheduler_output
         num_scheduled_tokens = dict(scheduler_output.num_scheduled_tokens)
@@ -1666,6 +1668,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output.total_num_scheduled_tokens - num_cut
             ),
         )
+
+    def _select_tree_width(self, slots: np.ndarray) -> int:
+        """The adaptive verify width for requests ``slots``, and (for
+        expert-aware selection) the selector's price of an expert and node
+        budget for the trees it drafts next."""
+        ctl = self._tree_width_ctl
+        assert ctl is not None
+        width = ctl.select(slots)
+        lam = getattr(self, "_tree_lam", None)
+        if lam is not None:
+            lam.fill_(ctl.throughput * ctl.expert_cost_scale)
+            self.speculator.tree_selector.aware_nodes.fill_(width)  # type: ignore[union-attr]
+        return width
 
     @torch.inference_mode()
     def _profile_tree_width_costs(self, ctl: TreeWidthController) -> None:
@@ -3940,6 +3955,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
+        pp_tree_width: int | None = None
         if self.speculator is not None:
             assert self.sampler is not None
             if isinstance(self.speculator, DraftModelSpeculator):
@@ -3959,6 +3975,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler._get_contexts(input_batch.idx_mapping),
                     self.sampler.watermarking.gpu[input_batch.idx_mapping],
                 )
+            if (
+                self.use_pp
+                and self._tree_width_ctl is not None
+                and not input_batch.has_structured_output_reqs
+            ):
+                # Pipeline parallelism: choose the next verify width now and
+                # report only that many drafts, so the scheduler schedules the
+                # same width on every stage.
+                pp_tree_width = self._select_tree_width(input_batch.idx_mapping_np)
             with use_workspace_lane(self._draft_workspace_lane):
                 draft_tokens = self.speculator.propose(
                     input_batch,
@@ -3998,7 +4023,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self._store_trees(input_batch, tree_packed)
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping],
+                self.req_states.draft_tokens[input_batch.idx_mapping][
+                    :, :pp_tree_width
+                ],
                 tree_packed=(
                     tree_packed if input_batch.has_structured_output_reqs else None
                 ),
