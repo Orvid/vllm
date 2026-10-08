@@ -1371,6 +1371,7 @@ def _fake_runner(spec, req_states, device, attn_groups, kv_cache_config=None):
         "_stage_tree_fa4_mask",
         "_fa4_tree_verify_layer_names",
         "_fa4_tree_page_sizes",
+        "_has_masked_tree_groups",
         "_tree_window",
         "_attach_tree_fa4_mask",
         "_attach_fa4_tree_mask_impl",

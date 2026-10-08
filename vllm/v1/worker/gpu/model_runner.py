@@ -2672,6 +2672,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     names.update(group.layer_names)
         return names
 
+    def _has_masked_tree_groups(self) -> bool:
+        """Whether an attention group runs on a backend the runner masks for
+        tree verification (FlashAttention / FlexAttention)."""
+        from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+        from vllm.v1.attention.backends.flex_attention import FlexAttentionBackend
+
+        masked = {FlashAttentionBackend.get_name(), FlexAttentionBackend.get_name()}
+        return any(
+            group.backend.get_name() in masked
+            for groups in self.attn_groups
+            for group in groups
+        )
+
     def _fa4_tree_page_sizes(self, target_layers: set[str]) -> bool:
         """Whether a KV cache group backs at least one tree-verify layer.
 
@@ -2738,6 +2751,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Only the target verify group(s) (see _fa4_tree_verify_layer_names)
         # carry the tree block; a second FA group's metadata stays untouched.
         target_layers = self._fa4_tree_verify_layer_names()
+        if not target_layers and not self._has_masked_tree_groups():
+            # No FlashAttention / FlexAttention layer: every group verifies
+            # trees through its own metadata (_check_tree_attention_support).
+            return
         if target_layers and not self._fa4_tree_page_sizes(target_layers):
             # The FA4 paged mask_mod's kv_idx is the absolute logical
             # block-slot only when its page size is known (the fastdiv divisor
