@@ -151,6 +151,33 @@ def test_each_timed_step_gets_the_expert_cost_routed_within_it(monkeypatch):
     assert seen[:3] == [3.0, 5.0, 0.0]
 
 
+def test_steps_spanning_other_work_are_not_cost_samples(monkeypatch):
+    """An interval covering a prefill or an idle engine (``timed=False``)
+    never reaches the width's cost; the next pure tree step does."""
+    ctl = TreeWidthController([2, 4], max_num_reqs=4, device=DEVICE)
+    seen: list[int] = []
+    monkeypatch.setattr(ctl, "observe_step_time", lambda j, n, ms, x: seen.append(j))
+    ctl._time_step(0, 1)
+    ctl._time_step(1, 1, timed=False)  # closes width 0's interval: untimed
+    ctl._time_step(0, 1)  # closes width 1's interval: a sample
+    for _ in range(2):
+        torch.accelerator.synchronize()
+        ctl._time_step(0, 1)
+    assert seen == [1, 0]
+
+
+def test_rarely_verified_widths_are_explored():
+    """A width ruled out by a misleading early cost still gets verified now
+    and then until it has enough samples to be judged."""
+    ctl = TreeWidthController([2, 4], max_num_reqs=4, device=DEVICE)
+    ctl.set_cost_table(build_cost_table({(2, 1): 1.0, (4, 1): 1.0}, [2, 4], 4))
+    ctl.observe_step_time(0, 1, 50.0)  # width 2 looks 50x dearer
+    _record(ctl, [0])
+    chosen = [ctl.select(np.array([0])) for _ in range(64)]
+    assert chosen.count(2) == 2  # every 32nd selection explores it
+    assert set(chosen) == {2, 4}
+
+
 def test_new_request_never_reads_previous_occupant_curve():
     ctl = TreeWidthController([2, 4], max_num_reqs=4, device=DEVICE)
     ctl.set_cost_table(build_cost_table({(2, 1): 0.5, (4, 1): 1.0}, [2, 4], 4))
@@ -168,7 +195,7 @@ def _trim(width: int, sched: SchedulerOutput, structured: bool = False):
 
     sched.has_structured_output_requests = structured
     runner = types.SimpleNamespace(
-        _tree_width_ctl=types.SimpleNamespace(select=lambda slots: width),
+        _tree_width_ctl=types.SimpleNamespace(select=lambda slots, timed: width),
         req_states=types.SimpleNamespace(req_id_to_index={"a": 0, "b": 1, "c": 2}),
     )
     runner._select_tree_width = types.MethodType(

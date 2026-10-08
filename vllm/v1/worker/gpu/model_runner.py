@@ -1666,6 +1666,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             or not draft_tokens
             or scheduler_output.has_structured_output_requests
         ):
+            self._tree_step_pure = False
             return scheduler_output
         slots = np.fromiter(
             map(self.req_states.req_id_to_index.__getitem__, draft_tokens),
@@ -1680,7 +1681,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 return scheduler_output
             width = int(chosen.max())
         else:
-            width = self._select_tree_width(slots)
+            # The previous step's interval ends here: it was a sample of its
+            # width's cost if it verified trees only.
+            timed = getattr(self, "_tree_step_pure", False)
+            self._tree_step_pure = (
+                len(draft_tokens) == len(scheduler_output.num_scheduled_tokens)
+                and not scheduler_output.scheduled_new_reqs
+            )
+            width = self._select_tree_width(slots, timed)
         if all(len(drafts) <= width for drafts in draft_tokens.values()):
             return scheduler_output
         num_scheduled_tokens = dict(scheduler_output.num_scheduled_tokens)
@@ -1700,13 +1708,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ),
         )
 
-    def _select_tree_width(self, slots: np.ndarray) -> int:
+    def _select_tree_width(self, slots: np.ndarray, timed: bool) -> int:
         """The adaptive verify width for requests ``slots``, and (for
         expert-aware selection) the selector's price of an expert and node
-        budget for the trees it drafts next."""
+        budget for the trees it drafts next. ``timed``: whether the step
+        since the previous selection was a pure tree decode step."""
         ctl = self._tree_width_ctl
         assert ctl is not None
-        width = ctl.select(slots)
+        width = ctl.select(slots, timed)
         lam = getattr(self, "_tree_lam", None)
         if lam is not None:
             lam.fill_(ctl.throughput * ctl.expert_cost_scale)
@@ -4036,7 +4045,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ):
                 # Pipeline parallelism: choose the next verify width as the
                 # trees are drafted; it travels with them to every stage.
-                pp_tree_width = self._select_tree_width(input_batch.idx_mapping_np)
+                pp_tree_width = self._select_tree_width(
+                    input_batch.idx_mapping_np,
+                    timed=(
+                        not input_batch.has_prefill
+                        and input_batch.tree_batch is not None
+                    ),
+                )
             with use_workspace_lane(self._draft_workspace_lane):
                 draft_tokens = self.speculator.propose(
                     input_batch,

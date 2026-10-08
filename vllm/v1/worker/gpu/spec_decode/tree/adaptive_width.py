@@ -64,6 +64,9 @@ _MAX_EXPERT_SCALE = 8.0
 _SNAP_RING = 64
 # Log the width choice's inputs this often (in selections).
 _LOG_EVERY = 256
+# Every this many selections, verify a width with fewer cost samples than this.
+_EXPLORE_EVERY = 32
+_EXPLORE_MIN_SAMPLES = 8
 
 
 @triton.jit
@@ -331,10 +334,13 @@ class TreeWidthController:
         assert self.cost_ms is not None
         return self.cost_ms[:, min(n, self.cost_ms.shape[1] - 1)] + self.cost_delta_ms
 
-    def _time_step(self, j: int, n: int) -> None:
-        """Mark this step's start on the stream; the interval from the
-        previous mark is the previous tree step's real GPU time, folded into
-        its width's correction once the marks have landed."""
+    def _time_step(self, j: int, n: int, timed: bool = True) -> None:
+        """Mark a step boundary on the stream; the interval from the previous
+        mark is a tree step's real GPU time, folded into its width's
+        correction once the marks have landed. ``timed`` says whether the
+        interval this mark closes covered a pure tree decode step (not a
+        prefill, nor an engine idle between requests), so it is a sample of
+        its width's cost."""
         snap = -1
         if self._expert_meter is not None:
             snap = self._num_snaps
@@ -342,7 +348,7 @@ class TreeWidthController:
             self._snaps[snap % _SNAP_RING].copy_(
                 self._expert_meter[0], non_blocking=True
             )
-        if self._open is not None:
+        if self._open is not None and timed:
             self._timed.append((*self._open, self._next_event, snap))
         self._open = (self._next_event, j, n, snap)
         self._next_event.record()
@@ -399,8 +405,15 @@ class TreeWidthController:
         w = self._fit_n / (self._fit_n + _FIT_PRIOR_STEPS)
         self.expert_cost_scale = w * slope + (1.0 - w)
 
-    def select(self, slots: np.ndarray) -> int:
-        """Verify width for a decode batch over request-state ``slots``."""
+    def select(self, slots: np.ndarray, timed: bool = True) -> int:
+        """Verify width for a decode batch over request-state ``slots``.
+
+        Args:
+            slots: The batch's request-state slots.
+            timed: Whether the step since the previous selection was a pure
+                tree decode step, whose GPU time samples its width's cost.
+
+        """
         n = len(slots)
         if self.cost_ms is None or n == 0 or len(self.widths) == 1:
             return self.B
@@ -421,7 +434,7 @@ class TreeWidthController:
                     "verifying the full width",
                     self._num_blind,
                 )
-            self._time_step(len(self.widths) - 1, n)
+            self._time_step(len(self.widths) - 1, n, timed)
             return self.B
         expected = known.sum(axis=0) + self._mean_curve * (n - len(known))
         cost = self.step_cost_ms(n)
@@ -431,6 +444,12 @@ class TreeWidthController:
         # is worth in tokens (expert-aware tree selection prices with it).
         self.throughput = float(rate[j])
         self._num_selects += 1
+        if self._num_selects % _EXPLORE_EVERY == 0:
+            # Now and then verify a width whose cost has few samples, so one
+            # early misleading sample cannot rule it out for good.
+            k = int(np.argmin(self._cost_samples))
+            if self._cost_samples[k] < _EXPLORE_MIN_SAMPLES:
+                j = k
         if self._num_selects % _LOG_EVERY == 0:
             logger.info(
                 "Tree width: %d reqs, widths %s, expected tokens %s, step ms %s "
@@ -443,7 +462,7 @@ class TreeWidthController:
                 self.widths[j],
                 self.expert_cost_scale,
             )
-        self._time_step(j, n)
+        self._time_step(j, n, timed)
         return self.widths[j]
 
 
