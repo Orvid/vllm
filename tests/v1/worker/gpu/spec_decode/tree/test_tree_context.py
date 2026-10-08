@@ -37,6 +37,20 @@ def test_row_parents_chain_rows_and_tree_rows():
     assert ctx.tree_width[:2].tolist() == [0, 4]
 
 
+def test_tree_rows_know_their_depth_anchor_and_path():
+    """A tree row's path lists its ancestors by depth, ending with itself, so
+    position-keyed lookups can resolve positions inside the tree; chain rows
+    and anchors have no path."""
+    ctx = TreeVerifyContext(16, 4, max_depth=3, device=DEVICE)
+    _batch(ctx)
+    assert ctx.row_depth[:8].tolist() == [0, 0, 0, 0, 1, 2, 1, 3]
+    assert ctx.row_anchor[:8].tolist() == [-1, -1, -1, -1, 3, 3, 3, 3]
+    paths = {
+        row: ctx.path_rows[row, : ctx.row_depth[row]].tolist() for row in range(4, 8)
+    }
+    assert paths == {4: [4], 5: [4, 5], 6: [6], 7: [4, 5, 7]}
+
+
 def test_commit_lists_anchor_then_accepted_nodes():
     """The committed rows of a tree request are its anchor then the accepted
     nodes shallowest first; a request without a tree commits nothing."""

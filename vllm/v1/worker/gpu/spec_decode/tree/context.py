@@ -28,21 +28,29 @@ from vllm.triton_utils import tl, triton
 @triton.jit
 def _fill_row_parents_kernel(
     row_parent_ptr,  # [max_tokens] int32
+    row_depth_ptr,  # [max_tokens] int32
+    row_anchor_ptr,  # [max_tokens] int32
+    path_rows_ptr,  # [max_tokens, D] int32
     tree_width_ptr,  # [max_num_reqs] int32
     query_start_loc_ptr,  # [R + 1] int32
     parents_ptr,  # [R, W] int64 parent arena per node (-1 = the anchor)
     parents_stride,
     widths_ptr,  # [R] int64 verify width per request (0 = no tree)
+    D: tl.constexpr,  # path_rows columns (the deepest node a tree can have)
     BLOCK: tl.constexpr,
     MAX_NODE: tl.constexpr,
+    DP: tl.constexpr,  # next power of two >= D
 ):
     r = tl.program_id(0).to(tl.int64)
     qs = tl.load(query_start_loc_ptr + r)
     qe = tl.load(query_start_loc_ptr + r + 1)
     for off in range(qs, qe, BLOCK):
         rows = off + tl.arange(0, BLOCK)
+        m = rows < qe
         parent = tl.where(rows == qs, -1, rows - 1)
-        tl.store(row_parent_ptr + rows, parent.to(tl.int32), mask=rows < qe)
+        tl.store(row_parent_ptr + rows, parent.to(tl.int32), mask=m)
+        tl.store(row_depth_ptr + rows, 0, mask=m)
+        tl.store(row_anchor_ptr + rows, -1, mask=m)
     n = tl.load(widths_ptr + r).to(tl.int32)
     tl.store(tree_width_ptr + r, n)
     if n > 0:
@@ -55,6 +63,27 @@ def _fill_row_parents_kernel(
         tl.store(
             row_parent_ptr + block_start + 1 + cols, parent.to(tl.int32), mask=live
         )
+        # Each node's path: walk its parents to the anchor (arena order puts a
+        # parent before its children, so at most D steps), collecting the
+        # ancestor row at each step, then store them by depth.
+        tl.debug_barrier()
+        k = tl.arange(0, DP)
+        for a in range(0, n):
+            row = block_start + 1 + a
+            ancestors = tl.full([DP], -1, tl.int32)
+            cur = row.to(tl.int32)
+            steps = 0
+            while (cur != block_start) & (steps < D):
+                ancestors = tl.where(k == steps, cur, ancestors)
+                cur = tl.load(row_parent_ptr + cur)
+                steps += 1
+            # ancestors[0] is the row itself (depth = steps), ancestors[i] its
+            # ancestor at depth steps - i.
+            depth_of = steps - k
+            dst = tl.where((k < steps) & (depth_of >= 1), depth_of - 1, D)
+            tl.store(path_rows_ptr + row * D + dst, ancestors, mask=dst < D)
+            tl.store(row_depth_ptr + row, steps)
+            tl.store(row_anchor_ptr + row, block_start.to(tl.int32))
 
 
 @triton.jit
@@ -162,6 +191,22 @@ class TreeVerifyContext:
         self.row_parent = torch.full(
             (max_num_tokens,), -1, dtype=torch.int32, device=device
         )
+        # Per row: its depth in its tree (0 for chain rows and anchors), its
+        # tree's anchor row (-1 for chain rows), and its path: path_rows[i, k-1]
+        # is the row of i's ancestor at depth k (i itself at its own depth).
+        # Mechanisms that look rows up by sequence position (sliding windows,
+        # compressors) resolve a tree row's position C + k through it, C being
+        # its anchor's position.
+        self.row_depth = torch.zeros(max_num_tokens, dtype=torch.int32, device=device)
+        self.row_anchor = torch.full(
+            (max_num_tokens,), -1, dtype=torch.int32, device=device
+        )
+        self.path_rows = torch.full(
+            (max_num_tokens, max(self.max_depth, 1)),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
         self.tree_width = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
         self.num_reqs = 0
         # Commit buffers, written after each walk.
@@ -196,15 +241,21 @@ class TreeVerifyContext:
         if num_reqs == 0:
             return
         assert parents.stride(1) == 1
+        d = self.path_rows.shape[1]
         _fill_row_parents_kernel[(num_reqs,)](
             self.row_parent,
+            self.row_depth,
+            self.row_anchor,
+            self.path_rows,
             self.tree_width,
             query_start_loc,
             parents,
             parents.stride(0),
             widths,
+            D=d,
             BLOCK=128,
             MAX_NODE=triton.next_power_of_2(max(parents.shape[1], 1)),
+            DP=triton.next_power_of_2(d),
         )
 
     def build_commit(

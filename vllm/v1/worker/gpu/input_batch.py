@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -131,6 +131,9 @@ class InputBatch:
     # The same trees as batched [num_reqs, W] device tensors (``trees`` holds
     # per-request views of them).
     tree_batch: "TreeBatch | None" = None
+    # The batch's per-row tree structure (a ``TreeVerifyContext``, filled for
+    # this step) when it verifies trees, for tree-aware attention builders.
+    tree_verify: Any = None
 
     @classmethod
     def make_dummy(

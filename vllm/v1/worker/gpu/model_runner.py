@@ -1017,6 +1017,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def get_kv_cache_spec(self):
         return get_kv_cache_spec(self.vllm_config)
 
+    def _check_tree_attention_support(self, draft_layers: set[str]) -> None:
+        """Refuse tree verification when a target attention group could not
+        keep tree rows apart: its builder must build tree-correct metadata
+        (``supports_tree_verify``), or the runner must mask it (FlashAttention
+        / FlexAttention). Stateful mixers commit through
+        ``TreeRecurrentLayers`` instead."""
+        spec = self.speculative_config
+        if spec is None or not spec.use_tree():
+            return
+        from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+        from vllm.v1.attention.backends.flex_attention import FlexAttentionBackend
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        masked = {FlashAttentionBackend.get_name(), FlexAttentionBackend.get_name()}
+        unsupported = sorted(
+            {
+                group.backend.get_name()
+                for groups in self.attn_groups
+                for group in groups
+                if not set(group.layer_names) <= draft_layers
+                and group.backend.get_name() not in masked
+                and not isinstance(group.kv_cache_spec, MambaSpec)
+                and not getattr(
+                    group.backend.get_builder_cls(), "supports_tree_verify", False
+                )
+            }
+        )
+        if unsupported:
+            raise ValueError(
+                "speculative tree verification needs every target attention "
+                "backend to keep tree rows apart, but these do not support it: "
+                f"{unsupported}."
+            )
+
     def initialize_kv_cache(
         self,
         kv_cache_config: KVCacheConfig,
@@ -1085,6 +1119,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.device,
                 draft_layer_names=draft_attn_layer_names,
             )
+        self._check_tree_attention_support(draft_attn_layer_names or set())
         additional_attn_cg_support = self.model_state.get_additional_cg_support()
         attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
         # The speculator clears the flag at load time when the checkpoint has
@@ -2242,6 +2277,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             slot_positions=slot_positions,
             trees=trees,
             tree_batch=tree_batch,
+            tree_verify=self._tree_ctx if tree_batch is not None else None,
             is_padding=is_padding,
             logits_indices=logits_indices,
             cu_num_logits=cu_num_logits,

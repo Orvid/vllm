@@ -457,6 +457,12 @@ class CommonAttentionMetadata:
     where bidirectional attention should apply. None for text-only
     batches or non-PrefixLM models. A request's ranges must not overlap."""
 
+    tree_verify: Any = None
+    """The batch's tree-verify structure (a ``TreeVerifyContext``: per-row
+    parent, depth, anchor and path rows) when it verifies speculative trees,
+    else None. Builders that declare ``supports_tree_verify`` build
+    tree-correct metadata from it."""
+
     rswa_prefix_lens: torch.Tensor | None = None
     """(batch_size,) per-request prefix length (prompt/image token count) for
     Reference Sliding Window Attention (R-SWA). Tokens with logical index below
@@ -589,6 +595,12 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
     # Whether all step-dependent draft decode metadata can be updated in place,
     # allowing one metadata build to be reused across autoregressive draft steps.
     supports_draft_decode_metadata_update: bool = False
+    # Does this builder build tree-correct metadata from
+    # ``CommonAttentionMetadata.tree_verify`` (each speculative-tree row sees
+    # its context and its own ancestors, not its siblings)? Speculative tree
+    # verification refuses target layers whose builder does not, unless the
+    # runner masks them itself (FlashAttention / FlexAttention).
+    supports_tree_verify: ClassVar[bool] = False
 
     @abstractmethod
     def __init__(

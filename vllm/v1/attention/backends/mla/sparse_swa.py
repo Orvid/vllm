@@ -38,6 +38,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     get_kv_quant_mode,
 )
+from vllm.v1.worker.gpu.spec_decode.tree.indexed import fill_tree_window_indices
 
 # DeepseekV4 decode layer types, keyed by compress_ratio. Each type has a distinct
 # (topk, extra_topk, extra_page_block_size) config, so they cannot share a
@@ -437,6 +438,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
     reorder_batch_threshold: int | None = None
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     supports_draft_decode_metadata_update = True
+    # Tree rows' decode index lists hold their context window and path.
+    supports_tree_verify: ClassVar[bool] = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -464,6 +467,12 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             2 if (spec_config is not None and spec_config.parallel_drafting) else 1
         )
         self.decode_threshold = 1 + spec_mult * self.num_speculative_tokens
+        if spec_config is not None and spec_config.use_tree():
+            # A tree verify block (anchor + nodes) is a decode: its rows take
+            # per-row index lists, which keep tree rows apart.
+            self.decode_threshold = max(
+                self.decode_threshold, 1 + spec_config.num_draft_rows_per_req
+            )
         self.reorder_batch_threshold = None
 
         hf_config = self.vllm_config.model_config.hf_config
@@ -673,6 +682,24 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     num_tokens=num_decode_tokens,
                     token_offset=0,
                 )
+                tree_verify = common_attn_metadata.tree_verify
+                if tree_verify is not None:
+                    # Tree nodes see their context window and their path,
+                    # not the rows before them.
+                    fill_tree_window_indices(
+                        decode_swa_indices,
+                        self.decode_swa_lens,
+                        tree_verify,
+                        num_decode_tokens,
+                        slot_mapping,
+                        query_start_loc,
+                        seq_lens,
+                        token_to_req_indices,
+                        block_table,
+                        self.block_size,
+                        self.window_size,
+                        replay_start,
+                    )
 
         # Vision variant: per-token in-image visibility for prefill tokens.
         # Decode tokens are always past the image spans (spans are prefilled
