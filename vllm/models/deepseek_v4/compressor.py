@@ -20,6 +20,9 @@ from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     _SAVE_PARTIAL_STATES_KERNEL,
 )
+from vllm.models.deepseek_v4.common.ops.tree_compress import (
+    tree_compress_norm_rope_store,
+)
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -87,10 +90,15 @@ class CompressorMetadata:
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
     num_decode_tokens: int | None = None
     c128_boundary: bool | None = None
+    # The batch's TreeVerifyContext when it verifies speculative trees.
+    tree_verify: Any = None
 
 
 class CompressorMetadataBuilder(AttentionMetadataBuilder):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+    # Tree rows' states go to their own slots; the compressor pools tree
+    # boundary entries along their paths (tree_compress_norm_rope_store).
+    supports_tree_verify: ClassVar[bool] = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -133,6 +141,7 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
                 if self.block_size == 8 and not async_spec_decode
                 else None
             ),
+            tree_verify=common_attn_metadata.tree_verify,
         )
 
 
@@ -496,3 +505,34 @@ class DeepseekCompressor(nn.Module):
             scale_dim=self._scale_dim,
             **extra_kwargs,
         )
+        if state_metadata.tree_verify is not None:
+            # Tree boundary rows pool their own paths (the pass above pooled
+            # positions linearly) into their nodes' scratch entries.
+            assert not store_full_kv, (
+                "speculative tree verification needs the fp8_ds_mla KV cache "
+                "layout for DeepSeek-V4"
+            )
+            tree_compress_norm_rope_store(
+                state_metadata.tree_verify,
+                num_actual,
+                state_cache,
+                positions,
+                slot_mapping,
+                token_to_req_indices,
+                block_table,
+                block_size,
+                state_width,
+                cos_sin_cache,
+                kv_cache,
+                k_cache_metadata.slot_mapping,
+                self.head_dim,
+                self.rope_head_dim,
+                self.compress_ratio,
+                self.overlap,
+                self.use_fp4_cache,
+                self.norm.weight,
+                self.rms_norm_eps,
+                self._quant_block,
+                self._token_stride,
+                self._scale_dim,
+            )

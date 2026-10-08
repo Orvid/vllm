@@ -47,6 +47,10 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
 )
+from vllm.v1.worker.gpu.spec_decode.tree.indexed import (
+    apply_tree_compressed_slots,
+    apply_tree_row_seq_lens,
+)
 
 logger = init_logger(__name__)
 
@@ -648,6 +652,17 @@ class DeepseekV32IndexerMetadata:
     decode: DeepSeekV32IndexerDecodeMetadata | None = None
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
 
+    # Speculative tree verification (decode rows): the batch's
+    # TreeVerifyContext, and what locating a tree row's in-tree compressed
+    # entries (its path's scratch entries) takes.
+    tree_verify: Any = None
+    tree_max_nodes: int = 0
+    # Compression ratio of the entries kept in tree scratch (0 = none).
+    tree_scratch_ratio: int = 0
+    positions: torch.Tensor | None = None
+    token_to_req: torch.Tensor | None = None
+    entry_block_table: torch.Tensor | None = None
+
 
 @triton.jit(do_not_specialize=["num_reqs", "num_actual_tokens", "num_tokens"])
 def _kpool_tail_slot_mapping_kernel(
@@ -858,6 +873,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     # so this is None; its own split uses self.decode_threshold.
     reorder_batch_threshold: int | None = None
     requires_block_table_width = True
+    # Tree rows score their context's compressed entries plus their own
+    # path's in-tree entries (scratch), never their siblings'.
+    supports_tree_verify = True
 
     @classmethod
     def get_cudagraph_support(
@@ -891,6 +909,20 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         next_n = self.num_speculative_tokens + 1
         self.decode_threshold = next_n
         self.reorder_batch_threshold = None
+        spec_config = self.vllm_config.speculative_config
+        self.tree_max_nodes = 0
+        self.tree_scratch_ratios: tuple[int, ...] = ()
+        if spec_config is not None and spec_config.use_tree():
+            # A tree verify block (anchor + nodes) is a decode: its rows get
+            # per-row lengths and candidates (flattened decode path).
+            self.decode_threshold = max(next_n, 1 + spec_config.num_draft_rows_per_req)
+            self.tree_max_nodes = spec_config.num_draft_rows_per_req
+            self.tree_scratch_ratios = spec_config.tree_scratch_ratios
+        self.tree_token_to_req = torch.zeros(
+            scheduler_config.max_num_batched_tokens,
+            dtype=torch.int32,
+            device=self.device,
+        )
         self.use_flattening = _use_flattening(self.vllm_config)
         self.supports_varlen = _supports_varlen_paged_mqa_logits()
         logger.info_once(
@@ -1318,6 +1350,20 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
             )
+            if common_attn_metadata.tree_verify is not None:
+                assert self.pcp_world_size == 1
+                apply_tree_compressed_slots(
+                    compressed_slot_mapping,
+                    common_attn_metadata.tree_verify,
+                    num_tokens,
+                    common_attn_metadata.positions,
+                    common_attn_metadata.token_to_req_indices(self.tree_token_to_req),
+                    indexer_block_table,
+                    self.kv_cache_spec.num_states,
+                    self.compress_ratio,
+                    self.tree_max_nodes,
+                    self.compress_ratio in self.tree_scratch_ratios,
+                )
             if self.pcp_world_size > 1:
                 compressed_slot_mapping = get_pcp_group().all_gather(
                     self.compressed_slot_mapping_buffer[:padded_num_tokens],
@@ -1537,6 +1583,21 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     )
                 )
 
+            tree_verify = common_attn_metadata.tree_verify
+            if tree_verify is not None:
+                # Tree rows' lengths follow their depth (true position), so a
+                # row's candidates are its context's compressed entries plus
+                # its own path's in-tree ones (see sparse_attn_indexer).
+                assert not use_native or (seq_lens.dim() == 1 or write_is_uniform), (
+                    "speculative tree rows need per-row indexer lengths"
+                )
+                apply_tree_row_seq_lens(
+                    seq_lens.reshape(-1),
+                    tree_verify,
+                    common_attn_metadata.positions,
+                    num_decode_tokens,
+                )
+
             if self.compress_ratio > 1:
                 kernel_block_size = self.kernel_block_size
                 if (
@@ -1625,6 +1686,16 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             prefill=prefill_metadata,
             decode=decode_metadata,
         )
+        if common_attn_metadata.tree_verify is not None:
+            attn_metadata.tree_verify = common_attn_metadata.tree_verify
+            attn_metadata.tree_max_nodes = self.tree_max_nodes
+            if self.compress_ratio in self.tree_scratch_ratios:
+                attn_metadata.tree_scratch_ratio = self.compress_ratio
+            attn_metadata.positions = common_attn_metadata.positions
+            attn_metadata.token_to_req = common_attn_metadata.token_to_req_indices(
+                self.tree_token_to_req
+            )
+            attn_metadata.entry_block_table = indexer_block_table
 
         return attn_metadata
 

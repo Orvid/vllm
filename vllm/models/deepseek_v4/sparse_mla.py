@@ -30,6 +30,10 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.worker.gpu.spec_decode.tree.indexed import (
+    apply_tree_compressed_slots,
+    remap_tree_compressed_indices,
+)
 
 # Pad C128A topk width to this alignment. 128 covers both h_q=64 (B_TOPK=64) and
 # h_q=128 (B_TOPK=128). FlashMLA decode asserts extra_topk % B_TOPK == 0;
@@ -117,12 +121,49 @@ class DeepseekV4FlashMLAMetadata(AttentionMetadata):
     c128a_decode_topk_lens: torch.Tensor | None = None
     # Prefill: local topk indices (used by combine_topk_swa_indices).
     c128a_prefill_topk_indices: torch.Tensor | None = None
+    # The batch's TreeVerifyContext when it verifies speculative trees: tree
+    # rows' compressed indices past their context name their path's scratch
+    # entries.
+    tree_verify: Any = None
+    tree_max_nodes: int = 0
+    tree_scratch: bool = False
+    tree_positions: torch.Tensor | None = None
+
+    def remap_tree_decode_indices(
+        self,
+        global_indices: torch.Tensor,
+        local_indices: torch.Tensor,
+        num_decode_tokens: int,
+        token_to_req: torch.Tensor,
+        entry_block_size: int,
+        compress_ratio: int,
+    ) -> None:
+        """Point tree rows' selected in-tree compressed entries at their
+        path's scratch entries (no-op for batches without trees)."""
+        if self.tree_verify is None or not self.tree_scratch:
+            return
+        assert self.tree_positions is not None
+        remap_tree_compressed_indices(
+            global_indices,
+            local_indices,
+            self.tree_verify,
+            num_decode_tokens,
+            self.tree_positions,
+            token_to_req,
+            self.block_table,
+            entry_block_size,
+            compress_ratio,
+            self.tree_max_nodes,
+        )
 
 
 class DeepseekV4SparseMLAMetadataBuilder(
     AttentionMetadataBuilder[DeepseekV4FlashMLAMetadata]
 ):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    # Tree rows' compressed entries: written to per-node scratch entries and
+    # selected through their own path (remap_tree_decode_indices).
+    supports_tree_verify: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -137,6 +178,17 @@ class DeepseekV4SparseMLAMetadataBuilder(
         # supports_spec_as_decode=True) as decodes; longer queries go to prefill.
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
         self.topk_tokens = self.model_config.hf_config.index_topk
+        spec_config = vllm_config.speculative_config
+        self.tree_max_nodes = 0
+        self.tree_scratch_ratios: tuple[int, ...] = ()
+        if spec_config is not None and spec_config.use_tree():
+            # Tree verify blocks are decodes (per-row index lists).
+            self.reorder_batch_threshold = max(
+                self.reorder_batch_threshold or 1,
+                1 + spec_config.num_draft_rows_per_req,
+            )
+            self.tree_max_nodes = spec_config.num_draft_rows_per_req
+            self.tree_scratch_ratios = spec_config.tree_scratch_ratios
 
         max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.req_id_per_token_buffer = torch.empty(
@@ -203,6 +255,19 @@ class DeepseekV4SparseMLAMetadataBuilder(
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
             )
+            if cm.tree_verify is not None:
+                apply_tree_compressed_slots(
+                    slot_mapping,
+                    cm.tree_verify,
+                    cm.num_actual_tokens,
+                    cm.positions,
+                    req_id_per_token,
+                    cm.block_table_tensor,
+                    int(self.kv_cache_spec.num_states),
+                    self.compress_ratio,
+                    self.tree_max_nodes,
+                    self.compress_ratio in self.tree_scratch_ratios,
+                )
 
         c128a_fields: dict[str, torch.Tensor | None] = {}
         if self.compress_ratio == 128:
@@ -224,6 +289,10 @@ class DeepseekV4SparseMLAMetadataBuilder(
             ),
             c128a_decode_topk_lens=c128a_fields.get("c128a_decode_topk_lens"),
             c128a_prefill_topk_indices=c128a_fields.get("c128a_prefill_topk_indices"),
+            tree_verify=cm.tree_verify,
+            tree_max_nodes=self.tree_max_nodes,
+            tree_scratch=self.compress_ratio in self.tree_scratch_ratios,
+            tree_positions=cm.positions if cm.tree_verify is not None else None,
         )
 
     def _build_c128a_metadata(

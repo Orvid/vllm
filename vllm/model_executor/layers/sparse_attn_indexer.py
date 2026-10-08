@@ -46,6 +46,7 @@ from vllm.v1.attention.backends.mla.indexer import (
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
+from vllm.v1.worker.gpu.spec_decode.tree.indexed import tree_indexer_logits
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
@@ -735,6 +736,26 @@ def sparse_attn_indexer(
                 indices=decode_metadata.indices,
             )
         num_rows = logits.shape[0]
+        if attn_metadata_narrowed.tree_scratch_ratio:
+            assert not needs_padded_path and not use_fp4_cache, (
+                "speculative tree rows need flattened FP8 indexer decode"
+            )
+            assert attn_metadata_narrowed.positions is not None
+            assert attn_metadata_narrowed.token_to_req is not None
+            assert attn_metadata_narrowed.entry_block_table is not None
+            tree_indexer_logits(
+                logits,
+                q_quant,
+                weights,
+                kv_cache,
+                attn_metadata_narrowed.tree_verify,
+                num_decode_tokens,
+                attn_metadata_narrowed.positions,
+                attn_metadata_narrowed.token_to_req,
+                attn_metadata_narrowed.entry_block_table,
+                attn_metadata_narrowed.tree_scratch_ratio,
+                attn_metadata_narrowed.tree_max_nodes,
+            )
         if candidate_blocks is not None:
             # Two-level selection (v4.1) on the decode logits; columns are
             # request-local compressed positions. seq_lens is (B, next_n)

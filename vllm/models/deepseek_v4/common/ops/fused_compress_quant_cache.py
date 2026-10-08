@@ -248,6 +248,59 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
 
     compressed_kv = tl.sum(kv * score, axis=0)  # [TRITON_BLOCK_SIZE] fp32
 
+    kv_slot_idx = tl.load(kv_slot_mapping_ptr + token_idx)
+    if kv_slot_idx < 0:
+        return
+    _sparse_attn_norm_rope_store(
+        compressed_kv,
+        position,
+        kv_slot_idx,
+        rms_norm_weight_ptr,
+        rms_norm_eps,
+        cos_sin_cache_ptr,
+        cos_sin_stride,
+        k_cache_ptr,
+        kv_cache_block_size,
+        HEAD_SIZE,
+        TRITON_BLOCK_SIZE,
+        COMPRESS_RATIO,
+        ROPE_HEAD_DIM,
+        FP8_MAX,
+        QUANT_BLOCK,
+        TOKEN_STRIDE,
+        SCALE_DIM,
+        KV_BLOCK_STRIDE,
+        SANITIZE_CACHE_NANS,
+    )
+
+
+@triton.jit
+def _sparse_attn_norm_rope_store(
+    compressed_kv,  # [TRITON_BLOCK_SIZE] fp32 pooled state
+    position,  # the boundary token's position
+    kv_slot_idx,  # the compressed entry's slot (>= 0)
+    rms_norm_weight_ptr,
+    rms_norm_eps,
+    cos_sin_cache_ptr,
+    cos_sin_stride,
+    k_cache_ptr,
+    kv_cache_block_size,
+    HEAD_SIZE: tl.constexpr,
+    TRITON_BLOCK_SIZE: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    ROPE_HEAD_DIM: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    QUANT_BLOCK: tl.constexpr,
+    TOKEN_STRIDE: tl.constexpr,
+    SCALE_DIM: tl.constexpr,
+    KV_BLOCK_STRIDE: tl.constexpr,
+    SANITIZE_CACHE_NANS: tl.constexpr,
+):
+    """RMSNorm → FP8 quant (nope) → RoPE → bf16 store (rope) of a pooled
+    head=512 compressed entry."""
+    block = tl.arange(0, TRITON_BLOCK_SIZE)
+    mask = block < HEAD_SIZE
+
     # ── RMSNorm (fp32 throughout) ──────────────────────────────────────
     rms_w = tl.load(rms_norm_weight_ptr + block, mask=mask, other=0.0)
     variance = tl.sum(compressed_kv * compressed_kv, axis=0) / HEAD_SIZE
@@ -255,9 +308,6 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     normed = compressed_kv * rrms * rms_w
 
     # ── KV cache pointers ────────────────────────────────────────────
-    kv_slot_idx = tl.load(kv_slot_mapping_ptr + token_idx)
-    if kv_slot_idx < 0:
-        return
     kv_block_idx = kv_slot_idx // kv_cache_block_size
     kv_pos_in_block = kv_slot_idx % kv_cache_block_size
 
@@ -810,6 +860,57 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
 
     compressed_kv = tl.sum(kv * score, axis=0)  # [TRITON_BLOCK_SIZE] fp32
 
+    kv_slot_idx = tl.load(kv_slot_mapping_ptr + token_idx)
+    if kv_slot_idx < 0:
+        return
+    _indexer_fp8_norm_rope_store(
+        compressed_kv,
+        position,
+        kv_slot_idx,
+        rms_norm_weight_ptr,
+        rms_norm_eps,
+        cos_sin_cache_ptr,
+        cos_sin_stride,
+        k_cache_ptr,
+        kv_cache_block_size,
+        HEAD_SIZE,
+        TRITON_BLOCK_SIZE,
+        COMPRESS_RATIO,
+        ROPE_HEAD_DIM,
+        FP8_MAX,
+        QUANT_BLOCK,
+        TOKEN_STRIDE,
+        SCALE_DIM,
+        KV_BLOCK_STRIDE,
+    )
+
+
+@triton.jit
+def _indexer_fp8_norm_rope_store(
+    compressed_kv,  # [TRITON_BLOCK_SIZE] fp32 pooled state
+    position,  # the boundary token's position
+    kv_slot_idx,  # the compressed entry's slot (>= 0)
+    rms_norm_weight_ptr,
+    rms_norm_eps,
+    cos_sin_cache_ptr,
+    cos_sin_stride,
+    k_cache_ptr,
+    kv_cache_block_size,
+    HEAD_SIZE: tl.constexpr,
+    TRITON_BLOCK_SIZE: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    ROPE_HEAD_DIM: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    QUANT_BLOCK: tl.constexpr,
+    TOKEN_STRIDE: tl.constexpr,
+    SCALE_DIM: tl.constexpr,
+    KV_BLOCK_STRIDE: tl.constexpr,
+):
+    """RMSNorm → RoPE → FP8 quant → store of a pooled head=128 indexer
+    entry."""
+    block = tl.arange(0, TRITON_BLOCK_SIZE)
+    mask = block < HEAD_SIZE
+
     # ── RMSNorm (fp32 throughout) ──────────────────────────────────────
     rms_w = tl.load(rms_norm_weight_ptr + block, mask=mask, other=0.0)
     variance = tl.sum(compressed_kv * compressed_kv, axis=0) / HEAD_SIZE
@@ -817,9 +918,6 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     normed = compressed_kv * rrms * rms_w
 
     # ── KV cache pointers ────────────────────────────────────────────
-    kv_slot_idx = tl.load(kv_slot_mapping_ptr + token_idx)
-    if kv_slot_idx < 0:
-        return
     kv_block_idx = kv_slot_idx // kv_cache_block_size
     kv_pos_in_block = kv_slot_idx % kv_cache_block_size
 
@@ -997,6 +1095,55 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
 
     compressed_kv = tl.sum(kv * score, axis=0)  # [TRITON_BLOCK_SIZE] fp32
 
+    kv_slot_idx = tl.load(kv_slot_mapping_ptr + token_idx)
+    if kv_slot_idx < 0:
+        return
+    _indexer_mxfp4_norm_rope_store(
+        compressed_kv,
+        position,
+        kv_slot_idx,
+        rms_norm_weight_ptr,
+        rms_norm_eps,
+        cos_sin_cache_ptr,
+        cos_sin_stride,
+        k_cache_ptr,
+        kv_cache_block_size,
+        HEAD_SIZE,
+        TRITON_BLOCK_SIZE,
+        COMPRESS_RATIO,
+        ROPE_HEAD_DIM,
+        QUANT_BLOCK,
+        TOKEN_STRIDE,
+        SCALE_DIM,
+        KV_BLOCK_STRIDE,
+    )
+
+
+@triton.jit
+def _indexer_mxfp4_norm_rope_store(
+    compressed_kv,  # [TRITON_BLOCK_SIZE] fp32 pooled state
+    position,  # the boundary token's position
+    kv_slot_idx,  # the compressed entry's slot (>= 0)
+    rms_norm_weight_ptr,
+    rms_norm_eps,
+    cos_sin_cache_ptr,
+    cos_sin_stride,
+    k_cache_ptr,
+    kv_cache_block_size,
+    HEAD_SIZE: tl.constexpr,
+    TRITON_BLOCK_SIZE: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    ROPE_HEAD_DIM: tl.constexpr,
+    QUANT_BLOCK: tl.constexpr,
+    TOKEN_STRIDE: tl.constexpr,
+    SCALE_DIM: tl.constexpr,
+    KV_BLOCK_STRIDE: tl.constexpr,
+):
+    """RMSNorm → RoPE → MXFP4 quant → store of a pooled head=128 indexer
+    entry."""
+    block = tl.arange(0, TRITON_BLOCK_SIZE)
+    mask = block < HEAD_SIZE
+
     # ── RMSNorm (fp32 throughout) ──────────────────────────────────────
     rms_w = tl.load(rms_norm_weight_ptr + block, mask=mask, other=0.0)
     variance = tl.sum(compressed_kv * compressed_kv, axis=0) / HEAD_SIZE
@@ -1004,9 +1151,6 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     normed = compressed_kv * rrms * rms_w
 
     # ── KV cache pointers (segregated: values first, then scales) ────
-    kv_slot_idx = tl.load(kv_slot_mapping_ptr + token_idx)
-    if kv_slot_idx < 0:
-        return
     kv_block_idx = kv_slot_idx // kv_cache_block_size
     kv_pos_in_block = kv_slot_idx % kv_cache_block_size
 

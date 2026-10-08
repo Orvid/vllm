@@ -200,6 +200,14 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     block_size,
                     is_valid,
                 )
+                attn_metadata.remap_tree_decode_indices(
+                    global_indices,
+                    self.topk_indices_buffer[:num_decode_tokens],
+                    num_decode_tokens,
+                    swa_metadata.token_to_req_indices,
+                    block_size,
+                    self.compress_ratio,
+                )
                 topk_indices = global_indices.view(num_decode_tokens, 1, -1)
             else:
                 # C128A: pre-computed during metadata build.

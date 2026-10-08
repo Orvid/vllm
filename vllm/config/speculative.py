@@ -2036,7 +2036,27 @@ class SpeculativeConfig:
         """
         if not self.use_tree():
             return 0
-        return 1 + self.max_tree_budget
+        return 1 + self.max_tree_budget + self.tree_scratch_positions
+
+    @property
+    def tree_scratch_ratios(self) -> tuple[int, ...]:
+        """KV compression ratios (DeepSeek-V4 style compressed attention) whose
+        entries a tree can complete inside itself and so keeps in per-node
+        scratch entries; larger ratios rarely complete one inside a tree, and
+        a request whose tree would is verified as a chain that step."""
+        if self.target_model_config is None:
+            return ()
+        ratios = getattr(self.target_model_config.hf_config, "compress_ratios", None)
+        return tuple(sorted({r for r in ratios or () if 1 < r <= 8}))
+
+    @property
+    def tree_scratch_positions(self) -> int:
+        """Positions past the verify block whose compressed entries hold the
+        in-tree entries: one entry per node, starting past the block."""
+        return max(
+            (r * (self.max_tree_budget + 2) for r in self.tree_scratch_ratios),
+            default=0,
+        )
 
     @property
     def tree_decode_width(self) -> int:

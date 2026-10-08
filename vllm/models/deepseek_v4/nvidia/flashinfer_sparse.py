@@ -835,6 +835,14 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                         is_valid,
                     )
                 )
+                attn_metadata.remap_tree_decode_indices(
+                    global_indices,
+                    self.topk_indices_buffer[:num_decode_tokens],
+                    num_decode_tokens,
+                    swa_metadata.token_to_req_indices,
+                    block_size,
+                    self.compress_ratio,
+                )
                 extra_sparse_indices = global_indices.view(num_decode_tokens, 1, -1)
             else:
                 extra_sparse_indices = attn_metadata.c128a_global_decode_topk_indices
