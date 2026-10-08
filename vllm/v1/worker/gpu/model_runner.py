@@ -805,6 +805,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Adaptive df2t verify width (``adaptive_tree_width``): the uniform
         # decode query lengths a step may run at, and the width chooser.
         self._tree_width_ctl: TreeWidthController | None = None
+        self._tree_pp_widths: np.ndarray | None = None
         self._decode_query_lens = {self.decode_query_len}
         spec = self.speculative_config
         if spec is not None and spec.use_tree() and spec.adaptive_tree_width:
@@ -813,6 +814,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Under pipeline parallelism the drafting (last) stage chooses
             # the width and reports only that many drafts to the scheduler,
             # so every stage verifies the same width.
+            if len(ladder) > 1 and self.use_pp:
+                # Per request state: its next step's verify width (0 = the
+                # full width), chosen by the last stage as it drafts.
+                self._tree_pp_widths = np.zeros(self.max_num_reqs, dtype=np.int64)
             if len(ladder) > 1 and self.is_last_pp_rank:
                 self._tree_width_ctl = TreeWidthController(
                     ladder, self.max_num_reqs, self.device
@@ -1654,22 +1659,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         bitmask rows were built for every scheduled draft.
         """
         ctl = self._tree_width_ctl
+        pp_widths = getattr(self, "_tree_pp_widths", None)
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
         if (
-            ctl is None
-            or getattr(self, "use_pp", False)
+            (ctl is None and pp_widths is None)
             or not draft_tokens
             or scheduler_output.has_structured_output_requests
         ):
-            # (Under pipeline parallelism the drafts were already cut to the
-            # width when reported; see _select_tree_width.)
             return scheduler_output
         slots = np.fromiter(
             map(self.req_states.req_id_to_index.__getitem__, draft_tokens),
             dtype=np.int64,
             count=len(draft_tokens),
         )
-        width = self._select_tree_width(slots)
+        if pp_widths is not None:
+            # Pipeline parallelism: the width the last stage chose as it
+            # drafted these trees, the same on every stage.
+            chosen = pp_widths[slots]
+            if not (chosen > 0).all():
+                return scheduler_output
+            width = int(chosen.max())
+        else:
+            width = self._select_tree_width(slots)
         if all(len(drafts) <= width for drafts in draft_tokens.values()):
             return scheduler_output
         num_scheduled_tokens = dict(scheduler_output.num_scheduled_tokens)
@@ -1949,6 +1960,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def _apply_relayed_trees(
         self,
+        tree_widths: np.ndarray | None,
         keep_np: np.ndarray,
         idx_mapping: torch.Tensor,
         idx_mapping_np: np.ndarray,
@@ -1997,6 +2009,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 keep
             ]
             self._tree_valid[rows] = True
+            if self._tree_pp_widths is not None and tree_widths is not None:
+                self._tree_pp_widths[rows] = tree_widths[keep_np]
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
         for new_req_data in scheduler_output.scheduled_new_reqs:
@@ -2021,6 +2035,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # A reused request-state slot must not serve its previous
             # occupant's drafted tree.
             self._tree_valid[req_index] = False
+            if self._tree_pp_widths is not None:
+                self._tree_pp_widths[req_index] = 0
             if self._tree_width_ctl is not None:
                 self._tree_width_ctl.add_request(req_index)
             if self.adaptive_verification is not None:
@@ -4018,9 +4034,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 and self._tree_width_ctl is not None
                 and not input_batch.has_structured_output_reqs
             ):
-                # Pipeline parallelism: choose the next verify width now and
-                # report only that many drafts, so the scheduler schedules the
-                # same width on every stage.
+                # Pipeline parallelism: choose the next verify width as the
+                # trees are drafted; it travels with them to every stage.
                 pp_tree_width = self._select_tree_width(input_batch.idx_mapping_np)
             with use_workspace_lane(self._draft_workspace_lane):
                 draft_tokens = self.speculator.propose(
@@ -4061,9 +4076,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self._store_trees(input_batch, tree_packed)
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping][
-                    :, :pp_tree_width
-                ],
+                self.req_states.draft_tokens[input_batch.idx_mapping],
                 tree_packed=(
                     tree_packed if input_batch.has_structured_output_reqs else None
                 ),
@@ -4072,9 +4085,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # so the pending-stash guard must not fire there.
                 allow_pending_overwrite=bool(getattr(self, "_kernel_warmup", False)),
             )
+            tree_widths = None
+            if self._tree_pp_widths is not None:
+                # 0: verify the full width (no width chosen this step).
+                tree_widths = np.full(input_batch.num_reqs, pp_tree_width or 0)
+                self._tree_pp_widths[input_batch.idx_mapping_np] = tree_widths
             if self.pp_handler is not None:
                 self.pp_handler.broadcast_drafts(
-                    self.req_states.draft_tokens, input_batch, tree_packed
+                    self.req_states.draft_tokens,
+                    input_batch,
+                    tree_packed,
+                    tree_widths,
                 )
 
         # Post-step KV connector related operations.

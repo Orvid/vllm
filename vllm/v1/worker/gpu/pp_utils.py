@@ -41,6 +41,9 @@ class PendingRecv:
     accepted_arenas: torch.Tensor | None = None  # [num_reqs, 1 + W]
     tree_batch: Any = None
     tree_anchors: torch.Tensor | None = None  # [num_reqs]
+    # Verify width the last stage chose for each request's next step (host,
+    # pinned; landed once ``event`` has).
+    tree_widths: torch.Tensor | None = None  # [num_reqs]
 
 
 def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
@@ -193,7 +196,14 @@ class PPHandler:
             idx_mapping=idx_mapping,
         )
         if slot.tree_packed is not None or slot.accepted_arenas is not None:
+            tree_widths = None
+            if slot.tree_widths is not None:
+                # The broadcast landed long ago (this slot is pp_size steps
+                # old); wait for its host copy only.
+                slot.event.synchronize()
+                tree_widths = slot.tree_widths.numpy()
             outputs["tree"] = dict(
+                tree_widths=tree_widths,
                 keep_np=~exclude_mask,
                 idx_mapping=slot.idx_mapping,
                 idx_mapping_np=slot.idx_mapping_np,
@@ -210,9 +220,11 @@ class PPHandler:
         draft_tokens: torch.Tensor,
         input_batch: InputBatch,
         tree_packed: torch.Tensor | None = None,
+        tree_widths: np.ndarray | None = None,
     ) -> None:
         """Broadcast draft proposals so non-last ranks can embed real token ids
-        (and, for tree verification, build the same trees)."""
+        (and, for tree verification, build the same trees, verifying each
+        request's next step at ``tree_widths``, ``[num_reqs]``)."""
         assert self.is_last_rank
         if compute_need_sampled_mask(input_batch) is None:
             return
@@ -234,6 +246,16 @@ class PPHandler:
                     tree_packed.record_stream(self.broadcast_stream)
                 torch.distributed.broadcast(
                     trees, src=self.last_rank, group=self.broadcast_group
+                )
+                if tree_widths is None:
+                    # 0: the full width (no adaptive width).
+                    widths = send.new_zeros(send.shape[0])
+                else:
+                    widths = torch.from_numpy(tree_widths.astype(np.int64)).to(
+                        self.device
+                    )
+                torch.distributed.broadcast(
+                    widths, src=self.last_rank, group=self.broadcast_group
                 )
 
     def receive(
@@ -287,6 +309,7 @@ class PPHandler:
                 )
             draft_tokens = None
             tree_packed = None
+            tree_widths = None
             if self.num_speculative_steps > 0:
                 draft_tokens = torch.empty(
                     num_reqs,
@@ -307,6 +330,16 @@ class PPHandler:
                     torch.distributed.broadcast(
                         tree_packed, src=self.last_rank, group=self.broadcast_group
                     )
+                    widths = torch.empty(
+                        num_reqs, dtype=torch.int64, device=self.device
+                    )
+                    torch.distributed.broadcast(
+                        widths, src=self.last_rank, group=self.broadcast_group
+                    )
+                    tree_widths = torch.empty(
+                        num_reqs, dtype=torch.int64, pin_memory=True
+                    )
+                    tree_widths.copy_(widths, non_blocking=True)
             event = self.broadcast_stream.record_event()
             num_sampled, num_rejected = combined.unbind(dim=0)
             # Must record_stream since these were allocated on broadcast stream but
@@ -330,6 +363,7 @@ class PPHandler:
             accepted_arenas=accepted_arenas if verifies_trees else None,
             tree_batch=input_batch.tree_batch if verifies_trees else None,
             tree_anchors=tree_anchors if verifies_trees else None,
+            tree_widths=tree_widths,
         )
         return bool(need_sampled_mask.all())
 
