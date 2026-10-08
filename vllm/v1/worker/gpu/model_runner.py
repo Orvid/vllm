@@ -3239,6 +3239,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # Nodes past a request's cap hold no token, so the walk stops
                 # before them.
                 token_ids = torch.where(tree_batch.depths > cap[:, None], -1, token_ids)
+                # The walk reads both with one row stride.
+                parents = parents.contiguous()
         else:
             token_ids = torch.zeros(
                 num_reqs, b_max, dtype=torch.long, device=self.device
