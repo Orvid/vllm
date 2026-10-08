@@ -272,10 +272,11 @@ def _chain_predictor():
 
 
 def test_online_predictor_batches_forwards_into_one_update(monkeypatch):
-    """With a 6-row batch, the 3-row forwards are buffered and every second
-    one takes a single optimizer step over both."""
+    """Past warm-up, with a 6-row batch, the 3-row forwards are buffered and
+    every second one takes a single optimizer step over both."""
     from vllm.v1.worker.gpu.spec_decode.tree import routing
 
+    monkeypatch.setattr(routing, "_TRAIN_WARMUP", 0)
     monkeypatch.setattr(routing, "_TRAIN_BATCH_ROWS", 6)
     pred, batch, cand, draft_hidden = _chain_predictor()
     graded = []  # predicted experts graded so far (rows x layers x top-k)

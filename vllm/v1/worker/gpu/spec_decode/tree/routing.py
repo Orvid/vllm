@@ -45,9 +45,12 @@ _LR = 1e-3
 _MAX_TRAIN_ROWS = 512
 _RING = 4
 _TRAIN_BUCKETS = (16, 32, 64, 128, 256, _MAX_TRAIN_ROWS)
-# Forwards' rows accumulate until an optimizer step has this many (or the
-# oldest is this many forwards old): the step's cost is mostly the optimizer
-# pass over the weights, which does not grow with its rows.
+# Past its first _TRAIN_WARMUP optimizer steps (one per forward: early on,
+# how fast the predictor learns is set by its number of updates, not their
+# rows), forwards' rows accumulate until a step has _TRAIN_BATCH_ROWS of them
+# or the oldest is _TRAIN_MAX_STALE forwards old: a step's cost is mostly the
+# optimizer pass over the weights, which does not grow with its rows.
+_TRAIN_WARMUP = 1024
 _TRAIN_BATCH_ROWS = 256
 _TRAIN_MAX_STALE = 16
 
@@ -306,6 +309,7 @@ class OnlineRoutingPredictor(MoERoutingPredictor):
             )
         self._buf_rows = 0
         self._buf_forwards = 0
+        self._num_updates = 0
         # Training steps by padded row count, each captured at first use.
         self._steps: dict[int, _TrainStep] = {}
         # Training rows reach the device through a ring of pinned buffers: a
@@ -428,7 +432,8 @@ class OnlineRoutingPredictor(MoERoutingPredictor):
         self._buf_rows = end
         self._buf_forwards += 1
         if (
-            self._buf_rows >= _TRAIN_BATCH_ROWS
+            self._num_updates < _TRAIN_WARMUP
+            or self._buf_rows >= _TRAIN_BATCH_ROWS
             or self._buf_forwards >= _TRAIN_MAX_STALE
         ):
             self._train_buffered()
@@ -443,6 +448,7 @@ class OnlineRoutingPredictor(MoERoutingPredictor):
             step = self._steps[bucket] = _TrainStep(self, bucket)
         step.weigh(n)
         step.run()
+        self._num_updates += 1
         self._buf_rows = 0
         self._buf_forwards = 0
 
