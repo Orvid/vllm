@@ -1096,8 +1096,10 @@ def test_compaction_moves_split_slots_and_accepted_scratch_entries():
 
     Anchor C = 9, nodes: arena 0 and 1 at depth 1, arena 2 under arena 1 at
     depth 2; the walk accepts arenas 1, 2. Per-token slots 11, 12 move to 10,
-    11 (slot 12 is zeroed). Arena 2 completes entry (9 + 2) // 2 = 5; with 3
-    nodes its scratch entry is (9 + 1 + 3) // 2 + 1 + 2 = 9.
+    11 (slot 12 is zeroed). Arena 2 (position 11) completes entry
+    (9 + 2) // 2 = 5; with 3 nodes its scratch entry is
+    (9 + 1 + 3) // 2 + 1 + 2 = 9. The same group's ratio-4 layer (blocks of
+    2 entries) moves its entry 3 + 1 + 2 = 6 to 11 // 4 = 2.
     """
     from vllm.v1.worker.gpu.spec_decode.tree.compaction import TreeKVCompaction
 
@@ -1105,29 +1107,33 @@ def test_compaction_moves_split_slots_and_accepted_scratch_entries():
     token_runs, entry_runs = (8, 4), (4, 2)
     token_cache = torch.randint(0, 256, (4, 4, 12), dtype=torch.uint8, device="cuda")
     entry_cache = torch.randint(0, 256, (4, 4, 6), dtype=torch.uint8, device="cuda")
+    entry4_cache = torch.randint(0, 256, (4, 2, 6), dtype=torch.uint8, device="cuda")
     groups = [
         SimpleNamespace(
             layer_names=["tok"], kv_cache_spec=SimpleNamespace(block_size=4)
         ),
         SimpleNamespace(
-            layer_names=["ent"],
-            kv_cache_spec=SimpleNamespace(block_size=8, tokens_per_state=2),
+            layer_names=["ent", "ent4"],
+            kv_cache_spec=SimpleNamespace(
+                block_size=8,
+                kv_cache_specs={
+                    "ent": SimpleNamespace(tokens_per_state=2),
+                    "ent4": SimpleNamespace(tokens_per_state=4),
+                },
+            ),
         ),
     ]
     token_table = torch.tensor([[3, 1, 0, 2]], dtype=torch.int32, device="cuda")
     entry_table = torch.tensor([[2, 0, 3, 1]], dtype=torch.int32, device="cuda")
 
-    def slot_bytes(cache, runs, table, slot):
-        """Byte views of each run of ``slot`` (one block = 4 slots)."""
-        block = cache[int(table[0, slot // 4])].flatten()
+    def slot_bytes(cache, runs, table, slot, n=4):
+        """Byte views of each run of ``slot`` (one block = ``n`` slots)."""
+        block = cache[int(table[0, slot // n])].flatten()
         out, off = [], 0
         for run in runs:
-            out.append(block[off + (slot % 4) * run : off + (slot % 4 + 1) * run])
-            off += 4 * run
+            out.append(block[off + (slot % n) * run : off + (slot % n + 1) * run])
+            off += n * run
         return out
-
-    def slot_value(cache, runs, table, slot):
-        return torch.cat(slot_bytes(cache, runs, table, slot)).clone()
 
     expected_token = token_cache.clone()
     for src, dst in ((11, 10), (12, 11)):
@@ -1144,16 +1150,23 @@ def test_compaction_moves_split_slots_and_accepted_scratch_entries():
         slot_bytes(entry_cache, entry_runs, entry_table, 9),
     ):
         d.copy_(s)
+    expected_entry4 = entry4_cache.clone()
+    for d, s in zip(
+        slot_bytes(expected_entry4, entry_runs, entry_table, 2, n=2),
+        slot_bytes(entry4_cache, entry_runs, entry_table, 6, n=2),
+    ):
+        d.copy_(s)
 
+    segments = {"tok": token_runs, "ent": entry_runs, "ent4": entry_runs}
     compactor = TreeKVCompaction(
         1,
         2,
-        {"tok": token_cache, "ent": entry_cache},
+        {"tok": token_cache, "ent": entry_cache, "ent4": entry4_cache},
         groups,
         torch.device("cuda"),
         arena_span=3,
-        layer_segments={"tok": token_runs, "ent": entry_runs},
-        scratch_ratios=(2,),
+        layer_segments=segments,
+        scratch_ratios=(2, 4),
         max_nodes=3,
     )
     compactor.compact(
@@ -1166,14 +1179,15 @@ def test_compaction_moves_split_slots_and_accepted_scratch_entries():
     )
     assert torch.equal(token_cache, expected_token)
     assert torch.equal(entry_cache, expected_entry)
+    assert torch.equal(entry4_cache, expected_entry4)
     assert (
         TreeKVCompaction.reserved_bytes(
             max_num_reqs=1,
             nodes_max=3,
             chain_w=2,
             kv_cache_groups=groups,
-            layer_segments={"tok": token_runs, "ent": entry_runs},
-            scratch_ratios=(2,),
+            layer_segments=segments,
+            scratch_ratios=(2, 4),
         )
         == compactor._reserved_bytes
     )

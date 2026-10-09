@@ -412,15 +412,15 @@ def _layer_spec(group_spec: Any, name: str) -> Any:
     return specs[name] if specs else group_spec
 
 
-def _group_slot_ratio(group_spec: Any, scratch_ratios: Sequence[int]) -> int:
-    """Positions per relocated slot of a kv-cache group: 1 for per-token KV,
-    a compression ratio whose in-tree entries a tree keeps in scratch (the
+def _slot_ratio(spec: Any, scratch_ratios: Sequence[int]) -> int:
+    """Positions per relocated slot of a layer: 1 for per-token KV, a
+    compression ratio whose in-tree entries a tree keeps in scratch (the
     accepted ones move to their canonical entries), 0 for nothing to move
-    (recurrent state, ratios verified as chains)."""
-    if isinstance(group_spec, MambaSpec):
+    (recurrent state, ratios whose entries no accepted tree row completes).
+    One kv-cache group can hold layers of several ratios (DeepSeek-V4's
+    compressed and indexer caches share 256-position blocks)."""
+    if isinstance(spec, MambaSpec):
         return 0
-    specs = getattr(group_spec, "kv_cache_specs", None)
-    spec = next(iter(specs.values())) if specs else group_spec
     ratio = getattr(spec, "tokens_per_state", 1)
     if ratio == 1:
         return 1
@@ -578,32 +578,41 @@ class TreeKVCompaction:
         self._max_nodes = max_nodes
         self._device = device
         layer_segments = layer_segments or {}
-        # Per group: slots per block (0 = nothing moves) and positions per
-        # slot. Per relocated (layer, segment): its group, byte offset of its
-        # run within a block, bytes per slot, slots per block, block stride.
+        # Plan groups: one per (kv-cache group, layer slot ratio), sharing the
+        # kv-cache group's block table (``plan_group_of``), with its slots per
+        # block and positions per slot. Per relocated (layer, segment): its
+        # plan group, byte offset of its run within a block, bytes per slot,
+        # slots per block of its view.
+        self.plan_group_of: list[int] = []
         self.block_sizes: list[int] = []
         self.slot_ratios: list[int] = []
+        plan_groups: dict[tuple[int, int], int] = {}
         segments: list[tuple[int, Tensor, int, int, int]] = []
         for g, group in enumerate(kv_cache_groups):
-            ratio = _group_slot_ratio(group.kv_cache_spec, scratch_ratios)
-            self.slot_ratios.append(max(ratio, 1))
-            if ratio == 0:
-                # Recurrent state commits through its layers (TreeCommit);
-                # compressed entries of chain-verified ratios stay put.
-                self.block_sizes.append(0)
+            if isinstance(group.kv_cache_spec, MambaSpec):
+                # Recurrent state commits through its layers (TreeCommit).
                 continue
             bs = getattr(group.kv_cache_spec, "block_size", None)
             if bs is None:
                 raise ValueError(
                     "df2t compaction needs a uniform block_size on every kv-cache group"
                 )
-            # UniformTypeKVCacheSpecs resolves to an int block_size.
-            slots_per_block = int(bs) // ratio
-            self.block_sizes.append(slots_per_block)
             for name in group.layer_names:
+                ratio = _slot_ratio(
+                    _layer_spec(group.kv_cache_spec, name), scratch_ratios
+                )
                 layer = views_by_name.get(name)
-                if layer is None:
+                if layer is None or ratio == 0:
+                    # (Compressed entries no accepted tree row completes stay
+                    # put.)
                     continue
+                pg = plan_groups.get((g, ratio))
+                if pg is None:
+                    pg = plan_groups[(g, ratio)] = len(self.plan_group_of)
+                    self.plan_group_of.append(g)
+                    # UniformTypeKVCacheSpecs resolves to an int block_size.
+                    self.block_sizes.append(int(bs) // ratio)
+                    self.slot_ratios.append(ratio)
                 # The view's own blocks (kernel blocks) address its slots.
                 view_slots = layer.shape[-2]
                 block_bytes = layer.stride(0) * layer.element_size()
@@ -618,10 +627,13 @@ class TreeKVCompaction:
                     )
                 run_off = 0
                 for run in runs:
-                    segments.append((g, layer, run_off, run, view_slots))
+                    segments.append((pg, layer, run_off, run, view_slots))
                     run_off += view_slots * run
 
-        self._G = len(kv_cache_groups)
+        # Plan groups, and the kv-cache groups whose block tables compact()
+        # takes.
+        self._G = len(self.plan_group_of)
+        self._num_kv_groups = len(kv_cache_groups)
         self._L = len(segments)
         if self._L == 0:
             self._empty = True
@@ -816,10 +828,17 @@ class TreeKVCompaction:
         layer_segments = layer_segments or {}
         L = 0
         max_el = 0
-        for group in kv_cache_groups:
-            if _group_slot_ratio(group.kv_cache_spec, scratch_ratios) == 0:
+        plan_groups: set[tuple[int, int]] = set()
+        for g, group in enumerate(kv_cache_groups):
+            if isinstance(group.kv_cache_spec, MambaSpec):
                 continue
             for name in group.layer_names:
+                ratio = _slot_ratio(
+                    _layer_spec(group.kv_cache_spec, name), scratch_ratios
+                )
+                if ratio == 0:
+                    continue
+                plan_groups.add((g, ratio))
                 runs = layer_segments.get(name)
                 if runs is None:
                     spec = _layer_spec(group.kv_cache_spec, name)
@@ -841,7 +860,7 @@ class TreeKVCompaction:
             if slab < cw:
                 slab = cw
         return cls._buffer_layout_bytes(
-            G=len(kv_cache_groups),
+            G=len(plan_groups),
             max_num_reqs=max_num_reqs,
             max_a=max_a,
             W=nodes_max,
@@ -854,10 +873,15 @@ class TreeKVCompaction:
     def _block_table_args(
         self, block_tables: Sequence[Tensor]
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Per-group device pointer/stride/width/block-size/ratio tables for
-        the plan kernel, cached by the block tables' addresses and shapes."""
-        assert len(block_tables) == self._G, (len(block_tables), self._G)
+        """Per plan group device pointer/stride/width/block-size/ratio tables
+        for the plan kernel (from the kv-cache groups' ``block_tables``),
+        cached by the block tables' addresses and shapes."""
+        assert len(block_tables) == self._num_kv_groups, (
+            len(block_tables),
+            self._num_kv_groups,
+        )
         assert len({bt.dtype for bt in block_tables}) == 1
+        block_tables = [block_tables[g] for g in self.plan_group_of]
         key = tuple((bt.data_ptr(), bt.stride(0), bt.shape[1]) for bt in block_tables)
         cached = getattr(self, "_bt_args", None)
         if cached is not None and cached[0] == key:
