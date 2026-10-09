@@ -38,7 +38,7 @@ from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
     get_aux_output_connector,
 )
-from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
+from vllm.distributed.parallel_state import get_dcp_group, get_pp_group, get_tp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
@@ -1717,8 +1717,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert ctl is not None
         width = ctl.select(slots, timed)
         lam = getattr(self, "_tree_lam", None)
+        price = ctl.throughput * ctl.expert_cost_scale if lam is not None else 0.0
+        parallel_config = getattr(self, "parallel_config", None)
+        if parallel_config is not None and parallel_config.tensor_parallel_size > 1:
+            # Tensor-parallel ranks time their own steps, so their controllers
+            # drift apart; they must verify the same width (or their
+            # collectives mismatch) and draft the same trees: rank 0 decides.
+            width, price = get_tp_group().broadcast_object((width, price), src=0)
         if lam is not None:
-            lam.fill_(ctl.throughput * ctl.expert_cost_scale)
+            lam.fill_(price)
             self.speculator.tree_selector.aware_nodes.fill_(width)  # type: ignore[union-attr]
         return width
 
