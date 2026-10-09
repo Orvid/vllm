@@ -1501,6 +1501,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             requires_grad=False,
         )
         spec_config = vllm_config.speculative_config
+        # DSpark drafts from the mean of the hc_mult residual streams; DFlash
+        # drafters trained on V4 take all streams (hc_mult * hidden_size).
+        self.aux_hidden_all_streams = (
+            spec_config is not None and spec_config.method == "dflash"
+        )
         needs_mtp_hidden_states = spec_config is not None and (
             spec_config.use_eagle() or spec_config.uses_draft_model()
         )
@@ -1609,7 +1614,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 aux_recon = mhc_post_tilelang(
                     hidden_states, residual, post_mix, res_mix
                 )
-                aux_hidden_state = aux_recon.mean(dim=1)
+                aux_hidden_state = (
+                    aux_recon.flatten(1)
+                    if self.aux_hidden_all_streams
+                    else aux_recon.mean(dim=1)
+                )
                 if self.use_sequence_parallel:
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
                 aux_hidden_states.append(aux_hidden_state)

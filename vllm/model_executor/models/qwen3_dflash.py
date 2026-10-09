@@ -108,9 +108,18 @@ def _get_dflash_fc_input_size(vllm_config: VllmConfig) -> int:
     config = spec_config.draft_model_config.hf_config
     aux_layers = get_eagle3_aux_layers_from_config(spec_config)
     num_features_to_use = len(aux_layers) if aux_layers else config.num_hidden_layers
-    target_hidden_size = (
-        getattr(config, "target_hidden_size", None) or config.hidden_size
-    )
+    target_hidden_size = getattr(config, "target_hidden_size", None)
+    if target_hidden_size is None:
+        # A target with hyper-connections (DeepSeek-V4) hands DFlash all
+        # hc_mult residual streams of each aux layer.
+        target_model_config = spec_config.target_model_config
+        target_config = (
+            target_model_config.hf_config if target_model_config is not None else None
+        )
+        hc_mult = getattr(target_config, "hc_mult", None)
+        target_hidden_size = (
+            hc_mult * target_config.hidden_size if hc_mult else config.hidden_size
+        )
     return target_hidden_size * num_features_to_use
 
 
