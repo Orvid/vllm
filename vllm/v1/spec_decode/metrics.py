@@ -249,7 +249,12 @@ class SpecDecodingProm:
         ] = {}
         if not is_diffusion:
             assert speculative_config is not None
-            num_spec_tokens = speculative_config.num_speculative_tokens
+            # An accepted chain is bounded by both the draft depth and, under
+            # tree verification, the scheduled rows (which size the stats).
+            num_spec_tokens = min(
+                speculative_config.num_speculative_tokens,
+                speculative_config.num_draft_rows_per_req,
+            )
             pos_labelnames = labelnames + ["position"]
             base_counter = self._counter_cls(
                 name="vllm:spec_decode_num_accepted_tokens_per_pos",
