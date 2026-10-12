@@ -84,7 +84,7 @@ def test_deepseek_v4_rocm_adaptive_indexer_support(monkeypatch: pytest.MonkeyPat
     )
 
     assert DeepseekV4IndexerBackend.supports_device_cpu_query_lens_mismatch()
-    assert indexer._rocm_supports_flattened_device_query_lens(adaptive_config)
+    assert indexer._dsv4_supports_flattened_device_query_lens(adaptive_config)
     assert (
         DeepseekV4IndexerBackend.get_builder_cls() is DeepseekV32IndexerMetadataBuilder
     )
@@ -105,6 +105,32 @@ def test_deepseek_v4_rocm_adaptive_indexer_support(monkeypatch: pytest.MonkeyPat
 
 
 @pytest.mark.cpu_test
+def test_deepseek_v4_sm12x_adaptive_indexer_support(monkeypatch: pytest.MonkeyPatch):
+    """SM12x has no varlen DeepGEMM logits, so adaptive verification needs the
+    flattened device-length path, scoped to DeepSeek-V4 like ROCm."""
+    monkeypatch.setattr(indexer.current_platform, "is_rocm", lambda: False)
+    monkeypatch.setattr(indexer.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        indexer.current_platform,
+        "is_device_capability_family",
+        lambda capability, device_id=0: capability == 120,
+    )
+    adaptive_config = _make_indexer_config(
+        architecture="DeepseekV4ForCausalLM", adaptive=True
+    )
+
+    assert DeepseekV4IndexerBackend.supports_device_cpu_query_lens_mismatch()
+    assert not DeepseekV41IndexerBackend.supports_device_cpu_query_lens_mismatch()
+    assert indexer._use_flattening(adaptive_config)
+    assert (
+        DeepseekV32IndexerMetadataBuilder.get_cudagraph_support(
+            adaptive_config, SimpleNamespace()
+        )
+        == AttentionCGSupport.ALWAYS
+    )
+
+
+@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "architecture",
     ["DeepseekV32ForCausalLM", "DeepseekV41ForCausalLM", "GlmMoeDsaForCausalLM"],
@@ -116,7 +142,7 @@ def test_rocm_adaptive_indexer_flattening_is_scoped_to_deepseek_v4(
     _mock_rocm_platform(monkeypatch)
     adaptive_config = _make_indexer_config(architecture=architecture, adaptive=True)
 
-    assert not indexer._rocm_supports_flattened_device_query_lens(adaptive_config)
+    assert not indexer._dsv4_supports_flattened_device_query_lens(adaptive_config)
     assert not indexer._use_flattening(adaptive_config)
     assert (
         DeepseekV32IndexerMetadataBuilder.get_cudagraph_support(
