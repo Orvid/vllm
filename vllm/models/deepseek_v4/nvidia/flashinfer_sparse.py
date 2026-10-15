@@ -669,7 +669,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             return self._deep_gemm_o_proj(o, positions)
         out = self._b12x_wo(o, positions, self.rotary_emb.cos_sin_cache)
         if not self._b12x_wo.checked and not torch.cuda.is_current_stream_capturing():
-            self._b12x_wo.check(out, self._deep_gemm_o_proj(o, positions), self.prefix)
+            self._b12x_wo.check(
+                out.clone(), self._deep_gemm_o_proj(o, positions), self.prefix
+            )
         return out
 
     def setup_b12x_wo_projection(self) -> None:
@@ -678,6 +680,8 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         reason = b12x_wo_unsupported_reason(self)
         if reason is None:
             self._b12x_wo = B12xWoProjection(self)
+            # Its plans must all be prepared before CUDA graph capture.
+            self.b12x_warmup_provider = self._b12x_wo
         elif envs.VLLM_USE_B12X_WO_PROJECTION:
             logger.warning_once("b12x WO projection disabled: %s", reason)
 

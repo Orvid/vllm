@@ -5,9 +5,10 @@
 One b12x chain replaces inverse RoPE + FP8 quant, the grouped ``wo_a`` einsum
 and ``wo_b`` (``b12x.gemm.wo_projection``, SM12x). Weights are packed once from
 the checkpoint's 128x128 block scales, before the linear methods rewrite them.
-Plans are shared by every layer: exact-count plans for CUDA-graph sized
-batches (prepared by the eager warmup that precedes each capture), and one
-dynamic plan for larger eager batches.
+Plans are shared by every layer: an exact-count plan per CUDA-graph capture
+size and one dynamic plan for every other count. All of them are prepared by
+the b12x warmup, before any graph is captured: preparing a plan later can
+reclaim b12x programs that captured graphs still launch.
 """
 
 from typing import Any
@@ -19,7 +20,7 @@ import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
-from vllm.utils.b12x import has_b12x
+from vllm.utils.b12x import B12xWarmupUnit, has_b12x
 
 logger = init_logger(__name__)
 
@@ -72,15 +73,16 @@ class B12xWoProjection:
             hidden=self.hidden,
         )
         config = get_current_vllm_config()
-        sizes = config.compilation_config.cudagraph_capture_sizes or []
-        self.max_exact_tokens = max(sizes, default=0)
+        self.exact_sizes = frozenset(
+            config.compilation_config.cudagraph_capture_sizes or ()
+        )
         self.max_dynamic_tokens = config.scheduler_config.max_num_batched_tokens
         self.checked = False
 
     def _plan(
         self, num_tokens: int, cos_sin_cache: torch.Tensor
     ) -> tuple[Any, torch.Tensor]:
-        exact = num_tokens <= self.max_exact_tokens
+        exact = num_tokens in self.exact_sizes
         dims = (self.groups, self.group_width, self.rank, self.hidden)
         key = (
             cos_sin_cache.device,
@@ -117,14 +119,12 @@ class B12xWoProjection:
         _PLANS[key] = entry = (plan, scratch)
         return entry
 
-    def __call__(
+    def _run(
         self, o: torch.Tensor, positions: torch.Tensor, cos_sin_cache: torch.Tensor
     ) -> torch.Tensor:
-        num_tokens = o.shape[0]
-        if num_tokens == 0:
-            return o.new_empty((0, self.hidden))
+        """The local (unreduced) projection, written into shared scratch."""
         wo = _wo_module()
-        plan, scratch = self._plan(num_tokens, cos_sin_cache)
+        plan, scratch = self._plan(o.shape[0], cos_sin_cache)
         binding = wo.bind_inv_rope(
             plan,
             scratch=scratch,
@@ -136,12 +136,63 @@ class B12xWoProjection:
             nope_dim=self.nope_dim,
             rope_dim=self.rope_dim,
         )
-        out = wo.run_inv_rope(binding=binding, plan=plan)
+        return wo.run_inv_rope(binding=binding, plan=plan)
+
+    def __call__(
+        self, o: torch.Tensor, positions: torch.Tensor, cos_sin_cache: torch.Tensor
+    ) -> torch.Tensor:
+        if o.shape[0] == 0:
+            return o.new_empty((0, self.hidden))
+        out = self._run(o, positions, cos_sin_cache)
         # The output lives in scratch the next layer reuses.
         return tensor_model_parallel_all_reduce(out) if self.reduce else out.clone()
 
+    def get_b12x_warmup_unit(
+        self,
+        layer: nn.Module,
+        token_counts: tuple[int, ...],
+        output_dtype: torch.dtype,
+    ) -> B12xWarmupUnit:
+        """Prepare every plan this projection can use (all layers share them)."""
+        cos_sin_cache = layer.rotary_emb.cos_sin_cache
+        device = cos_sin_cache.device
+        # Every exact plan, plus one count outside the capture sizes for the
+        # dynamic plan.
+        counts = sorted(self.exact_sizes)
+        dynamic = max(counts, default=0) + 1
+        if dynamic <= self.max_dynamic_tokens:
+            counts.append(dynamic)
+
+        def compile() -> None:
+            for num_tokens in counts:
+                o = torch.zeros(
+                    (num_tokens, layer.n_local_heads, layer.head_dim),
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                positions = torch.zeros(num_tokens, dtype=torch.int64, device=device)
+                self._run(o, positions, cos_sin_cache)
+
+        return B12xWarmupUnit(
+            name="WO projection",
+            key=(
+                type(self),
+                cos_sin_cache.device,
+                cos_sin_cache.dtype,
+                self.groups,
+                self.group_width,
+                self.rank,
+                self.hidden,
+            ),
+            compile=compile,
+        )
+
     def check(self, out: torch.Tensor, reference: torch.Tensor, prefix: str) -> None:
-        """Log one comparison against the DeepGEMM path (eager, nonzero input)."""
+        """Log one comparison against the DeepGEMM path (eager, nonzero input).
+
+        ``out`` must be a copy: a reduced output may share the all-reduce
+        buffer the reference path writes next.
+        """
         ref_norm = reference.float().norm().item()
         if ref_norm == 0.0:
             return
