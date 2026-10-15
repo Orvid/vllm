@@ -2033,6 +2033,10 @@ class DeepseekV4ForCausalLM(
         loader = AutoWeightsLoader(self)
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         self.process_weights_after_loading()
+        # Before the loader's linear methods rewrite the checkpoint scales.
+        for module in self.modules():
+            if hasattr(module, "setup_b12x_wo_projection"):
+                module.setup_b12x_wo_projection()
         return loaded_params
 
     def process_weights_after_loading(self) -> None:

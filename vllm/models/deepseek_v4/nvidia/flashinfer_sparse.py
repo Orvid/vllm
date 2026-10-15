@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
@@ -15,6 +16,10 @@ from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
     build_flashinfer_mixed_sparse_indices,
     compute_global_topk_indices_and_lens,
+)
+from vllm.models.deepseek_v4.nvidia.ops.b12x_wo import (
+    B12xWoProjection,
+    b12x_wo_unsupported_reason,
 )
 from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
     compute_fp8_einsum_recipe,
@@ -622,6 +627,8 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     backend_cls = DeepseekV4FlashInferMLASparseBackend
     swa_backend_cls = DeepseekSparseSWAFlashInferBackend
     use_fp8_ds_mla_layout: ClassVar[bool] = True
+    # Set by setup_b12x_wo_projection() after weight loading.
+    _b12x_wo: B12xWoProjection | None = None
 
     @staticmethod
     def _get_workspace(device: torch.device) -> torch.Tensor:
@@ -639,7 +646,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         return _pad_to_supported_q_heads(num_heads)
 
-    def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def _deep_gemm_o_proj(
+        self, o: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
         return deep_gemm_fp8_o_proj(
             o,
             positions,
@@ -654,6 +663,23 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             einsum_recipe=self._einsum_recipe,
             tma_aligned_scales=self._tma_aligned_scales,
         )
+
+    def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        if self._b12x_wo is None:
+            return self._deep_gemm_o_proj(o, positions)
+        out = self._b12x_wo(o, positions, self.rotary_emb.cos_sin_cache)
+        if not self._b12x_wo.checked and not torch.cuda.is_current_stream_capturing():
+            self._b12x_wo.check(out, self._deep_gemm_o_proj(o, positions), self.prefix)
+        return out
+
+    def setup_b12x_wo_projection(self) -> None:
+        """Pack the WO weights for b12x; runs before the linear methods
+        rewrite the checkpoint block scales."""
+        reason = b12x_wo_unsupported_reason(self)
+        if reason is None:
+            self._b12x_wo = B12xWoProjection(self)
+        elif envs.VLLM_USE_B12X_WO_PROJECTION:
+            logger.warning_once("b12x WO projection disabled: %s", reason)
 
     def __init__(self, vllm_config: VllmConfig, *args, **kwargs) -> None:
         super().__init__(vllm_config, *args, **kwargs)
