@@ -255,8 +255,8 @@ def build_flex_tree_mask(
         if window is not None:
             # Positional window term. Positions equal the block slot for
             # context/anchor/treeless rows and ``C + depth`` for tree nodes:
-            # a pure slot-distance window would mis-window the depth-decoupled
-            # node rows (siblings at mirrored depths).
+            # a pure slot-distance window would misapply itself to the
+            # depth-decoupled node rows (siblings at mirrored depths).
             assert depths is not None, "a windowed flex tree mask requires depths"
             is_treeless = words[r, 0] == 0
             q_pos = torch.where(
@@ -528,8 +528,8 @@ def attach_tree_flex_mask(
     When ``window`` is set the tree mask already ANDs the positional window, so
     the metadata's built-in *index-based* sliding-window term (``|q_idx -
     kv_idx| < sliding_window``, valid only where block-slot == position) is
-    neutralized: composing both would double-window and mis-window the
-    depth-decoupled node rows.
+    neutralized: composing both would apply the window twice and misapply it
+    to the depth-decoupled node rows.
 
     Args:
         metadata: A fully built ``FlexAttentionMetadata`` whose ``doc_ids``
