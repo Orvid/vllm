@@ -1091,34 +1091,24 @@ def get_max_concurrency_for_kv_cache_config(
     a representative per-layer spec (scheduler config), so both capacity
     call sites agree.
 
-    Only the steady part of each group's per-request footprint scales with
-    concurrency. The in-flight allowance (chunked-prefill tokens not yet
-    settled, see `KVCacheSpec.transient_memory_usage_bytes`) is bounded
-    system-wide by `max_in_flight_tokens` across *all* requests, so it is
-    reserved once per pool rather than multiplied by concurrency. Without
-    this, hybrid SWA models charge every request each SWA group's peak
-    window+in-flight blocks and under-report capacity by a large factor
-    (#51041).
-
     Host groups use a separate pool; the smaller concurrency limit applies.
     """
-    # [device, host]: steady blocks per request, transient blocks per pool.
-    steady = [0, 0]
-    transient = [0, 0]
+    num_blocks_per_request = 0
+    host_blocks_per_request = 0
     for group in kv_cache_config.kv_cache_groups:
-        pool = 1 if group.host_resident else 0
-        page = group.kv_cache_spec.page_size_bytes
-        steady[pool] += cdiv(
-            group.kv_cache_spec.steady_memory_usage_bytes(vllm_config), page
+        required = cdiv(
+            group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+            group.kv_cache_spec.page_size_bytes,
         )
-        transient[pool] += cdiv(
-            group.kv_cache_spec.transient_memory_usage_bytes(vllm_config), page
-        )
-    limits = [max(kv_cache_config.num_blocks - transient[0], 0) / steady[0]]
-    if steady[1]:
+        if group.host_resident:
+            host_blocks_per_request += required
+        else:
+            num_blocks_per_request += required
+    limits = [kv_cache_config.num_blocks / num_blocks_per_request]
+    if host_blocks_per_request:
         assert kv_cache_config.hisparse_host_num_blocks is not None
         limits.append(
-            max(kv_cache_config.hisparse_host_num_blocks - transient[1], 0) / steady[1]
+            kv_cache_config.hisparse_host_num_blocks / host_blocks_per_request
         )
     return min(limits)
 
@@ -2459,13 +2449,6 @@ def _max_memory_usage_bytes_from_groups(
 
     Each group independently claims blocks from the shared pool, so a request consumes
     the sum of the per-group block counts, i.e. ``bytes_per_block * total_blocks``.
-
-    Only the steady part of the per-request footprint gates startup: the
-    in-flight allowance (chunked-prefill tokens not yet settled) is bounded
-    system-wide by `max_in_flight_tokens` and enforced per request by the
-    runtime admission gate, so charging it here would inflate the
-    `max_model_len` fit-check by the (pool-stride-sized) transient pages of
-    every SWA-class group (#51041).
     """
     if not kv_cache_groups:
         return 0
@@ -2502,10 +2485,10 @@ def _max_memory_usage_bytes_from_groups(
     for group in kv_cache_groups:
         spec = group.kv_cache_spec
         if isinstance(spec, UniformTypeKVCacheSpecs):
-            total_blocks += spec.steady_memory_usage_pages(vllm_config)
+            total_blocks += spec.max_memory_usage_pages(vllm_config)
         else:
             total_blocks += cdiv(
-                spec.steady_memory_usage_bytes(vllm_config),
+                spec.max_memory_usage_bytes(vllm_config),
                 spec.page_size_bytes,
             )
 
