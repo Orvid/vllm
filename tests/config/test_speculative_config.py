@@ -78,14 +78,6 @@ def test_tree_accepts_drafter_without_candidate_head():
     assert cfg.tree_candidate_top_k == 8
 
 
-def test_expert_aware_selection_needs_adaptive_width():
-    """df2t_moe prices expert cost in tokens at the adaptive controller's
-    throughput estimate, so it fails closed without it."""
-    with pytest.raises(ValueError, match="adaptive_tree_width"):
-        _build(tree_selection="df2t_moe")
-    assert _build(tree_selection="df2t_moe", adaptive_tree_width=True).use_tree()
-
-
 def test_tree_rejects_sequential_drafters():
     with pytest.raises(ValueError, match="in parallel"):
         _build(method="ngram", draft_model_config=None)

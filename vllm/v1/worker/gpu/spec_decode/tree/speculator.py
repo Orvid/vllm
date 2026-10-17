@@ -102,13 +102,7 @@ class TreeSpeculatorMixin:
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
-        anchor_ids = None
-        if self.tree_selector.routing is not None:
-            # Each request's first query row holds its anchor (bonus) token,
-            # the row its next verify starts from.
-            nq = self.num_query_per_req
-            anchor_ids = self.input_buffers.input_ids[: num_reqs * nq : nq].contiguous()
-        tree = self.tree_selector.select(proposal, anchor_ids)
+        tree = self.tree_selector.select(proposal)
         self._last_tree = tree
         self._last_built_rows = num_reqs
         # The selector pads columns past a tree's node count with the

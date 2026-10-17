@@ -121,42 +121,12 @@ def test_one_outlier_step_moves_a_settled_cost_a_bounded_amount():
     assert ctl.cost_delta_ms[0] == pytest.approx((3.0 - 1.0) / 64)
 
 
-@pytest.mark.parametrize("true_scale", [0.2, 3.0])
-def test_expert_cost_scale_learns_what_estimated_experts_really_cost(true_scale):
-    """Steps whose rows reach more (estimated) expert ms take longer by
-    ``true_scale`` times that estimate, on top of noise; the fit recovers the
-    scale whichever side of the bandwidth estimate it falls."""
-    ctl = TreeWidthController([2, 4], max_num_reqs=4, device=DEVICE)
-    ctl.set_cost_table(build_cost_table({(2, 1): 10.0, (4, 1): 10.0}, [2, 4], 4))
-    rng = np.random.default_rng(0)
-    for _ in range(2000):
-        x = rng.uniform(0.0, 2.0)
-        ctl.observe_step_time(0, 1, 10.0 + true_scale * x + rng.normal(0, 0.1), x)
-    assert ctl.expert_cost_scale == pytest.approx(true_scale, abs=0.1)
-
-
-def test_each_timed_step_gets_the_expert_cost_routed_within_it(monkeypatch):
-    ctl = TreeWidthController([2, 4], max_num_reqs=4, device=DEVICE)
-    meter = torch.zeros(1, dtype=torch.float64, device=DEVICE)
-    ctl.set_expert_meter(meter)
-    seen: list[float | None] = []
-    monkeypatch.setattr(ctl, "observe_step_time", lambda j, n, ms, x: seen.append(x))
-    for cost in (3.0, 5.0, 0.0):
-        ctl._time_step(0, 1)
-        meter += cost
-        torch.accelerator.synchronize()
-    ctl._time_step(0, 1)
-    torch.accelerator.synchronize()
-    ctl._time_step(0, 1)
-    assert seen[:3] == [3.0, 5.0, 0.0]
-
-
 def test_steps_spanning_other_work_are_not_cost_samples(monkeypatch):
     """An interval covering a prefill or an idle engine (``timed=False``)
     never reaches the width's cost; the next pure tree step does."""
     ctl = TreeWidthController([2, 4], max_num_reqs=4, device=DEVICE)
     seen: list[int] = []
-    monkeypatch.setattr(ctl, "observe_step_time", lambda j, n, ms, x: seen.append(j))
+    monkeypatch.setattr(ctl, "observe_step_time", lambda j, n, ms: seen.append(j))
     ctl._time_step(0, 1)
     ctl._time_step(1, 1, timed=False)  # closes width 0's interval: untimed
     ctl._time_step(0, 1)  # closes width 1's interval: a sample

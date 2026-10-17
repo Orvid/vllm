@@ -182,12 +182,6 @@ from vllm.v1.worker.gpu.spec_decode.tree.compaction import TreeKVCompaction
 from vllm.v1.worker.gpu.spec_decode.tree.context import TreeVerifyContext
 from vllm.v1.worker.gpu.spec_decode.tree.indexed import tree_accept_depth_cap
 from vllm.v1.worker.gpu.spec_decode.tree.mixers import TreeRecurrentLayers
-from vllm.v1.worker.gpu.spec_decode.tree.routing import (
-    MoERoutingCapture,
-    MoERoutingPredictor,
-    bind_moe_routing_capture,
-    build_moe_routing_predictor,
-)
 from vllm.v1.worker.gpu.spec_decode.tree.tree_metadata import (
     TreeBatch,
     TreeDraft,
@@ -214,7 +208,6 @@ logger = init_logger(__name__)
 
 # Intermediate-tensor key carrying expert-aware tree selection's MoE routes
 # between pipeline stages.
-_MOE_ROUTES_KEY = "tree_moe_routes"
 
 
 def _tree_ensure_staged(
@@ -858,50 +851,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     ),
                     self.device,
                 )
-
-        # Expert-aware tree selection: learn the target's MoE routing from
-        # every forward and let the tree builder price nodes by the experts
-        # they add, at the adaptive width controller's tokens-per-ms rate,
-        # scaled by the expert cost it learns from measured step times. Every
-        # stage captures its own MoE layers' routing; under pipeline
-        # parallelism each stage relays the routes so far on with its hidden
-        # states (_relay_moe_routes), so the drafting (last) stage, which
-        # builds the trees, learns and prices every MoE layer.
-        self._moe_routing: MoERoutingPredictor | None = None
-        self._moe_capture: MoERoutingCapture | None = None
-        self._tree_lam: torch.Tensor | None = None
-        if spec is not None and spec.tree_selection == "df2t_moe":
-            capture = bind_moe_routing_capture(
-                self.model, self.vllm_config, self.max_num_tokens
-            )
-            if self.use_pp:
-                pp_group = get_pp_group()
-                stage_layers: list[Any] = [None] * pp_group.world_size
-                torch.distributed.all_gather_object(
-                    stage_layers, capture.layers, group=pp_group.cpu_group
-                )
-                capture.layers = sorted({x for layers in stage_layers for x in layers})
-                self._moe_capture = capture
-        if (
-            self.speculator is not None
-            and spec is not None
-            and (spec.tree_selection == "df2t_moe")
-        ):
-            self._moe_routing = build_moe_routing_predictor(
-                self.model,
-                self.vllm_config,
-                capture,
-                self.max_num_reqs,
-                self.device,
-            )
-            if self._tree_width_ctl is not None:
-                self._tree_width_ctl.set_expert_meter(
-                    self._moe_routing.forward_cost_total
-                )
-            self._tree_lam = torch.zeros(1, dtype=torch.float32, device=self.device)
-            self.speculator.tree_selector.bind_routing(  # type: ignore[union-attr]
-                self._moe_routing, self._tree_lam
-            )
 
         if self.parallel_config.enable_batch_sharded_sampling:
             if hasattr(self.model, "compute_logits_local"):
@@ -1709,24 +1658,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
     def _select_tree_width(self, slots: np.ndarray, timed: bool) -> int:
-        """The adaptive verify width for requests ``slots``, and (for
-        expert-aware selection) the selector's price of an expert and node
-        budget for the trees it drafts next. ``timed``: whether the step
-        since the previous selection was a pure tree decode step."""
+        """The adaptive verify width for requests ``slots``. ``timed``:
+        whether the step since the previous selection was a pure tree decode
+        step."""
         ctl = self._tree_width_ctl
         assert ctl is not None
         width = ctl.select(slots, timed)
-        lam = getattr(self, "_tree_lam", None)
-        price = ctl.throughput * ctl.expert_cost_scale if lam is not None else 0.0
         parallel_config = getattr(self, "parallel_config", None)
         if parallel_config is not None and parallel_config.tensor_parallel_size > 1:
             # Tensor-parallel ranks time their own steps, so their controllers
             # drift apart; they must verify the same width (or their
             # collectives mismatch) and draft the same trees: rank 0 decides.
-            width, price = get_tp_group().broadcast_object((width, price), src=0)
-        if lam is not None:
-            lam.fill_(price)
-            self.speculator.tree_selector.aware_nodes.fill_(width)  # type: ignore[union-attr]
+            width = get_tp_group().broadcast_object(width, src=0)
         return width
 
     @torch.inference_mode()
@@ -3760,11 +3703,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 for k, v in self.intermediate_tensors.tensors.items()
             }
             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
-            routes = intermediate_tensors.tensors.get(_MOE_ROUTES_KEY)
-            if self._moe_capture is not None and routes is not None and not dummy_run:
-                # Earlier stages' MoE routing for these rows; this stage's
-                # forward fills its own layers' columns.
-                self._moe_capture.routes[:n].copy_(routes[:n])
             del intermediate_tensors
 
         # Update the EPLB meta.
@@ -3854,9 +3792,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states = None
             aux_hidden_states = None
             output_intermediate_tensors = model_output
-        if self._moe_routing is not None and not dummy_run:
-            self._moe_routing.observe_forward(input_batch)
-
         finished_req_ids = scheduler_output.finished_req_ids
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
@@ -3877,18 +3812,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output = self.pp_handler.relay_aux_hidden_states(
                 model_inputs["intermediate_tensors"], output_intermediate_tensors
             )
-            if self._moe_capture is not None:
-                # The MoE routing of every layer so far, for the drafting
-                # stage's expert-aware tree selection. (The send completes
-                # before this stage's next forward rewrites the buffer.)
-                output = IntermediateTensors(
-                    output.tensors
-                    | {
-                        _MOE_ROUTES_KEY: self._moe_capture.routes[
-                            : input_batch.num_tokens_after_padding
-                        ]
-                    }
-                )
             return output
         return None
 

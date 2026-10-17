@@ -53,15 +53,6 @@ _RING = 4
 # the cap on a measured interval relative to its prediction.
 _COST_ALPHA = 1.0 / 64
 _MAX_STEP_RATIO = 3.0
-# Learned expert cost: EMA weight of the regression moments, the steps over
-# which the fit takes over from the prior scale (1: the bandwidth estimate),
-# the ratio past which a step is left out of the fit (it likely spans other
-# work), and the scale's cap.
-_FIT_ALPHA = 1.0 / 512
-_FIT_PRIOR_STEPS = 64
-_FIT_MAX_RATIO = 1.5
-_MAX_EXPERT_SCALE = 8.0
-_SNAP_RING = 64
 # Log the width choice's inputs this often (in selections).
 _LOG_EVERY = 256
 # Every this many selections, verify a width with fewer cost samples than this.
@@ -210,29 +201,12 @@ class TreeWidthController:
         self.throughput = 0.0
         self._cost_samples = np.zeros(nl, dtype=np.int64)
         self._next_event = torch.cuda.Event(enable_timing=True)
-        self._open: tuple[torch.cuda.Event, int, int, int] | None = None
-        self._timed: deque[
-            tuple[torch.cuda.Event, int, int, int, torch.cuda.Event, int]
-        ] = deque()
-        # Expert-aware selection: a device running total of the estimated
-        # cost of the experts each forward routed to, snapshotted with every
-        # step mark. Regressing step times on each step's share of it learns
-        # how much an estimated ms of experts really costs (expert_cost_scale).
-        self._expert_meter: torch.Tensor | None = None
-        self._snaps = torch.zeros(_SNAP_RING, dtype=torch.float64, pin_memory=pin)
-        self._snaps_np = self._snaps.numpy()
-        self._num_snaps = 0
-        self._x_mean: dict[tuple[int, int], float] = {}
-        self._x_count: dict[tuple[int, int], int] = {}
-        self._fit_xx = 0.0
-        self._fit_xr = 0.0
-        self._fit_n = 0
-        self.expert_cost_scale = 1.0
+        self._open: tuple[torch.cuda.Event, int, int] | None = None
+        self._timed: deque[tuple[torch.cuda.Event, int, int, torch.cuda.Event]] = (
+            deque()
+        )
         self._num_selects = 0
         self._num_blind = 0
-
-    def set_expert_meter(self, total: torch.Tensor) -> None:
-        self._expert_meter = total
 
     def add_request(self, slot: int) -> None:
         self.first_built_step[slot] = -1
@@ -341,35 +315,19 @@ class TreeWidthController:
         interval this mark closes covered a pure tree decode step (not a
         prefill, nor an engine idle between requests), so it is a sample of
         its width's cost."""
-        snap = -1
-        if self._expert_meter is not None:
-            snap = self._num_snaps
-            self._num_snaps += 1
-            self._snaps[snap % _SNAP_RING].copy_(
-                self._expert_meter[0], non_blocking=True
-            )
         if self._open is not None and timed:
-            self._timed.append((*self._open, self._next_event, snap))
-        self._open = (self._next_event, j, n, snap)
+            self._timed.append((*self._open, self._next_event))
+        self._open = (self._next_event, j, n)
         self._next_event.record()
         self._next_event = torch.cuda.Event(enable_timing=True)
-        while self._timed and self._timed[0][4].query():
-            start, pj, pn, s0, end, s1 = self._timed.popleft()
-            x = None
-            if s0 >= 0 and self._num_snaps - s0 <= _SNAP_RING:
-                snaps = self._snaps_np
-                x = float(snaps[s1 % _SNAP_RING] - snaps[s0 % _SNAP_RING])
-            self.observe_step_time(pj, pn, start.elapsed_time(end), x)
+        while self._timed and self._timed[0][3].query():
+            start, pj, pn, end = self._timed.popleft()
+            self.observe_step_time(pj, pn, start.elapsed_time(end))
 
-    def observe_step_time(
-        self, j: int, n: int, ms: float, expert_ms: float | None = None
-    ) -> None:
+    def observe_step_time(self, j: int, n: int, ms: float) -> None:
         """Fold a measured step time (``widths[j]``, ``n`` requests) into the
-        width's cost correction, and with the estimated cost of the experts
-        the step routed to (``expert_ms``), into the learned expert cost."""
+        width's cost correction."""
         predicted = self.step_cost_ms(n)[j]
-        if expert_ms is not None and ms <= _FIT_MAX_RATIO * predicted:
-            self._fit_expert_cost(j, n, ms - predicted, expert_ms)
         # An interval spanning other work (a prefill, an idle engine)
         # overstates this width's cost, so one sample moves the estimate by a
         # bounded amount; a real, larger cost still converges.
@@ -379,31 +337,6 @@ class TreeWidthController:
         self._cost_samples[j] += 1
         alpha = max(_COST_ALPHA, 1.0 / self._cost_samples[j])
         self.cost_delta_ms[j] += alpha * (ms - predicted)
-
-    def _fit_expert_cost(
-        self, j: int, n: int, residual_ms: float, expert_ms: float
-    ) -> None:
-        # Within one (width, request count), the step time varies with the
-        # experts the rows route to and little else, so the slope of the
-        # time residual over the expert estimate's deviation from its mean
-        # is the real cost of an estimated ms of experts.
-        key = (j, n)
-        count = self._x_count.get(key, 0) + 1
-        self._x_count[key] = count
-        mean = self._x_mean.get(key, expert_ms)
-        dx = expert_ms - mean
-        self._x_mean[key] = mean + max(_COST_ALPHA, 1.0 / count) * dx
-        if count == 1:
-            return
-        self._fit_n += 1
-        a = max(_FIT_ALPHA, 1.0 / self._fit_n)
-        self._fit_xx += a * (dx * dx - self._fit_xx)
-        self._fit_xr += a * (dx * residual_ms - self._fit_xr)
-        if self._fit_xx <= 0.0:
-            return
-        slope = min(max(self._fit_xr / self._fit_xx, 0.0), _MAX_EXPERT_SCALE)
-        w = self._fit_n / (self._fit_n + _FIT_PRIOR_STEPS)
-        self.expert_cost_scale = w * slope + (1.0 - w)
 
     def select(self, slots: np.ndarray, timed: bool = True) -> int:
         """Verify width for a decode batch over request-state ``slots``.
@@ -440,8 +373,8 @@ class TreeWidthController:
         cost = self.step_cost_ms(n)
         rate = (n + expected) / cost
         j = int(np.argmax(rate))
-        # Expected tokens per ms at the chosen width: what a ms of verify cost
-        # is worth in tokens (expert-aware tree selection prices with it).
+        # Expected tokens per ms at the chosen width: what a ms of verify
+        # cost is worth in tokens.
         self.throughput = float(rate[j])
         self._num_selects += 1
         if self._num_selects % _EXPLORE_EVERY == 0:
@@ -453,14 +386,13 @@ class TreeWidthController:
         if self._num_selects % _LOG_EVERY == 0:
             logger.info(
                 "Tree width: %d reqs, widths %s, expected tokens %s, step ms %s "
-                "(measured steps %s), chose %d; expert cost scale %.2f",
+                "(measured steps %s), chose %d",
                 n,
                 self.widths,
                 np.round(n + expected, 2).tolist(),
                 np.round(cost, 1).tolist(),
                 self._cost_samples.tolist(),
                 self.widths[j],
-                self.expert_cost_scale,
             )
         self._time_step(j, n, timed)
         return self.widths[j]
