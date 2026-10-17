@@ -316,8 +316,8 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
-    # req_id -> stashed df2t tree, parallel to scheduled_spec_decode_tokens.
-    # Only present for tree (df2t) requests; empty for all other methods.
+    # req_id -> stashed tree, parallel to scheduled_spec_decode_tokens.
+    # Only present for tree requests; empty for all other methods.
     spec_tree_draft: "dict[str, StashedTree]" = field(default_factory=dict)
 
     @classmethod

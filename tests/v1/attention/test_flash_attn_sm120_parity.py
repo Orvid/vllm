@@ -3,13 +3,14 @@
 """FA4 parity and selection on SM120 (RTX 5090, compute capability 12.0).
 
 FA4 is available on consumer Blackwell, but `get_flash_attn_version` only
-selects it under df2t speculative decoding; without a df2t speculative config
+selects it under tree verification speculative decoding; without a tree
+# speculative config
 SM120 keeps resolving to FA2 exactly as before. These tests pin both sides of
 that gate and run the adopted FA4 CuTe-DSL forward against FA2 and a dense
 float32 SDPA reference.
 
 All configs are built offline from a locally-written minimal Qwen3-0.6B
-config.json (no HuggingFace access), mirroring the df2t spec-decode fixtures.
+config.json (no HuggingFace access), mirroring the tree verify spec-decode fixtures.
 """
 
 import json
@@ -131,7 +132,7 @@ def _real_df2t_vllm_config(qwen3_config_path, flash_attn_version=None):
     """A VllmConfig built with a REAL df2t SpeculativeConfig.
 
     Passing a real SpeculativeConfig means ``VllmConfig.__post_init__`` runs
-    the df2t attention cross-validation (``_validate_tree_attention``) at
+    the tree verify attention cross-validation (``_validate_tree_attention``) at
     construction time, exercising the wiring rather than an isolated method.
     """
     from types import SimpleNamespace
@@ -190,7 +191,7 @@ def _real_df2t_vllm_config(qwen3_config_path, flash_attn_version=None):
 
 @requires_sm120_fa4
 def test_get_flash_attn_version_gates_fa4_on_df2t(qwen3_config_path):
-    """SM120 resolves FA2 by default and only upgrades to FA4 under df2t.
+    """SM120 resolves FA2 by default and only upgrades to FA4 under tree verification.
 
     The gate is the active speculative config (via `set_current_vllm_config`),
     so a non-df2t speculative decoder must NOT pull in FA4.
@@ -216,7 +217,8 @@ def test_get_flash_attn_version_gates_fa4_on_df2t(qwen3_config_path):
 
 @requires_sm120_fa4
 def test_df2t_forced_fa2_override_raises(qwen3_config_path):
-    """Explicitly forcing FA2 under df2t must error, never silently fall back.
+    """Explicitly forcing FA2 under tree verification must error, never
+    silently fall back.
 
     The allowed set is {fa4, flex}: an explicit ``flash_attn_version=2``
     override is rejected both at VllmConfig construction (real df2t
@@ -236,7 +238,7 @@ def _minimal_df2t_validate_config(*, rswa_window=None, is_mm_prefix_lm=False):
 
     ``_validate_tree_attention`` only reads the speculative config's
     ``use_df2t()`` (confirmed df2t) plus the attention/model surface relevant
-    to the df2t mask vehicles. This avoids rebuilding a full model just to
+    to the tree verify mask vehicles. This avoids rebuilding a full model just to
     reject an R-SWA or prefix-LM target.
     """
     from types import SimpleNamespace
@@ -277,7 +279,7 @@ def test_df2t_validate_rejects_mm_prefix_target(qwen3_config_path):
 
 @requires_sm120_fa4
 def test_df2t_validate_accepts_plain_target(qwen3_config_path):
-    """A plain (non-R-SWA, non-mm-prefix) df2t target passes the df2t attention
+    """A plain (non-R-SWA, non-mm-prefix) df2t target passes the tree verify attention
     validation unchanged."""
     cfg = _minimal_df2t_validate_config()
     cfg._validate_tree_attention()  # no raise
@@ -297,7 +299,7 @@ def test_df2t_forced_fa3_override_raises_on_major10(monkeypatch, qwen3_config_pa
     """df2t + an explicit fa3 override on a Blackwell major raises like fa2.
 
     The pre-existing major>=10 fallback normalizes an explicit fa3 to FA4 for
-    non-df2t runs; under df2t (non-flex) that silent normalization must not
+    non-tree runs; under tree verification (non-flex) that silent normalization must not
     apply — the override raises at runtime too. Non-df2t behavior is
     unchanged.
     """

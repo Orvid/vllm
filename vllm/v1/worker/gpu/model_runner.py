@@ -219,32 +219,32 @@ _MOE_ROUTES_KEY = "tree_moe_routes"
 
 def _tree_ensure_staged(
     *,
-    use_df2t: bool,
+    use_tree: bool,
     num_draft_tokens: int,
     trees_staged: bool,
     in_kernel_warmup: bool = False,
 ) -> None:
-    """Fail closed when a df2t decode batch schedules drafts without trees.
+    """Fail closed when a tree decode batch schedules drafts without trees.
 
-    The sampler dispatch branches on ``input_batch.trees``: a df2t batch whose
+    The sampler dispatch branches on ``input_batch.trees``: a tree batch whose
     drafts arrived without any stashed tree (``use_trees`` False) would
     otherwise fall through to the chain ``RejectionSampler``. DF2T never
     populates ``draft_logits`` on the real tree path, so at T>0 a chain
-    rejection is against a meaningless ``q``. A df2t decode batch must always
+    rejection is against a meaningless ``q``. A tree decode batch must always
     carry its trees; a batch that legitimately has none this step is the
     treeless/prefill path, which schedules no drafts (``num_draft_tokens ==
     0``) and takes the sampler path before this guard. The header guard only
-    fires for a TREE-enabled df2t (``use_tree()``), so chain methods
-    (eagle/dflash, and tree-off df2t) that reject with real draft_logits are
+    fires for a TREE-enabled tree verification (``use_tree()``), so chain methods
+    (eagle/dflash, and tree-off verification) that reject with real draft_logits are
     untouched.
 
     ``in_kernel_warmup`` suppresses the guard during the mock prefill/decode
     kernel-warmup steps (gpu/warmup.py), which intentionally schedule draft
     tokens without a stashed tree and whose sampled output is discarded.
     """
-    if use_df2t and num_draft_tokens > 0 and not trees_staged and not in_kernel_warmup:
+    if use_tree and num_draft_tokens > 0 and not trees_staged and not in_kernel_warmup:
         raise RuntimeError(
-            "df2t decode batch scheduled draft tokens but carried no stashed "
+            "tree decode batch scheduled draft tokens but carried no stashed "
             "tree (the tree was dropped), so the tree-verify mask/rows have no "
             "tree to work from. Refusing to fall through to chain rejection "
             "sampling against meaningless draft_logits."
@@ -263,7 +263,7 @@ def _tree_logprobs(
     logprob_token_ids_state=None,
     max_per_req_token_ids: int = 0,
 ) -> LogprobsTensors | None:
-    """Per-emitted-token logprobs for the df2t verify block.
+    """Per-emitted-token logprobs for the tree verify block.
 
     Each emitted token (accepted path + the terminal/resampled token) was drawn
     from a specific verify row: the chain-depth-0 token from the anchor row
@@ -383,7 +383,7 @@ def _tree_chain_context(
     tree_batch: "TreeBatch | None" = None,
     cu: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Tree-correct accepted-chain context for the df2t verify block.
+    """Tree-correct accepted-chain context for the tree verify block.
 
     The additive logits processors (penalties, bad words, thinking budget and
     custom processors) assume a linear draft chain: a row's "already emitted"
@@ -464,7 +464,7 @@ def _resolve_decode_query_len(
 ) -> int:
     """Resolve the per-request decode query width for the target forward.
 
-    For df2t the target verifies the static tree width
+    For tree verification the target verifies the static tree width
     (``tree_decode_width = 1 + nodes_max``, the uniform decode-graph width,
     which can exceed the drafter block depth); the reservation ceiling ``1 +
     max_tree_budget`` (``tree_lookahead``) is a separate buffer quantity and
@@ -600,13 +600,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             vocab_size=self.vocab_size,
             device=self.device,
             num_prefill_lookahead=num_prefill_lookahead,
-            # df2t carries tree_decode_width - 1 drafts per request (the tree
+            # Tree verify carries tree_decode_width - 1 drafts per request (the tree
             # width, which can exceed the drafter block depth); other methods
             # carry num_speculative_steps.
             num_draft_tokens=self._draft_carry_width(),
         )
         self.adaptive_verification: AdaptiveVerificationManager | None = None
-        # df2t flex tree verify: per-request mask inputs staged by
+        # flex tree verify: per-request mask inputs staged by
         # ``prepare_inputs`` and attached to the Flex metadata in
         # ``execute_model``. Stays None except on flex-tree batches.
         self._pending_tree_flex_mask: (
@@ -620,7 +620,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ]
             | None
         ) = None
-        # df2t fa4 tree verify: same staging for the FlashAttention-4 mask_mod
+        # fa4 tree verify: same staging for the FlashAttention-4 mask_mod
         # vehicle (``tree_attention_backend == "fa4"``, the default). Stays
         # None except on fa4-tree batches.
         self._pending_tree_fa4_mask: (
@@ -634,7 +634,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ]
             | None
         ) = None
-        # df2t device-resident tree carry: one packed row per request state
+        # tree device-resident tree carry: one packed row per request state
         # (tokens | depths | parents | words | num_nodes, see TreeBuilder),
         # written after each draft and gathered by the next step's
         # prepare_inputs; the host flag marks slots holding a current tree.
@@ -651,7 +651,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._tree_mask_depths: torch.Tensor | None = None
         # Set by the kernel-warmup path (gpu/warmup.py) for the duration of its
         # mock prefill/decode steps: those schedule draft tokens without any
-        # stashed df2t tree, so df2t guards that would otherwise fire on a real
+        # stashed tree, so tree guards that would otherwise fire on a real
         # dropped-tree batch must stay silent there.
         self._kernel_warmup = False
         self.input_buffers = InputBuffers(
@@ -684,10 +684,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # model_state exists (num_new_sampled_tokens_per_step from ModelState).
         self.sampler: Sampler | None = None
         self.rejection_sampler: RejectionSampler | None = None
-        # DF2T tree-traversal verifier (used only when method=="df2t"); a
+        # tree-traversal verifier (used only when method=="df2t"); a
         # sibling of RejectionSampler with the same output contract.
         self.tree_verifier: TreeVerifier | None = None
-        # df2t accepted-KV compactor and its memory-profiling reservation (see
+        # tree accepted-KV compactor and its memory-profiling reservation (see
         # ``_reserve_tree_compaction`` / ``_init_tree_compaction``). The
         # reservation is allocated during the profiling phase so the compactor
         # buffers are inside the GPU reservation; the compactor itself reuses
@@ -727,7 +727,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _draft_carry_width(self) -> int:
         """Per-request draft-carry width (the drain slots the scheduler reads).
 
-        df2t carries ``tree_decode_width - 1`` (the tree width, which can
+        tree verification carries ``tree_decode_width - 1`` (the tree width, which can
         exceed the drafter block depth); other speculative methods carry
         ``num_speculative_steps``.
         """
@@ -802,7 +802,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.num_speculative_steps,
             self.model_state.num_new_sampled_tokens_per_step,
         )
-        # Adaptive df2t verify width (``adaptive_tree_width``): the uniform
+        # Adaptive tree verify width (``adaptive_tree_width``): the uniform
         # decode query lengths a step may run at, and the width chooser.
         self._tree_width_ctl: TreeWidthController | None = None
         self._tree_pp_widths: np.ndarray | None = None
@@ -995,7 +995,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.device,
                         num_rounds=min(nodes_max, max_depth) + 1,
                     )
-                    # The df2t drafter conditions its next step on the
+                    # The tree drafter conditions its next step on the
                     # accepted chain; give it the verifier it reads that from.
                     setter = getattr(self.speculator, "set_tree_verifier", None)
                     if setter is not None:
@@ -1360,7 +1360,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         if uniform_query_len is not None:
             # A uniform decode at a query length other than decode_query_len
-            # (an adaptive df2t verify width).
+            # (an adaptive tree verify width).
             assert num_tokens % uniform_query_len == 0
             num_reqs = num_tokens // uniform_query_len
         elif uniform_decode:
@@ -1566,7 +1566,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _make_tree_capture_mask_attach(self) -> Callable[[dict[str, Any]], None]:
         """Return a hook attaching the FA4 tree mask to captured metadata.
 
-        The static df2t path captures its ``1 + B`` uniform tree-verify decode
+        The static tree path captures its ``1 + B`` uniform tree-verify decode
         through the V2 uniform FULL-graph machinery. The tree ``mask_mod`` and
         its aux pools are data-dependent per step, so capture bakes the
         ``mask_mod`` closure plus the persistent aux buffer addresses into the
@@ -1579,23 +1579,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert spec is not None
         if spec.tree_attention_backend != "fa4":
             raise RuntimeError(
-                "df2t CUDA-graph capture of the tree-verify decode currently "
+                "tree CUDA-graph capture of the tree-verify decode currently "
                 f"supports tree_attention_backend='fa4' only, got "
-                f"'{spec.tree_attention_backend}'. Run df2t with "
+                f"'{spec.tree_attention_backend}'. Run tree verification with "
                 "'fa4' (the default) under cudagraph mode, or keep flex eager "
                 "(-cc.cudagraph_mode=none)."
             )
         mode = self.compilation_config.cudagraph_mode
         if mode is None or not mode.has_full_cudagraphs():
-            # df2t tree-verify capture is the FULL uniform 1+B decode graph
+            # tree-verify capture is the FULL uniform 1+B decode graph
             # only; a mode without FULL (e.g. PIECEWISE-only) can never serve
             # it, and baking the mask into PIECEWISE descriptors is unsafe
             # (wrong q layout for mixed batches). Fail closed rather than
             # capture graphs that would be replayed without the mask.
             raise RuntimeError(
-                "df2t CUDA-graph capture requires a cudagraph mode with FULL "
+                "tree CUDA-graph capture requires a cudagraph mode with FULL "
                 "decode graphs (FULL / FULL_DECODE_ONLY / FULL_AND_PIECEWISE), "
-                f"got cudagraph_mode={mode}. Run df2t with a FULL-capable "
+                f"got cudagraph_mode={mode}. Run tree verification with a FULL-capable "
                 "cudagraph mode or cudagraph_mode=none (eager)."
             )
         width = spec.max_tree_budget
@@ -1628,9 +1628,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return attach
 
     def _tree_force_eager(self, uniform_tok_count: int | None) -> bool:
-        """Whether a scheduled batch must run eager under df2t CUDA graphs.
+        """Whether a scheduled batch must run eager under tree CUDA graphs.
 
-        df2t captures and replays the target tree-verify decode only as a FULL
+        Tree verify captures and replays the target tree-verify decode only as a FULL
         uniform ``(num_reqs, 1 + B)`` graph: the tree mask is baked into FULL
         captures, whose q_idx layout is that verify block alone. Any other
         batch shape (a co-scheduled prefill chunk, a treeless decode) must not
@@ -1845,7 +1845,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and self.speculative_config is not None
             and (self.speculative_config.use_tree())
         ):
-            # df2t captures its uniform 1+B target tree-verify decode through
+            # Tree verify captures its uniform 1+B target tree-verify decode through
             # the V2 uniform FULL-graph machinery, with the FA4 tree mask
             # baked into the captured metadata (see
             # _make_tree_capture_mask_attach). Configs the capture cannot yet
@@ -2255,7 +2255,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     trees = tree_batch.drafts
         use_trees = tree_batch is not None
 
-        # df2t flex/fa4 verify: stage the per-request tree mask inputs (context
+        # flex/fa4 verify: stage the per-request tree mask inputs (context
         # length C per request, ancestor-or-self words) so execute_model can
         # attach them to the Flex/FA4 metadata after prepare_attn.
         self._stage_tree_flex_mask(use_trees, trees, num_reqs, idx_mapping)
@@ -2338,7 +2338,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         if trees is not None:
-            # df2t tree verify block: snapshot consecutive positions for slot
+            # tree verify block: snapshot consecutive positions for slot
             # mapping, then rewrite the block rows (see prepare_tree_inputs).
             slot_positions = self.input_buffers.slot_positions[
                 :num_tokens_after_padding
@@ -2453,9 +2453,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_reqs: int,
         idx_mapping: torch.Tensor,
     ) -> None:
-        """Stage the df2t flex-tree per-request mask inputs, or clear them.
+        """Stage the flex-tree per-request mask inputs, or clear them.
 
-        Only active on df2t tree batches with ``tree_attention_backend ==
+        Only active on tree batches with ``tree_attention_backend ==
         "flex"``; and attaches the tree mask in ``execute_model``. For every
         other batch the pending field is cleared so no stale mask leaks into a
         later step.
@@ -2498,7 +2498,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
     def _tree_verify_layer_names(self) -> set[str]:
-        """Layer names whose group runs the df2t tree verify block.
+        """Layer names whose group runs the tree verify block.
 
         These are the target model's FlexAttention full-attention layers
         (the layers the selector forced to Flex under
@@ -2519,7 +2519,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return names
 
     def _attach_tree_flex_mask(self, attn_metadata: dict[str, Any] | None) -> None:
-        """Attach the staged df2t tree mask to the Flex verify metadata."""
+        """Attach the staged tree mask to the Flex verify metadata."""
         pending = self._pending_tree_flex_mask
         self._pending_tree_flex_mask = None
         if pending is None or attn_metadata is None:
@@ -2552,7 +2552,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             attached = True
         if not attached:
             raise ValueError(
-                "tree_attention_backend='flex' requires running the df2t "
+                "tree_attention_backend='flex' requires running the tree verify "
                 "verify forward on the FlexAttention backend, but no "
                 "FlexAttentionMetadata was produced. Select FlexAttention "
                 "for the target (or set tree_attention_backend='fa4')."
@@ -2622,7 +2622,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             missing = scheduled & ~self._tree_valid[idx_mapping_np]
             if missing.any():
                 raise RuntimeError(
-                    "df2t decode batch scheduled draft tokens for requests "
+                    "tree decode batch scheduled draft tokens for requests "
                     f"{[r for r, m in zip(req_ids, missing) if m]} that have no "
                     "drafted tree; refusing to verify drafts without a tree."
                 )
@@ -2641,9 +2641,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         idx_mapping: torch.Tensor,
         tree_batch: "TreeBatch | None" = None,
     ) -> None:
-        """Stage the df2t fa4-tree per-request mask inputs, or clear them.
+        """Stage the fa4-tree per-request mask inputs, or clear them.
 
-        Only active on df2t tree batches with ``tree_attention_backend ==
+        Only active on tree batches with ``tree_attention_backend ==
         "fa4"`` (the default); attaches the FA4 CuTE-DSL mask ``mask_mod`` in
         ``execute_model``. Writes into the persistent aux pools so the values
         are visible to the captured tree graph at replay. For every other
@@ -2730,10 +2730,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return windows
 
     def _fa4_tree_verify_layer_names(self) -> set[str]:
-        """Layer names whose group runs the df2t tree verify block on FA4.
+        """Layer names whose group runs the tree verify block on FA4.
 
         These are the target model's FlashAttention full-attention layers (the
-        df2t verify vehicle under ``tree_attention_backend == "fa4"``). A
+        tree verify vehicle under ``tree_attention_backend == "fa4"``). A
         metadata from any other group (a drafter or a prefill/encoder group,
         running in its own speculator) shares no logical slot space with the
         tree block and must never receive the tree mask.
@@ -2780,7 +2780,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return False
 
     def _attach_tree_fa4_mask(self, attn_metadata: dict[str, Any] | None) -> None:
-        """Attach the staged df2t fa4 tree mask to the FA4 verify metadata."""
+        """Attach the staged fa4 tree mask to the FA4 verify metadata."""
         pending = self._pending_tree_fa4_mask
         self._pending_tree_fa4_mask = None
         if pending is None:
@@ -2809,13 +2809,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         The mask is built per distinct sliding window among the target layers:
         a windowed layer gets the positional-window-composed mask (see
         ``build_fa4_tree_mask``) and a window-less layer the plain tree mask,
-        so the df2t verify no longer widens windowed layers to full context.
+        so the tree verify no longer widens windowed layers to full context.
         """
         if attn_metadata is None:
             # A staged tree mask must never silently vanish: no attention
-            # metadata produced on a df2t fa4-tree batch is a hard failure.
+            # metadata produced on a fa4-tree batch is a hard failure.
             raise RuntimeError(
-                "a staged df2t fa4 tree mask was dropped because no attention "
+                "a staged fa4 tree mask was dropped because no attention "
                 "metadata was produced this step; refusing to run the verify "
                 "forward without the tree mask."
             )
@@ -2839,8 +2839,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # is page_size * pages_per_seq, see the task 14 fix). Never attach
             # with an undeterminable page size.
             raise RuntimeError(
-                "cannot determine the KV page size for the df2t tree-verify "
-                "FA4 mask; refusing to attach without it. Ensure the df2t "
+                "cannot determine the KV page size for the tree-verify "
+                "FA4 mask; refusing to attach without it. Ensure the tree verify "
                 "target's FlashAttention KV cache group is present in "
                 "kv_cache_config (or set tree_attention_backend='flex')."
             )
@@ -2878,7 +2878,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             attached = True
         if not attached:
             raise ValueError(
-                "tree_attention_backend='fa4' requires running the df2t "
+                "tree_attention_backend='fa4' requires running the tree verify "
                 "verify forward on the FlashAttention-4 backend, but no "
                 "FlashAttentionMetadata carrying FA4 was produced. Select "
                 "FlashAttention for the target (or set "
@@ -2897,7 +2897,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         # Slot mappings: [num_kv_cache_groups, num_tokens_padded].
         # Kernel pads beyond num_tokens with PAD_SLOT_ID.
-        # df2t tree batches map slots through slot_positions (arena-decoupled
+        # tree batches map slots through slot_positions (arena-decoupled
         # from RoPE positions); otherwise slots follow the positions directly.
         positions = (
             input_batch.slot_positions
@@ -2984,12 +2984,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert self.tree_verifier is not None
             sampler_output = self._tree_verify(logits, input_batch)
         else:
-            # Rejection sampling for spec decoding. A df2t batch must always
+            # Rejection sampling for spec decoding. A tree batch must always
             # carry its tree: drafts without a stashed tree would reject
-            # against meaningless draft_logits (df2t never writes them).
+            # against meaningless draft_logits (tree verification never writes them).
             assert self.speculative_config is not None
             _tree_ensure_staged(
-                use_df2t=self.speculative_config.use_tree(),
+                use_tree=self.speculative_config.use_tree(),
                 num_draft_tokens=input_batch.num_draft_tokens,
                 trees_staged=input_batch.trees is not None,
                 in_kernel_warmup=getattr(self, "_kernel_warmup", False),
@@ -3048,7 +3048,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return min(nodes_max, spec.max_tree_depth)
 
     def _reserve_tree_compaction(self) -> None:
-        """Reserve the df2t compaction buffers inside the memory-profiling pass.
+        """Reserve the tree compaction buffers inside the memory-profiling pass.
 
         ``TreeKVCompaction`` holds a persistent plan + scratch whose size is
         bounded only by the tree budget and ``max_num_reqs``; created lazily on
@@ -3088,7 +3088,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             nbytes, dtype=torch.uint8, device=self.device
         )
         logger.info(
-            "df2t compaction reserved %.2f MiB for the per-step plan+scratch "
+            "tree compaction reserved %.2f MiB for the per-step plan+scratch "
             "(precise, inside the GPU reservation)",
             nbytes / (1 << 20),
         )
@@ -3108,7 +3108,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert self._kv_cache_views_by_name is not None
         if storage is None:
             raise RuntimeError(
-                "df2t compaction has no profiling-phase reservation: the "
+                "tree compaction has no profiling-phase reservation: the "
                 "memory-profiling pass must run before the KV cache is built"
             )
         layer_segments, scratch_ratios, max_nodes = self._tree_compaction_layout()
@@ -3144,7 +3144,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return layer_segments, spec.tree_scratch_ratios, spec.num_draft_rows_per_req
 
     def _compact_tree_accepted_kv(self, input_batch: InputBatch) -> None:
-        """Relocate accepted-tree KV to canonical slots (df2t KV compaction).
+        """Relocate accepted-tree KV to canonical slots (tree KV compaction).
 
         The tree verify writes each accepted node's K/V at its scattered
         tree-block slot ``C + 1 + arena`` (the tree-verify layout); inference reads
@@ -3234,7 +3234,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # per-step device->host sync.
         cu = input_batch.cu_num_logits_np
         assert cu is not None, (
-            "df2t verify requires the host cu_num_logits mirror; "
+            "tree verify requires the host cu_num_logits mirror; "
             "make_input_batch must fill cu_num_logits_np"
         )
         b_vals = [t.token_ids.shape[0] if t is not None else 0 for t in trees]
@@ -3261,7 +3261,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # The full ordinary-decode logits pipeline (penalties, custom
-        # processors, min_p, temperature, top-k/top-p). A df2t request must
+        # processors, min_p, temperature, top-k/top-p). A tree request must
         # never silently drop its active sampling/processing configuration.
         positions = input_batch.positions[input_batch.logits_indices]
         processed = self.sampler.apply_sampling_params(
@@ -3382,7 +3382,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_sampled: torch.Tensor,
         cu: np.ndarray,
     ) -> SamplerOutput:
-        """Shared tail of the df2t verify: rejection counts, logprobs and the
+        """Shared tail of the tree verify: rejection counts, logprobs and the
         accepted-KV compaction."""
         assert self.sampler is not None
         ss = self.sampler.sampling_states
@@ -3395,7 +3395,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         # Real per-emitted-token logprobs: each token's target logprob is the
         # log-softmax of the processed distribution at the row it was drawn
-        # from (the accepted chain context), so a df2t ``logprobs`` request
+        # from (the accepted chain context), so a tree ``logprobs`` request
         # returns the same per-token logprobs the plain target would.
         idx_np = input_batch.idx_mapping_np
         max_logprobs = ss.max_num_logprobs(idx_np)
@@ -3543,7 +3543,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
-        # df2t runs its tree-verify decode on the FULL uniform 1+B graph only;
+        # tree runs its tree-verify decode on the FULL uniform 1+B graph only;
         # a non-uniform (mixed/prefill) batch must run eager rather than
         # dispatch to a PIECEWISE graph, whose query layout is not the verify
         # block the tree mask is defined for.
@@ -4093,7 +4093,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
-            # df2t keeps each request's tree on device beside its draft tokens
+            # Tree verify keeps each request's tree on device beside its draft tokens
             # (read by the next step's prepare_inputs). Like the draft tokens,
             # the trees reach the scheduler only when structured output needs
             # them for grammar validation.

@@ -85,7 +85,7 @@ class DraftTokensHandler:
                 # abandoned instead of tripping this.
                 if not self._tree_throwaway:
                     raise RuntimeError(
-                        "df2t tree stash from the previous step was never "
+                        "tree stash from the previous step was never "
                         "taken before the next step stashed its trees: the "
                         "scheduler would receive step N+1's trees for step N "
                         "(wrong tree => wrong mask/verify). "

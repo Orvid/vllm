@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """DF2T s-curve (server-based): tok/s + acceptance across tree_s, and T=0
 output identity across s (v5 SS3.4 invariant 3: bit/stream-identical at T=0).
 
@@ -137,5 +140,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
     main()

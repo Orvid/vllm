@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Adaptive verify width for df2t tree speculative decoding.
+"""Adaptive verify width for tree speculative decoding.
 
 Every decode step verifies the first ``w`` nodes (best-first, so a valid
 prefix tree) of every request's tree, for one ``w`` from a captured ladder. The
@@ -147,7 +147,7 @@ def _predict_kernel(
 
 
 class TreeWidthController:
-    """Chooses each decode step's df2t verify width.
+    """Chooses each decode step's tree verify width.
 
     Args:
         widths: Ascending candidate widths; the last is the drafted ``B``.

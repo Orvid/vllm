@@ -153,7 +153,7 @@ def _penalties_kernel(
     # Accumulate the already-emitted draft tokens from previous positions
     # directly into output_bin_counts (preserves its native tensor layout,
     # avoiding an expensive shared-memory layout conversion after the loop).
-    # Under a df2t tree (IS_TREE) the emitted prefix is the row's accepted
+    # Under a tree (IS_TREE) the emitted prefix is the row's accepted
     # chain (ancestors + itself in depth order) read from the per-row chain
     # table; otherwise it is the linear draft prefix in the request's block
     # (arena/local order), which is correct for a chain.

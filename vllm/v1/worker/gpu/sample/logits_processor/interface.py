@@ -88,7 +88,7 @@ class LogitsContext:
     # Exact per-row lengths on device are `pos + 1`.
     seq_lens_upper_bound_np: np.ndarray
     # [num_logits_rows] length of the row's tree-correct accepted-chain
-    # context, or None for chain layouts. Set only under df2t tree verify: it
+    # context, or None for chain layouts. Set only under tree verify: it
     # is the number of already-emitted draft tokens on the row's accepted
     # chain (``chain_prefix_len`` tokens), which may be fewer or differently
     # ordered than ``expanded_local_pos`` (arena order includes siblings).

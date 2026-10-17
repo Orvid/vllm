@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for the df2t FlexAttention tree mask.
+"""Tests for the tree verify FlexAttention tree mask.
 
 Builds the tree-verify attention mask on the FlexAttention vehicle: a
 ``logical_mask_mod`` closure over per-request ancestor words, so the verify
@@ -489,7 +489,7 @@ def test_flex_tree_mask_gates_attention(qwen3_config_path):
 
 def _fake_flex_metadata(doc_ids: torch.Tensor) -> FlexAttentionMetadata:
     """Uninitialised FlexAttentionMetadata (real class, so the runner's
-    isinstance gate passes) with only the fields the df2t attach helper and the
+    isinstance gate passes) with only the fields the tree verify attach helper and the
     assertions touch."""
     meta = object.__new__(FlexAttentionMetadata)
     meta.doc_ids = doc_ids

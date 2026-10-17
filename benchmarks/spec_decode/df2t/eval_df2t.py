@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """DF2T acceptance eval harness (Task 15, acceptance half).
 
 Drives a vLLM spec-decode server over a held-out prompt corpus and reports the
@@ -263,7 +266,7 @@ def _report(port: int, name: str, prompts: list[str], concurrency: int = 1) -> d
 
 
 def main() -> None:
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
     port = int(os.environ.get("PORT", "8006"))
     method = (
         sys.argv[sys.argv.index("--method") + 1] if "--method" in sys.argv else "df2t"

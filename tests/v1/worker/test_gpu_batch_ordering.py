@@ -253,7 +253,7 @@ def test_no_speculator_dispatches_on_query_length_alone():
 
 
 def test_df2t_decode_query_len_uses_tree_decode_width():
-    """The target verify decode width for df2t is the static tree width
+    """The target verify decode width for tree verification is the static tree width
     (``1 + nodes_max``), decoupled from ``num_speculative_steps``; other
     methods keep ``steps + bonus``."""
     df2t_cfg = SimpleNamespace(

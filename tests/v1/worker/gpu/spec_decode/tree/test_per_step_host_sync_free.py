@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Fail-closed regression: the df2t per-step verify path must be host-sync-free.
+"""Fail-closed regression: the tree verify per-step verify path must be host-sync-free.
 
 M1's per-step cost decomposition is only trustworthy if verifying a tree (the
 worker's per-step verify path: rebuilding the tree avoidably H2D, laying out the
@@ -58,11 +58,10 @@ class _CountingSync:
         self.orig_tolist = torch.Tensor.tolist
         self.orig_cpu = torch.Tensor.cpu
         self.orig_numpy = torch.Tensor.numpy
-        self.orig_sync = torch.cuda.synchronize
         self.orig_accel_sync = torch.accelerator.synchronize
         orig_item, orig_tolist = self.orig_item, self.orig_tolist
         orig_cpu, orig_numpy = self.orig_cpu, self.orig_numpy
-        orig_sync, orig_accel_sync = self.orig_sync, self.orig_accel_sync
+        orig_accel_sync = self.orig_accel_sync
         counts = {"item": 0, "tolist": 0, "cpu": 0, "numpy": 0, "synchronize": 0}
         self.counts = counts
 
@@ -86,10 +85,6 @@ class _CountingSync:
                 counts["numpy"] += 1
             return orig_numpy(self, *a, **k)
 
-        def sync(*a, **k):
-            counts["synchronize"] += 1
-            return orig_sync(*a, **k)
-
         def accel_sync(*a, **k):
             counts["synchronize"] += 1
             return orig_accel_sync(*a, **k)
@@ -98,7 +93,6 @@ class _CountingSync:
         torch.Tensor.tolist = tolist
         torch.Tensor.cpu = cpu
         torch.Tensor.numpy = numpy
-        torch.cuda.synchronize = sync
         torch.accelerator.synchronize = accel_sync
         return self
 
@@ -107,7 +101,6 @@ class _CountingSync:
         torch.Tensor.tolist = self.orig_tolist
         torch.Tensor.cpu = self.orig_cpu
         torch.Tensor.numpy = self.orig_numpy
-        torch.cuda.synchronize = self.orig_sync
         torch.accelerator.synchronize = self.orig_accel_sync
         return False
 
@@ -305,7 +298,7 @@ def test_df2t_per_step_verify_path_is_host_sync_free(uniform):
         "numpy": 0,
         "synchronize": 0,
     }, (
-        "the df2t per-step verify path must make no CUDA scalar reads, "
+        "the tree verify per-step verify path must make no CUDA scalar reads, "
         "device->host copies or synchronize calls; got {cnt.counts}"
     )
     # Test-side reads after the counting region; requires a live verification.

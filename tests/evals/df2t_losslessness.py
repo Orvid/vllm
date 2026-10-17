@@ -6,7 +6,7 @@ The verifier must emit, at every visited row, a token drawn from the target's
 fully processed distribution at that row (``argmax`` at T=0, one categorical
 draw otherwise), regardless of what the drafter proposed. Because a decoded
 token's row is always anchored at the previously accepted token, this makes the
-df2t-decoded next-token distribution identical to the target's.
+tree-decoded next-token distribution identical to the target's.
 
 This harness takes that claim at the empirical level: a synthetic Markov target
 (``P``) and an approximate drafter (``Q = P + noise``) run through the REAL
@@ -14,8 +14,8 @@ This harness takes that claim at the empirical level: a synthetic Markov target
 autoregressive decode loop. It tallies (anchor, emitted) transitions and asserts
 
   * T=0: every emitted token is bit-identical to the target's argmax at its
-    row (invariant 4) and ``KL(df2t || target)`` is ~0;
-  * production params (T>0, top-p/top-k): ``KL(df2t || target) < 1e-3``.
+    row (invariant 4) and ``KL(tree || target)`` is ~0;
+  * production params (T>0, top-p/top-k): ``KL(tree || target) < 1e-3``.
 
 Run as a test::
 
@@ -143,7 +143,7 @@ def _decode(
     seed: int,
     prod_ss: "SamplingStates | None" = None,
 ) -> tuple[torch.Tensor, int]:
-    """Batched df2t decode loop; returns the (anchor, emitted) count matrix and
+    """Batched tree decode loop; returns the (anchor, emitted) count matrix and
     the count of any emitted token that deviates from the target argmax.
 
     With ``prod_ss`` set, every target row is preprocessed through the real
@@ -257,7 +257,7 @@ def _kl_mean(
     target: torch.Tensor,
     min_samples: int,
 ) -> tuple[float, int]:
-    """Mean per-context ``KL(df2t-emitted || target)`` over contexts with at
+    """Mean per-context ``KL(tree-emitted || target)`` over contexts with at
     least ``min_samples`` transitions."""
     q = counts.to(torch.float32)
     rowsum = q.sum(-1, keepdim=True)

@@ -121,7 +121,7 @@ class InputBatch:
     # [num_reqs] set only under PCP+DCP (see CommonAttentionMetadata).
     dcp_local_seq_lens_cpu_upper_bound: torch.Tensor | None = None
 
-    # [num_tokens_after_padding] only set for df2t tree batches: the
+    # [num_tokens_after_padding] only set for tree batches: the
     # slot-position equivalent of ``positions`` (see ``prepare_tree_inputs``).
     slot_positions: torch.Tensor | None = None
 
@@ -613,7 +613,7 @@ def prepare_tree_inputs(
     num_new_sampled_tokens: int = 1,
     tree_batch: tuple[torch.Tensor, ...] | None = None,
 ) -> None:
-    """Rewrite the verify-block rows of requests that carry a df2t tree.
+    """Rewrite the verify-block rows of requests that carry a tree.
 
     For every request whose tree is not None, the trailing ``1 + B`` token rows
     (the verify block, spanning ``[query_end - num_logits, query_end)``) become
@@ -661,7 +661,7 @@ def prepare_tree_inputs(
 
     """
     num_reqs = idx_mapping.shape[0]
-    assert num_new_sampled_tokens == 1, "df2t verify supports one anchor"
+    assert num_new_sampled_tokens == 1, "tree verify supports one anchor"
     if input_ids.device.type == "cpu":
         _prepare_tree_inputs_cpu(
             input_ids,

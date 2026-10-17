@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for the df2t budget policy (``s`` scale + per-request shape).
+"""Unit tests for the tree verify budget policy (``s`` scale + per-request shape).
 
 Covers the pure ``resolve_nodes_max`` / ``shape`` operators and the
 ``BudgetPolicy`` bundle. All inputs are scalars/int, so the tests run fully

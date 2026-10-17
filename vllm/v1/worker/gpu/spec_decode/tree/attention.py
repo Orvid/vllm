@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""FlexAttention tree-apportionment mask for the df2t verify forward.
+"""FlexAttention tree-apportionment mask for the tree verify forward.
 
 The tree verify block occupies logical slots ``C .. C + B`` of a request
 (context ``< C``, anchor at ``C``, node with arena ``a`` at ``C + 1 + a``), and
@@ -186,7 +186,7 @@ def build_flex_tree_mask(
     window: int | None = None,
     depths: torch.Tensor | None = None,
 ) -> tuple[Callable, BlockSparsityHint]:
-    """Build the df2t tree verify ``logical_mask_mod`` and block-sparsity hint.
+    """Build the tree verify ``logical_mask_mod`` and block-sparsity hint.
 
     Args:
         num_reqs: Number of requests in the batch.
@@ -465,7 +465,7 @@ def build_fa4_tree_mask(
     window: int | None = None,
     depths: torch.Tensor | None = None,
 ) -> tuple[Callable, list[torch.Tensor]]:
-    """Build the df2t tree verify FA4 ``mask_mod`` and its aux tensors.
+    """Build the tree verify FA4 ``mask_mod`` and its aux tensors.
 
     Args:
         num_reqs: Number of requests in the batch. ``C_per_req``/``words``/
@@ -518,7 +518,7 @@ def attach_tree_flex_mask(
     window: int | None = None,
     depths: torch.Tensor | None = None,
 ) -> None:
-    """Attach the df2t tree mask to a built ``FlexAttentionMetadata``.
+    """Attach the tree mask to a built ``FlexAttentionMetadata``.
 
     Sets ``logical_mask_mod`` and ``block_sparsity_hint`` from
     ``build_flex_tree_mask`` (using the metadata's own ``doc_ids`` as the

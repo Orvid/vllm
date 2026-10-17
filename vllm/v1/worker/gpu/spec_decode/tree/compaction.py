@@ -343,7 +343,7 @@ def compact_accepted_chain(
     for layer in kv_caches:
         if layer.ndim != 4:
             raise ValueError(
-                "df2t compaction needs 4D [B, H, N, C] per-layer caches; "
+                "tree compaction needs 4D [B, H, N, C] per-layer caches; "
                 f"got shape {tuple(layer.shape)}"
             )
         _, num_heads, tokens_per_block, content = layer.shape
@@ -355,7 +355,7 @@ def compact_accepted_chain(
         # would read/write head-strided positions instead, so reject it.
         if layer.stride() != (tokens_per_block * elems, content, elems, 1):
             raise ValueError(
-                "df2t compaction requires per-slot-contiguous (LBNHC) layer "
+                "tree compaction requires per-slot-contiguous (LBNHC) layer "
                 f"caches; got strides {layer.stride()} for shape "
                 f"{tuple(layer.shape)}"
             )
@@ -599,7 +599,7 @@ class TreeKVCompaction:
             bs = getattr(group.kv_cache_spec, "block_size", None)
             if bs is None:
                 raise ValueError(
-                    "df2t compaction needs a uniform block_size on every kv-cache group"
+                    "tree compaction needs a uniform block_size on every kv-cache group"
                 )
             for name in group.layer_names:
                 ratio = _slot_ratio(
@@ -652,7 +652,7 @@ class TreeKVCompaction:
             return
         self._empty = False
         if any(layer.device.type != device.type for _, layer, *_ in segments):
-            raise ValueError("df2t compaction views must live on one device")
+            raise ValueError("tree compaction views must live on one device")
 
         # Byte addressing from the lowest view: layers of any dtypes and
         # layouts share one gather/scatter launch.
@@ -694,7 +694,7 @@ class TreeKVCompaction:
         if storage is not None:
             if storage.numel() < self._reserved_bytes:
                 raise ValueError(
-                    "df2t compaction storage reservation is too small: "
+                    "tree compaction storage reservation is too small: "
                     f"{storage.numel()} bytes available, "
                     f"{self._reserved_bytes} required. Rebuild the memory-"
                     "profiling reservation from the real KV cache layout."
@@ -703,7 +703,7 @@ class TreeKVCompaction:
                 device.index is not None and storage.device.index != device.index
             ):
                 raise ValueError(
-                    "df2t compaction storage must live on the compactor's "
+                    "tree compaction storage must live on the compactor's "
                     f"device {device}, got {storage.device}"
                 )
             self._storage = storage
@@ -973,7 +973,7 @@ class TreeKVCompaction:
             return
         if self._kv_base.data_ptr() != self._base_ptr:
             raise RuntimeError(
-                "df2t compaction backing KV cache moved after the compactor "
+                "tree compaction backing KV cache moved after the compactor "
                 "was built; re-create the compactor"
             )
         W = self._W

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """df2t real-logprobs layout and value drills (WS-B-2).
 
-The df2t verify block emits, per request, one token per chain depth (the
+The tree verify block emits, per request, one token per chain depth (the
 accepted path + the terminal/resampled token). Before this task a ``logprobs``
 request raised NotImplementedError inside the worker on the first verify step
 (killing the engine); these tests pin the replacement: per-emitted-token

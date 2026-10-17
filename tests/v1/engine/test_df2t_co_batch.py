@@ -4,7 +4,7 @@
 co-scheduled with a tree decode verifies its first token instead of asserting.
 
 Before the mask-scoping fix, a C == 0 request (a fresh prompt prefilling in
-the same batch as a df2t tree-verify decode) tripped the pre-existing
+the same batch as a tree-verify decode) tripped the pre-existing
 ``C > 0`` guard in ``_stage_tree_fa4_mask``/``_stage_tree_flex_mask`` and
 crashed the worker. The fix scopes the tree mask per-request: a treeless
 request falls back to per-request causal attention over its own rows and draws
@@ -77,7 +77,7 @@ def _run_engine(
     not _offline_models_present(), reason="offline df2t models not present"
 )
 def test_df2t_co_batch_fresh_prefill_verifies_fa4() -> None:
-    """A fresh-prefill (C == 0) request co-scheduled with a df2t tree decode
+    """A fresh-prefill (C == 0) request co-scheduled with a tree decode
     (default batching, fa4 vehicle) no longer asserts and both requests draw
     the greedy target's first token."""
     reference = _run_engine(method=None)

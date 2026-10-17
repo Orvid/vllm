@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""End-to-end df2t CUDA-graph capture of the uniform 1+B tree-verify decode.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""End-to-end tree CUDA-graph capture of the uniform 1+B tree-verify decode.
 
 df2t now captures its static tree-verify decode through the V2 uniform FULL
 CUDA-graph machinery (decode_query_len = 1 + num_speculative_tokens) with
@@ -60,7 +61,7 @@ def _run(cudagraph_mode: str) -> list[int]:
     out = llm.generate([_PROMPT], SamplingParams(max_tokens=96, temperature=0.0))
     ids = list(out[0].outputs[0].token_ids)
     del llm
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
     return ids
 
 
@@ -74,7 +75,7 @@ def test_df2t_serves_with_full_cudagraphs_and_matches_eager_single_request() -> 
     eager_ids = _run("NONE")
     assert len(graph_ids) == 96
     assert graph_ids == eager_ids, (
-        "df2t CUDA-graph decode diverges from eager at a single-request shape:\n"
+        "tree CUDA-graph decode diverges from eager at a single-request shape:\n"
         f"  graph: {graph_ids[:48]}\n  eager: {eager_ids[:48]}"
     )
 
@@ -83,7 +84,7 @@ def test_df2t_serves_with_full_cudagraphs_and_matches_eager_single_request() -> 
     not _offline_models_present(), reason="offline df2t models not present"
 )
 def test_df2t_with_piecewise_only_mode_fails_closed() -> None:
-    """df2t CUDA-graph capture is the FULL uniform 1+B decode graph only; a
+    """Tree CUDA-graph capture is the FULL uniform 1+B decode graph only; a
     PIECEWISE-only mode cannot serve it and must fail closed (precise error
     surfaced in the engine core; the API boundary reports init failure)
     instead of capturing graphs that would replay without the tree mask."""

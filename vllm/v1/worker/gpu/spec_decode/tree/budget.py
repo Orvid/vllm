@@ -149,7 +149,7 @@ class BudgetPolicy:
 
     @classmethod
     def from_config(cls, d: Any) -> "BudgetPolicy":
-        """Build from the ``SpeculativeConfig`` df2t tree knobs.
+        """Build from the ``SpeculativeConfig`` tree knobs.
 
         Args:
             d: Object exposing ``tree_s``, ``tree_budget``, ``nodes_ceiling``

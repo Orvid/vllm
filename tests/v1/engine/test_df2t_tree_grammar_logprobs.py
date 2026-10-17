@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""End-to-end df2t tree-aware structured-output and real-logprobs oracle gates.
+"""End-to-end tree-aware structured-output and real-logprobs oracle gates.
 
 Two independently-reviewed defects are pinned here.
 
@@ -9,15 +9,15 @@ Two independently-reviewed defects are pinned here.
    (``structured_output_manager.validate_tokens`` / ``grammar_bitmask``), so a
    tree's siblings advanced the grammar state wrongly for every row past the
    first branch: valid tokens were masked out and invalid ones let through. A
-   grammar/JSON-schema df2t request therefore diverged from the non-spec target
+   grammar/JSON-schema tree request therefore diverged from the non-spec target
    (or emitted schema-invalid output).
 2. **Logprobs crashed the engine.** ``_tree_verify_rejects_logprobs`` raised
-   NotImplementedError inside the worker on the first df2t verify step, so a
+   NotImplementedError inside the worker on the first tree verify step, so a
    single ``logprobs`` request killed the server.
 
 The fix makes both tree-aware (validate/mask along the ACCEPTED CHAIN, and emit
 real per-token logprobs from the processed distribution at the accepted rows).
-This suite proves the oracle: a df2t request with a JSON-schema grammar or with
+This suite proves the oracle: a tree request with a JSON-schema grammar or with
 ``logprobs`` produces EXACTLY the same token stream and per-token logprobs as
 the plain (non-speculative) target with the same parameters, at T=0, without
 crashing.
@@ -148,12 +148,12 @@ def _assert_parity(got_ids, got_logprobs, want_ids, want_logprobs) -> None:
     not _offline_models_present(), reason="offline df2t models not present"
 )
 def test_df2t_guided_json_matches_target_t0():
-    """A df2t request constrained by a JSON schema at T=0 emits exactly the
+    """A tree request constrained by a JSON schema at T=0 emits exactly the
     same token stream as the non-speculative target with the same schema, and
     every output is itself schema-valid JSON.
 
     Before the tree-aware grammar fix the SDK masked the arena-ordered draft
-    tree as a chain, so sibling rows advanced the grammar wrongly and the df2t
+    tree as a chain, so sibling rows advanced the grammar wrongly and the tree verify
     stream diverged (or produced schema-invalid output).
     """
     from vllm import SamplingParams
@@ -180,7 +180,7 @@ def test_df2t_guided_json_matches_target_t0():
     not _offline_models_present(), reason="offline df2t models not present"
 )
 def test_df2t_logprobs_returned_and_match_target_t0():
-    """A df2t request with ``logprobs`` neither crashes the engine nor returns
+    """A tree request with ``logprobs`` neither crashes the engine nor returns
     empty logprobs, and at T=0 the per-token (token id, logprob, rank) exactly
     matches the non-spec target.
 

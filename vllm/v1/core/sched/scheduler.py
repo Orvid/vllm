@@ -274,7 +274,8 @@ class Scheduler(SchedulerInterface):
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
         self.use_eagle_block_drop = False
-        # For df2t the scheduler reserves the TREE BUDGET ceiling per request
+        # For tree verification the scheduler reserves the TREE BUDGET
+        # ceiling per request
         # (a tree may be wider than the drafter block depth); every other
         # speculative method reserves its own num_speculative_tokens positions.
         self.num_spec_tokens = (
@@ -599,7 +600,7 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
-        # df2t trees for the scheduled spec tokens (parallel to the above).
+        # trees for the scheduled spec tokens (parallel to the above).
         spec_tree_draft: dict[str, StashedTree] = {}
         # Whether the running batch contains any prefill requests.
         prefill_scheduled = False
@@ -2545,7 +2546,7 @@ class Scheduler(SchedulerInterface):
             # Trim drafts to scheduled number of spec tokens
             # (needed for chunked prefill case for example).
             del spec_token_ids[orig_num_spec_tokens:]
-            # Carry the stashed tree (df2t & friends) into the scheduled step,
+            # Carry the stashed tree into the scheduled step,
             # trimmed to the same scheduled spec-token count as the drafts.
             if trees is not None:
                 tree = trees[i]

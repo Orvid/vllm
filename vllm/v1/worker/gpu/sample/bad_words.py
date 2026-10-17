@@ -160,7 +160,7 @@ def _bad_words_kernel(
 
         from_spec_input = actual_pos >= output_len
         if from_spec_input:
-            # The token is a within-step draft. Under a df2t tree (IS_TREE)
+            # The token is a within-step draft. Under a tree (IS_TREE)
             # the emitted prefix is the row's accepted chain read from the
             # per-row chain table; otherwise the draft token at local
             # position 1 is the first draft after the committed anchor.

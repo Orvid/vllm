@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for the df2t FA4 tree mask_mod (committed kernel vehicle).
+"""Tests for the tree verify FA4 tree mask_mod (committed kernel vehicle).
 
-The df2t tree-verify mask rides the FlashAttention-4 CuTe-DSL
+The tree-verify mask rides the FlashAttention-4 CuTe-DSL
 ``mask_mod`` vehicle behind ``tree_attention_backend == "fa4"`` (the default),
 leaving the Flex path behind ``== "flex"`` for A/B.
 
@@ -70,7 +70,7 @@ def _fa4_available() -> bool:
 
 requires_sm120_fa4 = pytest.mark.skipif(
     not (_sm120() and _fa4_available()),
-    reason="FA4 df2t tree mask requires an SM120 device with FA4 available",
+    reason="FA4 tree mask requires an SM120 device with FA4 available",
 )
 
 if _sm120() and _fa4_available():  # pragma: no branch
@@ -323,7 +323,7 @@ def test_build_fa4_tree_mask_window_aux_and_cache():
 
 @requires_sm120_fa4
 def test_fa4_tree_mask_window_matches_manual_and_flex_reference():
-    """Windowed df2t tree verify: FA4 paged varlen with the window-composed
+    """Windowed tree verify: FA4 paged varlen with the window-composed
     tree mask_mod reproduces the manual positional-window matrix AND the Flex
     closure's windowed matrix exactly (within fp tolerance). The node rows'
     positions are depth-decoupled from their block slots, so a plain index
@@ -1132,7 +1132,7 @@ def test_fa4_tree_mask_sign_bit_node_63():
 
 @requires_sm120_fa4
 def test_fa4_tree_mask_gates_attention(qwen3_config_path):
-    """The df2t verify forward on the real FlashAttentionImpl+metadata honors
+    """The tree verify forward on the real FlashAttentionImpl+metadata honors
     the attached FA4 tree mask_mod: attaching build_fa4_tree_mask to the
     FlashAttentionMetadata and running the FA4 impl matches the manual
     block-slot SDPA reference, so sibling nodes do not leak."""
@@ -1269,7 +1269,7 @@ def test_fa4_tree_mask_gates_attention(qwen3_config_path):
 
 @requires_sm120_fa4
 def test_df2t_mask_composition_guard_rswa_mm_prefix_fail_closed():
-    """The df2t tree mask must never be silently dropped by the FA4 commit
+    """The tree mask must never be silently dropped by the FA4 commit
     kernel's ``rswa_mask_mod_fn or mm_mask_mod or tree_mask_mod`` dispatch:
     a tree metadata carrying R-SWA or mm-prefix state fails closed with a clear
     error, while a plain tree metadata passes."""
@@ -1588,7 +1588,7 @@ def test_runner_attach_fa4_fails_closed_when_page_size_undeterminable():
 
 def test_runner_attach_fa4_fails_closed_when_staged_mask_dropped():
     """A staged fa4 tree mask must never silently vanish: if no attention
-    metadata is produced (attn_metadata is None) on a df2t fa4-tree batch, the
+    metadata is produced (attn_metadata is None) on a fa4-tree batch, the
     attach raises instead of dropping the mask and running the verify forward
     without it."""
     device = torch.device("cpu")
@@ -1712,7 +1712,7 @@ def test_runner_df2t_force_eager_only_when_non_uniform(
 
 
 def test_runner_df2t_capture_mode_fails_closed():
-    """df2t CUDA-graph capture is the FULL uniform 1+B decode graph only: a
+    """Tree CUDA-graph capture is the FULL uniform 1+B decode graph only: a
     mode without FULL graphs (PIECEWISE-only / NONE) must fail closed with a
     precise error rather than capture graphs that could never serve the tree
     mask."""

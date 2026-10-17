@@ -182,7 +182,7 @@ class Request:
         self.last_sched_seq = 0
 
         self.spec_token_ids: list[int] = []
-        # Stashed df2t tree for those spec tokens; carried worker -> scheduler
+        # Stashed tree for those spec tokens; carried worker -> scheduler
         # as python lists and scheduled next step into SchedulerOutput.
         self.tree_draft: StashedTree | None = None
         self.num_computed_tokens = 0

@@ -128,7 +128,7 @@ class SamplingStates:
     def all_greedy(self, idx_mapping_np: np.ndarray) -> bool:
         """Whether every scheduled request is greedy (temperature == 0.0).
 
-        Host-numpy check (no device read); lets the df2t tree verifier take its
+        Host-numpy check (no device read); lets the tree verifier take its
         argmax-only fast path on a T=0 batch without a per-step host sync.
         """
         return bool(np.all(self.temperature.np[idx_mapping_np] == 0.0))

@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""End-to-end df2t tree-aware sampling feature oracle gates.
+"""End-to-end tree-aware sampling feature oracle gates.
 
 The additive logits processors (repetition/frequency/presence penalties, bad
 words, thinking budget and custom processors) treat the verify block as a
 linear draft chain: a row's "already emitted" prefix is the arena order of the
-rows before it. Under a df2t tree that is wrong — siblings and other branches
+rows before it. Under a tree that is wrong — siblings and other branches
 sit in arena order and are not on the accepted chain — so the processed
 distribution deviates from the chain they are supposed to reproduce. This suite
-pins the fix: a df2t request with these features active produces the SAME token
+pins the fix: a tree request with these features active produces the SAME token
 stream as the plain (non-speculative) target run with the same parameters.
 
 Exact token parity is only a valid oracle in fp32 (in bf16 the target's own
@@ -96,7 +96,7 @@ def _assert_parity(df2t_ids: list[list[int]], ref_ids: list[list[int]]) -> None:
     not _offline_models_present(), reason="offline df2t models not present"
 )
 def test_df2t_repetition_penalty_matches_target_t0():
-    """A df2t request with a repetition/frequency/presence penalty at T=0 must
+    """A tree request with a repetition/frequency/presence penalty at T=0 must
     emit exactly the same token stream as the non-speculative target run.
 
     At T=0 the penalty changes the argmax, so this is a full end-to-end probe
@@ -124,7 +124,7 @@ def test_df2t_repetition_penalty_matches_target_t0():
 )
 def test_df2t_bad_words_matches_target_t0():
     """Bad-words masking reads the same "already emitted" prefix a chain would:
-    at T=0 a df2t request masks the exact same tokens the target masks."""
+    at T=0 a tree request masks the exact same tokens the target masks."""
     from vllm import SamplingParams
 
     params = SamplingParams(max_tokens=64, temperature=0.0, bad_words=_BAD_WORDS)
@@ -139,12 +139,13 @@ def test_df2t_bad_words_matches_target_t0():
 )
 def test_df2t_custom_logits_processor_matches_target_t0():
     """A custom logits processor that consumes the tree-correct accepted-chain
-    context (ctx.chain_prefix / ctx.chain_prefix_len under df2t) must make df2t
+    context (ctx.chain_prefix / ctx.chain_prefix_len under tree
+    verification) must make df2t
     emit the same T=0 stream as the target.
 
     The processor biases a fixed token by the number of accepted-chain tokens
-    seen, which is 0 at a plain single-row target decode and 0 at the df2t
-    anchor row; under the (buggy) arena order the df2t node rows would see a
+    seen, which is 0 at a plain single-row target decode and 0 at the tree verify
+    anchor row; under the (buggy) arena order the tree verify node rows would see a
     nonzero bias (sibling positions) and diverge from the target.
     """
     import torch
@@ -162,7 +163,7 @@ def test_df2t_custom_logits_processor_matches_target_t0():
 
         The emitted-context length is ``output_len + accepted-chain``: in a
         plain target decode the per-step context is just the committed output
-        (``total_len - prompt_len``); under df2t it is that plus the row's
+        (``total_len - prompt_len``); under tree verification it is that plus the row's
         accepted-chain count (``ctx.chain_prefix_len``), so the two runs agree
         per generated token index. Under the buggy arena-order assumption the
         df2t node rows would see sibling positions (the *number* of blocks

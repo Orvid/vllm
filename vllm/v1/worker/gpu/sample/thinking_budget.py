@@ -153,7 +153,7 @@ def _load_effective_token(
         return tl.load(all_token_ids_ptr + req_state_idx * all_token_ids_stride + pos)
     # In decode/spec-decode, input_ids at local position 0 is the already
     # committed last sampled token. Effective draft-prefix positions start at
-    # local position 1. Under a df2t tree (IS_TREE) the draft prefix is the
+    # local position 1. Under a tree (IS_TREE) the draft prefix is the
     # row's accepted chain read from the per-row chain table.
     if IS_TREE:
         return tl.load(

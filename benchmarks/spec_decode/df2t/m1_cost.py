@@ -131,7 +131,7 @@ def _row(name: str, prompt_batch: list[str], c: int) -> dict:
 def main() -> None:
     import torch
 
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
     prompts = E.PROMPTS["math"] + E.PROMPTS["code"] + E.PROMPTS["chat"]
     print(
         f"=== M1 cost decomposition  L={_L} max_tokens={_MAX_TOKENS} "

@@ -153,7 +153,7 @@ def test_greedy_fused_walk_bit_identical_to_torch_loop():
             fused=False,
         )
         a_u = tv_u.accepted_arenas[:R].clone()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         # fused kernel (production)
         tv_f = TV(R, B, V, device, num_rounds=1 + B)
@@ -167,7 +167,7 @@ def test_greedy_fused_walk_bit_identical_to_torch_loop():
             fused=True,
         )
         a_f = tv_f.accepted_arenas[:R].clone()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         assert torch.equal(s_f, s_u), (R, B, "sampled")
         assert torch.equal(n_f, n_u), (R, B, "num_sampled")

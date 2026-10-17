@@ -72,7 +72,7 @@ class TreeDraft:
 
 @dataclass
 class TreeBatch:
-    """A step's df2t trees as batched ``[R, W]`` device tensors.
+    """A step's trees as batched ``[R, W]`` device tensors.
 
     One non-blocking host->device upload carries every request's tree, so the
     per-step consumers (verify-row rewrite, FA4 mask staging, verifier, KV

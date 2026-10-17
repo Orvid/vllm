@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Adaptive df2t verify width: calibration, width choice and batch trimming."""
+"""Adaptive tree verify width: calibration, width choice and batch trimming."""
 
 import types
 

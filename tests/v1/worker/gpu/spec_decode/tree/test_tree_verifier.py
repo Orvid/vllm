@@ -83,10 +83,10 @@ def _compute_tree_depths(parents: torch.Tensor) -> torch.Tensor:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_df2t_verify_supports_logprobs():
-    """The df2t verify path no longer rejects ``logprobs`` requests.
+    """The tree verify path no longer rejects ``logprobs`` requests.
 
     The old fail-closed raise (``_tree_verify_rejects_logprobs``) is gone: a
-    df2t request that asks for logprobs gets real per-token logprobs and one
+    tree request that asks for logprobs gets real per-token logprobs and one
     that does not asks for none. The draw-row mapping, logprob values and
     per-request CSR layout are pinned in ``test_df2t_tree_logprobs.py``.
     """
@@ -716,7 +716,7 @@ def test_model_runner_df2t_tree_verify_mixed_batch():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_df2t_production_pipeline_matches_reference():
-    """Pins the PRODUCTION df2t verify pipeline against the oracle.
+    """Pins the PRODUCTION tree verify pipeline against the oracle.
 
     Real serving routes the verify block through ``SamplingStates`` kernels
     (apply_temperature, apply_min_p, apply_top_k_top_p) before the TreeVerifier

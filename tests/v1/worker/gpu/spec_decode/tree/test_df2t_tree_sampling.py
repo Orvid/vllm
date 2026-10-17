@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tree-aware sampling feature drills for the df2t verify block.
+"""Tree-aware sampling feature drills for the tree verify block.
 
 The additive logits processors (penalties, bad words, thinking budget and
 custom processors) treat the verify block as a linear draft chain: a row's
 "already emitted" prefix is the arena order of the rows before it. Under a
-df2t tree that assumption is wrong — siblings and other branches sit in arena
+tree that assumption is wrong — siblings and other branches sit in arena
 order and are not on the accepted chain — so a repetition/frequency/presence
 penalty, a bad-word mask or a budget force would count/see sibling tokens and
 the processed distribution diverges from the chain (and non-speculative)

@@ -366,19 +366,19 @@ class DFlashSpeculator(DraftModelSpeculator):
         """Publish context features required by a draft's candidate head."""
 
     def set_tree_verifier(self, verifier: "TreeVerifier | None") -> None:
-        """Attach the df2t accepted-chain source (runner's TreeVerifier).
+        """Attach the tree verify accepted-chain source (runner's TreeVerifier).
 
-        Non-df2t speculators keep ``None`` and never build the accepted-chain
-        context; df2t overrides :meth:`_tree_accepted_arenas` to expose
+        Non-tree speculators keep ``None`` and never build the accepted-chain
+        context; tree verification overrides :meth:`_tree_accepted_arenas` to expose
         ``verifier.accepted_arenas``.
         """
         self.tree_verifier = verifier
 
     def _tree_accepted_arenas(self) -> torch.Tensor | None:
-        """The df2t accepted arena per chain depth (``[R, 1 + nodes_max]``,
+        """The tree verify accepted arena per chain depth (``[R, 1 + nodes_max]``,
         ``-1`` = none) for the draft input prep, or None.
 
-        Non-df2t speculators return None, keeping the linear (``dflash``) input
+        Non-tree speculators return None, keeping the linear (``dflash``) input
         prep byte-for-byte identical.
         """
         return None
@@ -461,7 +461,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         # The query slot mapping is written into the shared BlockTables slot_mappings.
         # That buffer's address is what the captured CUDA graph reads from at replay.
         assert self.draft_kv_cache_group_id >= 0
-        # df2t: the accepted arena per chain depth (None keeps the linear
+        # tree verification: the accepted arena per chain depth (None keeps the linear
         # dflash input prep untouched).
         accepted_arenas = self._tree_accepted_arenas()
         # Support multiple draft KV cache groups by preparing inputs once for each
@@ -582,7 +582,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         """Hook: report the row count a replayed draft graph just wrote.
 
         Drafting runtimes that read fixed-width persistent buffers out from
-        under a captured graph (e.g. df2t's tree) override this to track
+        under a captured graph (e.g. the tree) override this to track
         exactly how many rows the replay wrote, so later reads can fail closed
         on an over-read. Base implementation is a no-op.
         """
@@ -617,7 +617,7 @@ def _prepare_dflash_inputs_kernel(
     # Block table for slot mapping lookup.
     block_table_ptr,
     block_table_stride,
-    # df2t accepted-chain context (only when USE_TREE): the verifier's
+    # Tree accepted-chain context (only when USE_TREE): the verifier's
     # accepted arena per chain depth, [R, 1 + nodes_max] (-1 = none).
     accepted_arenas_ptr,
     accepted_arenas_stride,
@@ -660,7 +660,7 @@ def _prepare_dflash_inputs_kernel(
     is_ctx = j < num_ctx
 
     if USE_TREE:
-        # The df2t verify block is in TREE-ARENA order (siblings adjacent), so
+        # The tree verify block is in TREE-ARENA order (siblings adjacent), so
         # the accepted chain is NOT the leading rows of the span and a blind
         # "last num_rejected rows were rejected" cut picks the wrong context.
         # Each arena's chain depth comes from the accepted-arenas row (0 for
@@ -882,7 +882,7 @@ def prepare_dflash_inputs(
     max_num_tokens: int,
     max_model_len: int,
     sample_from_anchor: bool = False,
-    # df2t accepted-chain context: the verifier's accepted arena per chain
+    # Tree accepted-chain context: the verifier's accepted arena per chain
     # depth, [>= num_reqs, 1 + nodes_max] (-1 = none). None keeps the linear
     # path.
     accepted_arenas: torch.Tensor | None = None,
@@ -896,7 +896,7 @@ def prepare_dflash_inputs(
     max_tokens_per_req = max_target_query_len + num_query_per_req
     BLOCK_SIZE = min(256, triton.next_power_of_2(max(1, max_tokens_per_req)))
     num_blocks = triton.cdiv(max_tokens_per_req, BLOCK_SIZE)
-    use_df2t = accepted_arenas is not None
+    use_tree = accepted_arenas is not None
     _prepare_dflash_inputs_kernel[(num_reqs, num_blocks)](
         input_buffers.input_ids,
         input_buffers.positions,
@@ -938,5 +938,5 @@ def prepare_dflash_inputs(
         CP_SIZE=cp_size,
         CP_INTERLEAVE=cp_interleave,
         BLOCK_SIZE=BLOCK_SIZE,
-        USE_TREE=use_df2t,
+        USE_TREE=use_tree,
     )

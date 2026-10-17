@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tree-aware structured-output grammar tests for df2t (WS-B-2).
+"""Tree-aware structured-output grammar tests for tree verification (WS-B-2).
 
 ``structured_output_manager`` advanced the grammar state along the ARENA-ORDERED
-draft tokens as if they were a linear chain. Under a df2t tree that is wrong:
+draft tokens as if they were a linear chain. Under a tree that is wrong:
 siblings and other branches sit in arena order and are not on the accepted
 chain, so a node's bitmask row was computed against the wrong prefix (valid
 tokens masked out, invalid ones let through). These tests pin the fix: the
 grammar is advanced/masked along each node's ACCEPTED CHAIN (its ancestors plus
-itself, in depth order) and the df2t draft carry is never chain-validated.
+itself, in depth order) and the tree verify draft carry is never chain-validated.
 
 The regex ``[a-z]*[0-9]+`` is chosen so the next-token mask observably depends on
 whether a digit has been seen: after letters-only any letter/digit is allowed,
@@ -71,7 +71,7 @@ def letters(tokenizer):
 
 @dataclass(frozen=True)
 class _Tree:
-    """A 2-level df2t tree in arena (emit) order with a digit sibling first."""
+    """A 2-level tree in arena (emit) order with a digit sibling first."""
 
     token_ids: tuple[int, ...]  # node tokens, arena order
     parents: tuple[int, ...]  # parent arena index per node (-1 = anchor child)

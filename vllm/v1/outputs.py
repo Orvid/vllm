@@ -387,7 +387,7 @@ class DraftTokenIds:
     req_ids: list[str]
     # num_reqs x num_draft_tokens
     draft_token_ids: list[list[int]]
-    # Per-request stashed df2t tree, parallel to req_ids; None per request
+    # Per-request stashed tree, parallel to req_ids; None per request
     # without one, and the whole field is None for non-tree methods.
     spec_tree_draft: list[StashedTree | None] | None = None
 

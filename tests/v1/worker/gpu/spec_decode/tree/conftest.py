@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Shared fixtures for the df2t spec-decode tests."""
+"""Shared fixtures for the tree verify spec-decode tests."""
 
 import json
 
@@ -31,7 +31,7 @@ _MINIMAL_QWEN3_CONFIG = {
 def qwen3_config_path(tmp_path):
     """A local directory holding a minimal Qwen3-0.6B config.json.
 
-    The df2t tests build real VllmConfigs to exercise attention/metadata
+    The tree verify tests build real VllmConfigs to exercise attention/metadata
     machinery that needs model shape fields (head_size/heads/etc.). Resolving
     a remote HuggingFace id would require network access, so these tests use
     a locally-written config directory instead — fully offline and portable.

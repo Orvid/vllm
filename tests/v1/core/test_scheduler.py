@@ -7188,7 +7188,7 @@ def test_update_draft_token_ids_in_output_strips_padding():
 
 
 def test_update_draft_token_ids_in_output_carries_tree():
-    """The async/deferred output path must carry the df2t tree into
+    """The async/deferred output path must carry the tree into
     ``scheduler_output.spec_tree_draft``, trimmed to the scheduled spec-token
     count, mirroring the sync ``update_draft_token_ids`` path."""
     scheduler = create_scheduler(num_speculative_tokens=4)
@@ -7373,7 +7373,7 @@ def _df2t_draft_model_config() -> SimpleNamespace:
 
 
 def _df2t_scheduler(tmp_path, tree: bool = True) -> Scheduler:
-    """A real :class:`Scheduler` over a df2t tree ``SpeculativeConfig`` with the
+    """A real :class:`Scheduler` over a tree ``SpeculativeConfig`` with the
     tree budget ceiling raised above the drafter block depth (num_spec = 15,
     max_tree_budget = 64). ``tree=False`` keeps the same drafter verifying its
     chain, so the scheduler must fall back to the dflash reservation."""
@@ -7460,7 +7460,7 @@ def _df2t_scheduler(tmp_path, tree: bool = True) -> Scheduler:
 
 
 def test_df2t_scheduler_reserves_tree_budget_ceiling(tmp_path):
-    """The df2t scheduler's per-request draft-row count is the static tree
+    """The tree verify scheduler's per-request draft-row count is the static tree
     width and its KV lookahead is the TREE BUDGET ceiling (``1 +
     max_tree_budget``), both decoupled from ``num_speculative_tokens`` — so a
     tree wider than the drafter block depth (B > L) has slots to verify into,

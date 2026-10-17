@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for the df2t tree verify-block layout (positions/slots/logits).
+"""Tests for the tree verify-block layout (positions/slots/logits).
 
 Builds the target verify block for a scheduled tree: per request the
 trailing ``1 + B`` token rows become ``[anchor @ C] + [node i @ C + depth_i]``

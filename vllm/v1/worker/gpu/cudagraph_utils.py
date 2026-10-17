@@ -158,7 +158,7 @@ class CudaGraphManager:
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
         # Uniform decode query lengths to capture, when a step may run at
-        # several (adaptive df2t verify widths).
+        # several (adaptive tree verify widths).
         self.decode_query_lens = decode_query_lens
         self.varlen_decode = varlen_decode
         # DBO supports FULL CUDA graphs only.
@@ -690,7 +690,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 assert self.ubatch_runner is not None
                 if tree_mask_attach is not None:
                     raise RuntimeError(
-                        "df2t CUDA-graph capture does not support "
+                        "tree CUDA-graph capture does not support "
                         "microbatched (DBO) FULL graphs."
                     )
                 ubatch_state = self.ubatch_runner.prepare(

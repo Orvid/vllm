@@ -24,7 +24,8 @@ class RequestState:
         self.num_speculative_steps = num_speculative_steps
         self.vocab_size = vocab_size
         self.device = device
-        # The per-request draft-carry width. For df2t this is the tree width
+        # The per-request draft-carry width. For tree verification this is the
+        # tree width
         # (``num_draft_rows_per_req = tree_decode_width - 1``), which can exceed
         # the drafter block depth ``num_speculative_steps``; every other method
         # carries ``num_speculative_steps`` drafts.

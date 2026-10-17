@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""End-to-end df2t drafter-context acceptance gate.
+"""End-to-end tree drafter-context acceptance gate.
 
-The df2t drafter must condition its next draft on the accepted chain (the
+The tree drafter must condition its next draft on the accepted chain (the
 positions the target actually accepted, relocated to canonical ``C + depth``
 slots by the KV compaction), not on the arena-order verify rows. When that was
 wrong the drafter proposed from garbage hidden states and acceptance
 collapsed to the degenerate floor (~1-3 accepted tokens per 32 drafted, i.e.
 ``mean accepted / draft`` ~0.05). This test drives the real engine on the
-offline Qwen3-0.6B + df2t drafter, reads the spec-decode counters, and asserts
+offline Qwen3-0.6B + tree drafter, reads the spec-decode counters, and asserts
 the acceptance length is materially above that floor, plus a T=0 losslessness
 check (df2t output == the plain target's greedy walk) over the whole batch.
 
@@ -101,7 +101,7 @@ def _run_engine(
 def test_df2t_acceptance_above_degenerate_floor_and_lossless() -> None:
     """df2t must accept materially more than the buggy 1-3/32 floor.
 
-    Before the drafter-context fix the df2t engine measured ~0.05 accepted
+    Before the drafter-context fix the tree verify engine measured ~0.05 accepted
     tokens per draft step (acceptance length ~1.05) — no speculative speedup.
     The gate asserts a mean accepted-per-draft well above that floor (measured
     ~1.8-2.5 after the fix, comparable to or above the dflash chain's own
