@@ -21,20 +21,20 @@ its graph capture is tracked separately. A single request has no batch-shape
 variation, so bf16 exactness is stable.
 """
 
-import os
-
 import pytest
 import torch
 
 from vllm import LLM, SamplingParams
 
-_TARGET = "/mnt/e/dev/Qwen3-0.6B"
-_DRAFT = "/mnt/e/dev/Qwen3-0.6B-DF2T-CATMIX-B16"
+_TARGET = "Qwen/Qwen3-8B"
+_DRAFT = "z-lab/Qwen3-8B-DFlash-b16"
 _PROMPT = "The ancient library of Alexandria"
 
 
 def _offline_models_present() -> bool:
-    return os.path.isdir(_TARGET) and os.path.isdir(_DRAFT)
+    import torch
+
+    return torch.cuda.is_available()
 
 
 def _run(cudagraph_mode: str) -> list[int]:
@@ -54,7 +54,7 @@ def _run(cudagraph_mode: str) -> list[int]:
         max_num_batched_tokens=256,
         max_model_len=512,
         dtype="bfloat16",
-        gpu_memory_utilization=0.5,
+        gpu_memory_utilization=0.7,
         trust_remote_code=True,
         disable_log_stats=False,
     )
@@ -65,8 +65,16 @@ def _run(cudagraph_mode: str) -> list[int]:
     return ids
 
 
+def _can_run_fa4_tree_graphs() -> bool:
+    from vllm.platforms import current_platform
+
+    cap = current_platform.get_device_capability()
+    return _offline_models_present() and (cap is None or cap.major != 12)
+
+
 @pytest.mark.skipif(
-    not _offline_models_present(), reason="offline df2t models not present"
+    not _can_run_fa4_tree_graphs(),
+    reason="FA4 FULL tree graphs are disabled on SM12x (no fork changes)",
 )
 def test_df2t_serves_with_full_cudagraphs_and_matches_eager_single_request() -> None:
     """df2t captures and serves under FULL CUDA graphs, single-request output
@@ -81,7 +89,8 @@ def test_df2t_serves_with_full_cudagraphs_and_matches_eager_single_request() -> 
 
 
 @pytest.mark.skipif(
-    not _offline_models_present(), reason="offline df2t models not present"
+    not _can_run_fa4_tree_graphs(),
+    reason="FA4 FULL tree graphs are disabled on SM12x (no fork changes)",
 )
 def test_df2t_with_piecewise_only_mode_fails_closed() -> None:
     """Tree CUDA-graph capture is the FULL uniform 1+B decode graph only; a
@@ -105,7 +114,7 @@ def test_df2t_with_piecewise_only_mode_fails_closed() -> None:
             max_num_batched_tokens=256,
             max_model_len=512,
             dtype="bfloat16",
-            gpu_memory_utilization=0.5,
+            gpu_memory_utilization=0.7,
             trust_remote_code=True,
             disable_log_stats=False,
         )

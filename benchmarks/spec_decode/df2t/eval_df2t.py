@@ -33,9 +33,9 @@ import urllib.request
 
 import torch
 
-TARGET = os.environ.get("TARGET", "/mnt/e/dev/Qwen3-0.6B")
-DRAFT = os.environ.get("DRAFT", "/mnt/e/dev/Qwen3-0.6B-DF2T-CATMIX-B16")
-HF_HOME = os.environ.get("HF_HOME", "/mnt/e/dev/df2t-run/.hf")
+TARGET = os.environ.get("TARGET", "Qwen/Qwen3-8B")
+DRAFT = os.environ.get("DRAFT", "z-lab/Qwen3-8B-DFlash-b16")
+HF_HOME = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/hf-user"))
 VENV_PY = os.environ.get("VENV_PY", "/home/orvid/vllm/.venv/bin/python")
 
 # Fallback held-out prompts (used only if the datasets corpus cannot load).
@@ -78,7 +78,7 @@ def load_corpus(n: int, seed: int) -> dict[str, list[str]]:
         import datasets
     except ImportError:
         return PROMPTS
-    cache_dir = "/mnt/e/dev/df2t-run/.hf"
+    cache_dir = os.path.expanduser("~/.cache/hf-user")
     rng = random.Random(seed)
     out: dict[str, list[str]] = {}
     try:
@@ -181,7 +181,7 @@ def _boot(
         "--speculative-config",
         json.dumps(spec),
         "--gpu-memory-utilization",
-        "0.45",
+        "0.7",
         "--port",
         str(port),
         "--host",

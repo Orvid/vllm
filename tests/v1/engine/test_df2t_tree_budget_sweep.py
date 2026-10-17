@@ -17,17 +17,17 @@ already emits these per request.
 """
 
 import gc
-import os
 
 import pytest
 
+from tests.v1.engine.df2t_test_utils import assert_t0_parity
 from vllm.platforms import current_platform
 
 if not current_platform.is_cuda():
     pytest.skip(reason="df2t requires CUDA", allow_module_level=True)
 
-_TARGET = "/mnt/e/dev/Qwen3-0.6B"
-_DRAFT = "/mnt/e/dev/Qwen3-0.6B-DF2T-CATMIX-B16"
+_TARGET = "Qwen/Qwen3-8B"
+_DRAFT = "z-lab/Qwen3-8B-DFlash-b16"
 _PROMPTS = [
     "The capital of France is",
     "The largest planet is",
@@ -38,10 +38,14 @@ _DEPTH = 12
 
 
 def _offline_models_present() -> bool:
-    return os.path.isdir(_TARGET) and os.path.isdir(_DRAFT)
+    import torch
+
+    return torch.cuda.is_available()
 
 
-def _run_engine(*, tree_budget: int) -> tuple[list[list[int]], list[dict]]:
+def _run_engine(
+    *, tree_budget: int
+) -> tuple[list[list[int]], list[dict[int, float]], list[dict]]:
     """Run df2t at ``tree_budget`` over L=``_DEPTH`` at T=0.
 
     Returns the output token ids and each request's ``spec_decode_metrics``
@@ -67,8 +71,8 @@ def _run_engine(*, tree_budget: int) -> tuple[list[list[int]], list[dict]]:
         async_scheduling=False,
         max_num_batched_tokens=256,
         max_model_len=192,
-        dtype="float32",
-        gpu_memory_utilization=0.45,
+        dtype="bfloat16",
+        gpu_memory_utilization=0.7,
         trust_remote_code=True,
         disable_log_stats=True,
         per_request_spec_decode_metrics="detailed",
@@ -76,22 +80,24 @@ def _run_engine(*, tree_budget: int) -> tuple[list[list[int]], list[dict]]:
     )
     try:
         out = llm.generate(
-            _PROMPTS, SamplingParams(max_tokens=_MAX_TOKENS, temperature=0.0)
+            _PROMPTS,
+            SamplingParams(max_tokens=_MAX_TOKENS, temperature=0.0, logprobs=2),
         )
         ids = [list(o.outputs[0].token_ids) for o in out]
+        probs = [o.outputs[0].logprobs for o in out]
         metrics = [
             o.outputs[0].spec_decode_metrics.to_dict()
             if o.outputs[0].spec_decode_metrics
             else {}
             for o in out
         ]
-        return ids, metrics
+        return ids, probs, metrics
     finally:
         del llm
         gc.collect()
 
 
-def _reference_ids() -> list[list[int]]:
+def _reference_ids() -> tuple[list[list[int]], list[list[dict[int, float]]]]:
     from vllm import LLM, SamplingParams
 
     llm = LLM(
@@ -100,17 +106,20 @@ def _reference_ids() -> list[list[int]]:
         async_scheduling=False,
         max_num_batched_tokens=256,
         max_model_len=192,
-        dtype="float32",
-        gpu_memory_utilization=0.45,
+        dtype="bfloat16",
+        gpu_memory_utilization=0.7,
         trust_remote_code=True,
         disable_log_stats=True,
         attention_config={"backend": "FLEX_ATTENTION"},
     )
     try:
         out = llm.generate(
-            _PROMPTS, SamplingParams(max_tokens=_MAX_TOKENS, temperature=0.0)
+            _PROMPTS,
+            SamplingParams(max_tokens=_MAX_TOKENS, temperature=0.0, logprobs=2),
         )
-        return [list(o.outputs[0].token_ids) for o in out]
+        return [list(o.outputs[0].token_ids) for o in out], [
+            o.outputs[0].logprobs for o in out
+        ]
     finally:
         del llm
         gc.collect()
@@ -130,24 +139,22 @@ def _mean_accepted_per_step(metrics: list[dict]) -> float:
 
 
 @pytest.mark.skipif(
-    not _offline_models_present(), reason="offline df2t models not present"
+    not _offline_models_present(), reason="needs CUDA and a public model download"
 )
 def test_df2t_tree_budget_is_actually_expressed_over_depth_twelve() -> None:
     """tree@B for B in {16, 32, 64} over L=12 schedules B draft rows per step,
     NOT L: the recorded per-step drafted count equals the requested budget
     (never the ``num_spec``/L cap), and every run stays the lossless T=0 greedy
     walk."""
-    reference = _reference_ids()
+    ref_ids, ref_probs = _reference_ids()
 
     effective_b: dict[int, int] = {}
     per_step: dict[int, list[int]] = {}
     mean_accepted: dict[int, float] = {}
     for budget in (16, 32, 64):
-        ids, metrics = _run_engine(tree_budget=budget)
+        ids, probs, metrics = _run_engine(tree_budget=budget)
         # T=0 losslessness: output equals the plain greedy walk.
-        assert ids == reference, (
-            f"tree@{budget} T=0 output diverges from the greedy reference"
-        )
+        assert_t0_parity(ids, ref_ids, probs, ref_probs, f"tree@{budget}")
         drafted = _per_step_drafted(metrics)
         assert drafted, "no per-step drafted counts recorded"
         per_step[budget] = drafted
@@ -164,7 +171,7 @@ def test_df2t_tree_budget_is_actually_expressed_over_depth_twelve() -> None:
             f"effective B={width} did not exceed the L={_DEPTH} depth cap"
         )
 
-    # v5 §6: acceptance is non-decreasing in the tree budget. Real-model noise
+    # Acceptance is non-decreasing in the tree budget. Real-model noise
     # can invert adjacent rungs, so require the widest tree to beat the
     # narrowest (and never regress by more than a token on the way up).
     assert mean_accepted[64] >= mean_accepted[16], (

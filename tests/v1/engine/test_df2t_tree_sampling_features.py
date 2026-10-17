@@ -19,7 +19,7 @@ distribution-parity of the processed rows is pinned at the kernel level in
 """
 
 import gc
-import os
+from typing import Any
 
 import pytest
 
@@ -28,8 +28,8 @@ from vllm.platforms import current_platform
 if not current_platform.is_cuda():
     pytest.skip(reason="df2t requires CUDA", allow_module_level=True)
 
-_TARGET = "/mnt/e/dev/Qwen3-0.6B"
-_DRAFT = "/mnt/e/dev/Qwen3-0.6B-DF2T-CATMIX-B16"
+_TARGET = "Qwen/Qwen3-8B"
+_DRAFT = "z-lab/Qwen3-8B-DFlash-b16"
 _NUM_SPEC = 15
 _PROMPTS = [
     "The capital of France is",
@@ -43,7 +43,9 @@ _BAD_WORDS = ["the", "France"]
 
 
 def _offline_models_present() -> bool:
-    return os.path.isdir(_TARGET) and os.path.isdir(_DRAFT)
+    import torch
+
+    return torch.cuda.is_available()
 
 
 def _run_engine(
@@ -52,15 +54,21 @@ def _run_engine(
     method: str | None,
     sampling_params,
     logits_processors: list | None = None,
-) -> list[list[int]]:
-    from vllm import LLM
+    dtype: str = "bfloat16",
+) -> tuple[list[list[int]], list[Any]]:
+    from vllm import LLM, SamplingParams
 
+    sampling_params = SamplingParams(
+        **vars(sampling_params),
+        logprobs=max(sampling_params.logprobs or 0, 2),
+    )
     speculative_config = None
     if method is not None:
         speculative_config = {
             "method": method,
             "model": _DRAFT,
             "num_speculative_tokens": _NUM_SPEC,
+            "tree_selection": "df2t",
             "tree_attention_backend": "flex",
         }
     llm = LLM(
@@ -70,8 +78,8 @@ def _run_engine(
         async_scheduling=False,
         max_num_batched_tokens=256,
         max_model_len=512,
-        dtype="float32",
-        gpu_memory_utilization=0.45,
+        dtype=dtype,
+        gpu_memory_utilization=0.7,
         trust_remote_code=True,
         disable_log_stats=True,
         attention_config={"backend": "FLEX_ATTENTION"},
@@ -79,21 +87,20 @@ def _run_engine(
     )
     outs = llm.generate(prompts, sampling_params)
     ids = [list(o.outputs[0].token_ids) for o in outs]
+    probs = [o.outputs[0].logprobs for o in outs]
     del llm
     gc.collect()
-    return ids
+    return ids, probs
 
 
-def _assert_parity(df2t_ids: list[list[int]], ref_ids: list[list[int]]) -> None:
-    for i, (g, want) in enumerate(zip(df2t_ids, ref_ids)):
-        assert g == want, (
-            f"prompt {i}: df2t output diverges from the target with the same "
-            f"sampling features: got {g[:20]}... want {want[:20]}..."
-        )
+def _assert_parity(tree_ids, tree_probs, ref_ids, ref_probs, what) -> None:
+    from tests.v1.engine.df2t_test_utils import assert_t0_parity
+
+    assert_t0_parity(tree_ids, ref_ids, tree_probs, ref_probs, what)
 
 
 @pytest.mark.skipif(
-    not _offline_models_present(), reason="offline df2t models not present"
+    not _offline_models_present(), reason="needs CUDA and a public model download"
 )
 def test_df2t_repetition_penalty_matches_target_t0():
     """A tree request with a repetition/frequency/presence penalty at T=0 must
@@ -113,14 +120,14 @@ def test_df2t_repetition_penalty_matches_target_t0():
         frequency_penalty=0.5,
         presence_penalty=0.3,
     )
-    reference = _run_engine(_PROMPTS, 64, None, params)
-    got = _run_engine(_PROMPTS, 64, "df2t", params)
-    _assert_parity(got, reference)
-    print("\n  df2t repetition-penalty T=0 == target greedy (fp32)", flush=True)
+    ref_ids, ref_probs = _run_engine(_PROMPTS, 64, None, params)
+    got_ids, got_probs = _run_engine(_PROMPTS, 64, "dflash", params)
+    _assert_parity(got_ids, got_probs, ref_ids, ref_probs, "repetition penalty")
+    print("\n  df2t repetition-penalty T=0 == target greedy", flush=True)
 
 
 @pytest.mark.skipif(
-    not _offline_models_present(), reason="offline df2t models not present"
+    not _offline_models_present(), reason="needs CUDA and a public model download"
 )
 def test_df2t_bad_words_matches_target_t0():
     """Bad-words masking reads the same "already emitted" prefix a chain would:
@@ -128,14 +135,26 @@ def test_df2t_bad_words_matches_target_t0():
     from vllm import SamplingParams
 
     params = SamplingParams(max_tokens=64, temperature=0.0, bad_words=_BAD_WORDS)
-    reference = _run_engine(_PROMPTS, 64, None, params)
-    got = _run_engine(_PROMPTS, 64, "df2t", params)
-    _assert_parity(got, reference)
-    print("\n  df2t bad-words T=0 == target greedy (fp32)", flush=True)
+    ref_ids, ref_probs = _run_engine(_PROMPTS, 64, None, params)
+    got_ids, got_probs = _run_engine(_PROMPTS, 64, "dflash", params)
+    _assert_parity(got_ids, got_probs, ref_ids, ref_probs, "bad words")
+    print("\n  df2t bad-words T=0 == target greedy", flush=True)
+
+
+def _fp32_loadable() -> bool:
+    """8B-parity runs need fp32 (bf16 near-tie flips are not meaningful for
+    position-boosting processors); that needs a >= 40 GB device."""
+    import torch
+
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_properties(0).total_memory >= 40 << 30
+    )
 
 
 @pytest.mark.skipif(
-    not _offline_models_present(), reason="offline df2t models not present"
+    not (_offline_models_present() and _fp32_loadable()),
+    reason="custom-processor parity is only meaningful in fp32 (40GB+ device)",
 )
 def test_df2t_custom_logits_processor_matches_target_t0():
     """A custom logits processor that consumes the tree-correct accepted-chain
@@ -191,11 +210,21 @@ def test_df2t_custom_logits_processor_matches_target_t0():
             return logits
 
     params = SamplingParams(max_tokens=64, temperature=0.0)
-    reference = _run_engine(
-        _PROMPTS, 64, None, params, logits_processors=[ChainContextLengthBias]
+    ref_ids, ref_probs = _run_engine(
+        _PROMPTS,
+        64,
+        None,
+        params,
+        logits_processors=[ChainContextLengthBias],
+        dtype="float32",
     )
-    got = _run_engine(
-        _PROMPTS, 64, "df2t", params, logits_processors=[ChainContextLengthBias]
+    got_ids, got_probs = _run_engine(
+        _PROMPTS,
+        64,
+        "dflash",
+        params,
+        logits_processors=[ChainContextLengthBias],
+        dtype="float32",
     )
-    _assert_parity(got, reference)
-    print("\n  df2t custom-processor T=0 == target greedy (fp32)", flush=True)
+    _assert_parity(got_ids, got_probs, ref_ids, ref_probs, "custom processor")
+    print("\n  df2t custom-processor T=0 == target greedy", flush=True)

@@ -47,8 +47,8 @@ from vllm.v1.structured_output import (
 )
 from vllm.v1.structured_output.backend_types import StructuredOutputGrammar
 
-TOKENIZER = "/mnt/e/dev/Qwen3-0.6B"
-DRAFT_ROOT = "/mnt/e/dev/Qwen3-0.6B-DF2T-CATMIX-B16"
+TOKENIZER = "Qwen/Qwen3-0.6B"
+DRAFT_ROOT = "z-lab/Qwen3-8B-DFlash-b16"
 REGEX = "[a-z]*[0-9]+"
 MAX_WAIT_SECONDS = 60
 

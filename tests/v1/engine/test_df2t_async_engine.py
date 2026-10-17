@@ -17,7 +17,6 @@ speculative decoding), so both runs use fp32 on the flex vehicle.
 """
 
 import gc
-import os
 
 import pytest
 
@@ -26,13 +25,15 @@ from vllm.platforms import current_platform
 if not current_platform.is_cuda():
     pytest.skip(reason="df2t requires CUDA", allow_module_level=True)
 
-_TARGET = "/mnt/e/dev/Qwen3-0.6B"
-_DRAFT = "/mnt/e/dev/Qwen3-0.6B-DF2T-CATMIX-B16"
+_TARGET = "Qwen/Qwen3-8B"
+_DRAFT = "z-lab/Qwen3-8B-DFlash-b16"
 _PROMPTS = ["The capital of France is", "The largest planet is"]
 
 
 def _offline_models_present() -> bool:
-    return os.path.isdir(_TARGET) and os.path.isdir(_DRAFT)
+    import torch
+
+    return torch.cuda.is_available()
 
 
 def _run_engine(
@@ -47,6 +48,7 @@ def _run_engine(
             "model": _DRAFT,
             "num_speculative_tokens": 15,
             "tree_attention_backend": "flex",
+            "tree_selection": "df2t",
             # Keep the batch budget small enough that two requests actually
             # overlap in the async queue under the tree-budget reservation
             # (each decode reserves tree_budget new slots per request).
@@ -61,8 +63,8 @@ def _run_engine(
         async_scheduling=async_scheduling,
         max_num_batched_tokens=192,
         max_model_len=192,
-        dtype="float32",
-        gpu_memory_utilization=0.45,
+        dtype="bfloat16",
+        gpu_memory_utilization=0.7,
         trust_remote_code=True,
         disable_log_stats=True,
         attention_config={"backend": "FLEX_ATTENTION"},
@@ -75,7 +77,7 @@ def _run_engine(
 
 
 @pytest.mark.skipif(
-    not _offline_models_present(), reason="offline df2t models not present"
+    not _offline_models_present(), reason="needs CUDA and a public model download"
 )
 def test_df2t_async_multi_batch_t0_matches_greedy_reference() -> None:
     """Two requests through the concurrent async batch queue produce, at T=0,
@@ -84,7 +86,7 @@ def test_df2t_async_multi_batch_t0_matches_greedy_reference() -> None:
     accepted-KV compaction must leave the next step attending the relocated
     canonical slots."""
     reference = _run_engine(async_scheduling=False, method=None, max_tokens=16)
-    async_ids = _run_engine(async_scheduling=True, method="df2t", max_tokens=16)
+    async_ids = _run_engine(async_scheduling=True, method="dflash", max_tokens=16)
 
     assert len(async_ids) == len(_PROMPTS) == len(reference)
     for i, expected in enumerate(reference):

@@ -20,27 +20,29 @@ tokens, which is what the co-batch fix guards.
 """
 
 import gc
-import os
 
 import pytest
 
+from tests.v1.engine.df2t_test_utils import assert_t0_parity
 from vllm.platforms import current_platform
 
 if not current_platform.is_cuda():
     pytest.skip(reason="df2t requires CUDA", allow_module_level=True)
 
-_TARGET = "/mnt/e/dev/Qwen3-0.6B"
-_DRAFT = "/mnt/e/dev/Qwen3-0.6B-DF2T-CATMIX-B16"
+_TARGET = "Qwen/Qwen3-8B"
+_DRAFT = "z-lab/Qwen3-8B-DFlash-b16"
 _PROMPTS = ["The capital of France is", "The largest planet is"]
 
 
 def _offline_models_present() -> bool:
-    return os.path.isdir(_TARGET) and os.path.isdir(_DRAFT)
+    import torch
+
+    return torch.cuda.is_available()
 
 
 def _run_engine(
-    *, method: str | None, tree_attention_backend: str = "fa4", dtype: str = "bfloat16"
-) -> list[list[int]]:
+    *, method: str | None, tree_attention_backend: str = "flex", dtype: str = "bfloat16"
+) -> tuple[list[list[int]], list[dict[int, float]]]:
     from vllm import LLM, SamplingParams
 
     speculative_config = None
@@ -49,8 +51,9 @@ def _run_engine(
             "method": method,
             "model": _DRAFT,
             "num_speculative_tokens": 15,
+            "tree_selection": "df2t",
         }
-        if method == "df2t":
+        if method is not None:
             speculative_config["tree_attention_backend"] = tree_attention_backend
     llm = LLM(
         model=_TARGET,
@@ -59,41 +62,46 @@ def _run_engine(
         async_scheduling=False,
         max_model_len=192,
         dtype=dtype,
-        gpu_memory_utilization=0.45,
+        gpu_memory_utilization=0.7,
         trust_remote_code=True,
         disable_log_stats=True,
         attention_config=(
             {"backend": "FLEX_ATTENTION"} if dtype == "float32" else None
         ),
     )
-    out = llm.generate(_PROMPTS, SamplingParams(max_tokens=16, temperature=0.0))
+    out = llm.generate(
+        _PROMPTS, SamplingParams(max_tokens=16, temperature=0.0, logprobs=2)
+    )
     ids = [list(o.outputs[0].token_ids) for o in out]
+    probs = [o.outputs[0].logprobs for o in out]
     del llm
     gc.collect()
-    return ids
+    return ids, probs
 
 
 @pytest.mark.skipif(
-    not _offline_models_present(), reason="offline df2t models not present"
+    not _offline_models_present(), reason="needs CUDA and a public model download"
 )
 def test_df2t_co_batch_fresh_prefill_verifies_fa4() -> None:
     """A fresh-prefill (C == 0) request co-scheduled with a tree decode
     (default batching, fa4 vehicle) no longer asserts and both requests draw
     the greedy target's first token."""
-    reference = _run_engine(method=None)
-    ids = _run_engine(method="df2t", tree_attention_backend="fa4")
-    assert [r[0] for r in ids] == [r[0] for r in reference], (
+    ref_ids, _ = _run_engine(method=None)
+    ids, _ = _run_engine(method="dflash", tree_attention_backend="flex")
+    assert [r[0] for r in ids] == [r[0] for r in ref_ids], (
         "the co-batched requests must verify their first token correctly "
         "(no assert, no mask-token garbage)"
     )
 
 
 @pytest.mark.skipif(
-    not _offline_models_present(), reason="offline df2t models not present"
+    not _offline_models_present(), reason="needs CUDA and a public model download"
 )
 def test_df2t_co_batch_fresh_prefill_lossless_flex_fp32() -> None:
     """Same co-batch fresh-prefill scenario on the flex tree-verify vehicle in
     fp32: both requests' T=0 output equals the plain target's greedy walk."""
-    reference = _run_engine(method=None, dtype="float32")
-    ids = _run_engine(method="df2t", tree_attention_backend="flex", dtype="float32")
-    assert ids == reference, "df2t co-batch output diverges from the target"
+    ref_ids, ref_probs = _run_engine(method=None, dtype="bfloat16")
+    ids, probs = _run_engine(
+        method="dflash", tree_attention_backend="flex", dtype="bfloat16"
+    )
+    assert_t0_parity(ids, ref_ids, probs, ref_probs, "co-batch parity")
