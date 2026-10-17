@@ -86,7 +86,7 @@ def _build_step(
     anchors: torch.Tensor,
     q_logits: torch.Tensor,
     builder: TreeBuilder,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Draft a top-K successor tree per request from the last-token ``Q``.
 
     ``cand[d]`` is the top-K of ``Q(·|cand[d-1, 0])`` (``cand[0]`` from the
