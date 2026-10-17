@@ -277,10 +277,6 @@ class Attention(nn.Module, AttentionLayerBase):
             kv_cache_dtype = cache_config.cache_dtype
         else:
             kv_cache_dtype = "auto"
-        if kv_cache_dtype.endswith("_ds_mla"):
-            # Packed MLA-only formats an MLA target (e.g. DeepSeek-V4) sets for
-            # its own layers; a drafter's MHA layers keep the model dtype.
-            kv_cache_dtype = "auto"
 
         # llm-compressor models declare an FP8 KV-cache scheme in their
         # checkpoint config. Honor it only when the user did not explicitly
