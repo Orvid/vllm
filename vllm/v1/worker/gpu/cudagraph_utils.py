@@ -714,6 +714,10 @@ class ModelCudaGraphManager(CudaGraphManager):
 
                 return ubatch_forward_fn
 
+            if tree_verify is not None and desc.cg_mode == CUDAGraphMode.FULL:
+                # This graph verifies uniform trees of its query width.
+                query_len = desc.max_query_len or num_tokens // max(num_reqs, 1)
+                tree_verify.step_width = query_len - 1
             attn_metadata, slot_mappings = prepare_inputs_to_capture(
                 num_reqs,
                 num_tokens,
@@ -725,6 +729,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
                 max_query_len=desc.max_query_len or desc.uniform_token_count,
                 pcp_manager=pcp_manager,
+                tree_verify=tree_verify,
             )
             if tree_mask_attach is not None and desc.cg_mode == CUDAGraphMode.FULL:
                 # df2t: bake the tree-verify mask_mod + its persistent aux
@@ -739,10 +744,6 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             # Capture with dummy rows marked as padding.
             input_buffers.is_padding.fill_(True)
-            if tree_verify is not None and desc.cg_mode == CUDAGraphMode.FULL:
-                # This graph verifies uniform trees of its query width.
-                query_len = desc.max_query_len or num_tokens // max(num_reqs, 1)
-                tree_verify.step_width = query_len - 1
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
                 batch_descriptor = None
@@ -810,6 +811,7 @@ def prepare_inputs_to_capture(
     full_cudagraph: bool,
     max_query_len: int | None = None,
     pcp_manager: "PCPManager | None" = None,
+    tree_verify: Any = None,
 ) -> AttentionState:
     if full_cudagraph and max_query_len is None:
         # Mixed graphs can replay a single prefill spanning the entire batch,
@@ -818,6 +820,10 @@ def prepare_inputs_to_capture(
     input_batch = InputBatch.make_dummy(
         num_reqs, num_tokens, input_buffers, max_query_len=max_query_len
     )
+    if full_cudagraph:
+        # A FULL tree-verify graph bakes each backend's tree path, which reads
+        # the persistent tree context refreshed before every replay.
+        input_batch.tree_verify = tree_verify
     if pcp_manager is not None:
         input_batch = pcp_manager.prepare_inputs_to_capture(input_batch)
 
