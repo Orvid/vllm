@@ -49,13 +49,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
         super().__init__(vllm_config, device)
 
-        # Context features come from combine_hidden_states(), which projects
-        # into the draft hidden size, never an HC-widened target residual.
         self.hidden_states = torch.zeros(
-            self.max_num_tokens,
-            self.draft_model_config.get_hidden_size(),
-            dtype=self.dtype,
-            device=device,
+            self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
         )
 
         # Multimodal inputs not currently supported.
