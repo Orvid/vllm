@@ -59,7 +59,7 @@ def _run_engine(
         async_scheduling=False,
         max_model_len=192,
         dtype=dtype,
-        gpu_memory_utilization=0.3,
+        gpu_memory_utilization=0.45,
         trust_remote_code=True,
         disable_log_stats=True,
         attention_config=(

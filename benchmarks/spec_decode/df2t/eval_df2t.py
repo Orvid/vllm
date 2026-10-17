@@ -181,7 +181,7 @@ def _boot(
         "--speculative-config",
         json.dumps(spec),
         "--gpu-memory-utilization",
-        "0.3",
+        "0.45",
         "--port",
         str(port),
         "--host",
