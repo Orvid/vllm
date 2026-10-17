@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """M1 cost decomposition (plan Task 15 step 3).
 
 Boots the PRODUCTION-path server (``eager=False``: FULL CUDA graphs including

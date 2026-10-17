@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Regression tests for the per-step verifier perf restructure (fast path).
 
 Two guarantees, both bit-identity discriminations on the PRODUCTION device loop
@@ -34,7 +35,7 @@ def _random_trees(num_reqs, B, vocab, seed):
     num_nodes = torch.zeros(num_reqs, dtype=torch.long)
     for r in range(num_reqs):
         b = max(1, int(torch.randint(1, B + 1, (1,), generator=rng).item()))
-        used = {p: set() for p in range(-1, b)}
+        used: dict[int, set[int]] = {p: set() for p in range(-1, b)}
         for i in range(b):
             p = -1 if i == 0 else int(torch.randint(-1, i, (1,), generator=rng).item())
             tok = int(torch.randint(0, vocab, (1,), generator=rng).item())
