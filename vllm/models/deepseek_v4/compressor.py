@@ -246,6 +246,14 @@ class DeepseekCompressor(nn.Module):
 
         self.overlap = compress_ratio == 4
         self.coff = 1 + self.overlap
+        # Tree rows write entries only for ratios kept in per-node scratch;
+        # the others' tree rows have no compressed slot.
+        spec_config = vllm_config.speculative_config
+        self.tree_scratch = (
+            spec_config is not None
+            and spec_config.use_tree()
+            and compress_ratio in spec_config.tree_scratch_ratios
+        )
 
         # The head=512 cr>=128 no-overlap deep gather uses the two-stage
         # compressor, which needs an fp32 scratch [max_batched, 512] for
@@ -505,7 +513,7 @@ class DeepseekCompressor(nn.Module):
             scale_dim=self._scale_dim,
             **extra_kwargs,
         )
-        if state_metadata.tree_verify is not None:
+        if state_metadata.tree_verify is not None and self.tree_scratch:
             # Tree boundary rows pool their own paths (the pass above pooled
             # positions linearly) into their nodes' scratch entries.
             assert not store_full_kv, (
