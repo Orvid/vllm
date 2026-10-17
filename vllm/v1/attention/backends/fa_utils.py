@@ -128,7 +128,12 @@ def get_flash_attn_version(
         # 1. default version depending on platform. The tree-verify FA4 mask
         # path needs the vendored compile-from-specs API; without it, a tree
         # defaults to the FA2/FA3 split (or Triton/b12x/Flex) vehicles.
-        if tree_active and is_fa_version_supported(4) and FA4_TREE_MASK_AVAILABLE:
+        if (
+            tree_active
+            and device_capability.major != 12
+            and is_fa_version_supported(4)
+            and FA4_TREE_MASK_AVAILABLE
+        ):
             fa_version = 4
         elif device_capability.major == 9 and is_fa_version_supported(3):
             # Hopper (SM90): prefer FA3
@@ -155,7 +160,11 @@ def get_flash_attn_version(
         # Tree-verify FA4 is only available with the vendored fork's
         # compile-from-specs API; an explicit FA4 request without it must fail
         # visibly instead of silently serving a non-tree (or split-less) pass.
-        if tree_active and fa_version == 4 and not FA4_TREE_MASK_AVAILABLE:
+        if (
+            tree_active
+            and fa_version == 4
+            and (not FA4_TREE_MASK_AVAILABLE or device_capability.major == 12)
+        ):
             raise RuntimeError(
                 "speculative tree verification on FlashAttention-4 requires "
                 "the vendored FlashAttention compile-from-specs API "

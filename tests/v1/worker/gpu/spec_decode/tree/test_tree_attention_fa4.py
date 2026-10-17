@@ -65,7 +65,10 @@ def _fa4_available() -> bool:
         return False
     from vllm.v1.attention.backends.fa_utils import FA4_TREE_MASK_AVAILABLE
 
-    return FA4_TREE_MASK_AVAILABLE
+    # The vendored (non-upstream) compile-from-specs API exists here, but the
+    # PRs must run on SM120 without any flash-attention fork changes, so FA4
+    # tree verification is disabled on SM12x (see fa_utils).
+    return FA4_TREE_MASK_AVAILABLE and not _sm120()
 
 
 requires_sm120_fa4 = pytest.mark.skipif(
