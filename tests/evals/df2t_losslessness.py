@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DF2T losslessness harness (v5 spec §3.6 TRAVERSAL).
+"""DF2T losslessness harness: traversal verification losslessness.
 
 The verifier must emit, at every visited row, a token drawn from the target's
 fully processed distribution at that row (``argmax`` at T=0, one categorical
@@ -10,7 +10,7 @@ df2t-decoded next-token distribution identical to the target's.
 
 This harness takes that claim at the empirical level: a synthetic Markov target
 (``P``) and an approximate drafter (``Q = P + noise``) run through the REAL
-``TreeBuilder`` (task 8) and the REAL ``TreeVerifier`` (this task) in a batched
+``TreeBuilder`` and the REAL ``TreeVerifier`` in a batched
 autoregressive decode loop. It tallies (anchor, emitted) transitions and asserts
 
   * T=0: every emitted token is bit-identical to the target's argmax at its

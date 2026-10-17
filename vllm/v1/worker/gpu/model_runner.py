@@ -2974,7 +2974,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert self.sampler is not None
             sampler_output = self.sampler(logits, input_batch)
         elif input_batch.trees is not None:
-            # DF2T tree-traversal verification (v5 spec §3.6). The tree was
+            # Traversal verification of the drafted tree. The tree was
             # stashed on the batch by the worker's draft-token handler (read
             # fresh from the speculator's graph-replayed builder buffers); the
             # verifier reads only the target logits rows, never any drafter
@@ -3147,7 +3147,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Relocate accepted-tree KV to canonical slots (df2t KV compaction).
 
         The tree verify writes each accepted node's K/V at its scattered
-        tree-block slot ``C + 1 + arena`` (Task 6 layout); inference reads
+        tree-block slot ``C + 1 + arena`` (the tree-verify layout); inference reads
         context by ``position -> slot`` (``C + depth``), so without compaction
         the accepted chain's K/V is unreachable and the next step attends
         garbage. ``TreeKVCompaction`` relocates every accepted node's K/V to
@@ -3209,7 +3209,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         logits: torch.Tensor,
         input_batch: InputBatch,
     ) -> SamplerOutput:
-        """DF2T tree-traversal verification (v5 spec §3.6).
+        """Traversal verification of a drafted tree.
 
         Runs the same per-request logits pipeline ordinary decoding uses
         (logits processors, min_p, temperature, top-k/top-p) on the verify

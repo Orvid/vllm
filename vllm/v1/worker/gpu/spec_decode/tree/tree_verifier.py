@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Torch TreeVerifier for DF2T tree speculative decoding (v5 spec §3.6).
+"""Torch TreeVerifier for tree speculative decoding.
 
 Implements TRAVERSAL (not rejection) verification, vectorized across requests:
 at the current node, draw ONE token from the fully processed target distribution

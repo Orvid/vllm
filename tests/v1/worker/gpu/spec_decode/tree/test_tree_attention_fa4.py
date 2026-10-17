@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the df2t FA4 tree mask_mod (committed kernel vehicle).
 
-Task 14 swaps the df2t tree-verify mask onto the FlashAttention-4 CuTe-DSL
+The df2t tree-verify mask rides the FlashAttention-4 CuTe-DSL
 ``mask_mod`` vehicle behind ``tree_attention_backend == "fa4"`` (the default),
 leaving the Flex path behind ``== "flex"`` for A/B.
 
@@ -13,7 +13,7 @@ reference): in the FA4 paged varlen forward the mask_mod sees
 arena ``a``, so block-slot ``= C + q_idx``) and ``kv_idx`` as the *local KV
 position within the sequence*, which equals the logical block-slot (context
 ``< C``, anchor ``== C``, node ``C + 1 + j``). This matches the Flex path's
-block-slot convention (Task 8), so the same ancestor-or-self semantics hold on
+block-slot convention, so the same ancestor-or-self semantics hold on
 both vehicles. ``batch_idx`` is the request index, so per-request ``C`` and
 ancestor words are read from aux tensors keyed by it.
 
@@ -82,7 +82,7 @@ if _sm120() and _fa4_available():  # pragma: no branch
 def _manual_matrix(C: int, words: list[int], B: int) -> torch.Tensor:
     """Manual ``[C + 1 + B, C + 1 + B]`` boolean matrix over block-slot (q, k).
 
-    Identical to the Flex-path reference (Task 8 tests): key ``k`` is allowed iff
+    Identical to the Flex-path reference: key ``k`` is allowed iff
     ``k < C`` (context), ``k == C`` (anchor), or ``k == C + 1 + j`` with bit ``j``
     set in the query node's ancestor-or-self word. Rows below ``C`` are context
     positions that never query in the verify layout and are left False.

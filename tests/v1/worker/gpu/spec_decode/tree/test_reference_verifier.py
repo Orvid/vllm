@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for the brute-force traversal verifier reference (v5 spec §3.6).
+"""Tests for the brute-force traversal verifier reference.
 
 Traversal draws one token per depth from the fully processed target
 distribution at the current row, descends iff it is a child of the current
@@ -11,6 +11,7 @@ leaf bonus path, and determinism.
 """
 
 import importlib.util
+from typing import TypedDict
 
 import torch
 
@@ -62,6 +63,14 @@ def _real_tree(b: int, L: int, k: int, vocab: int, seed: int):
     return draft.token_ids, draft.parents
 
 
+class _SamplingParams(TypedDict, total=False):
+    """Sampling parameters a case passes to the reference."""
+
+    temperature: float
+    top_k: int
+    top_p: float
+
+
 def test_traversal_greedy_chain_then_mismatch():
     """Anchor -> token5 -> token9, then the argmax is not a child: exactly two
     tokens accepted, the mismatch token (== argmax at T=0) is emitted."""
@@ -84,13 +93,13 @@ def test_traversal_greedy_chain_then_mismatch():
 
 
 def test_traversal_t0_argmax_everywhere():
-    """Invariant 4 (§3.7): at T=0 every emitted token (accepted, mismatch, and
-    the leaf bonus on a fully accepted path) equals the raw argmax of the
+    """Invariant 4: at T=0 every emitted token (accepted, mismatch, and the
+    leaf bonus on a fully accepted path) equals the raw argmax of the
     processed distribution at its row, exactly."""
     vocab = 64
-    cases = [
-        (_real_tree(7, 4, 3, vocab, seed=1), dict()),
-        (_real_tree(12, 6, 4, vocab, seed=2), dict(top_k=3, top_p=0.95)),
+    cases: list[tuple[tuple[torch.Tensor, torch.Tensor], _SamplingParams]] = [
+        (_real_tree(7, 4, 3, vocab, seed=1), {}),
+        (_real_tree(12, 6, 4, vocab, seed=2), {"top_k": 3, "top_p": 0.95}),
     ]
     for (token_ids, parents), sampling in cases:
         b = token_ids.shape[0]

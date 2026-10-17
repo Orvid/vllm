@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Round-trip tests for carrying a per-request ``TreeDraft`` beside draft tokens.
 
-The df2t verify step (Task 6) needs the tree structure one engine step after it
+The tree verify step needs the tree structure one engine step after it
 is proposed. It rides the same hop as ``DraftTokenIds`` (worker -> scheduler ->
 scheduled spec tokens) as plain python lists, so these tests pin the
 list-ification and the set -> get -> recover seam.

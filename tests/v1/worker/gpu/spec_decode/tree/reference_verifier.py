@@ -2,14 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Brute-force traversal verifier reference (the oracle).
 
-Implements the DF2T lossless verification rule (v5 spec §3.6): starting at the
+Implements the DF2T lossless verification rule: starting at the
 anchor, draw one token per depth from the fully processed target distribution
 at the current row; descend iff the drawn token is a child of the current node;
 otherwise emit it and stop. At a leaf ``children(u)`` is empty, so the same
 step emits the bonus token after a fully accepted path — there is no separate
 greedy or bonus path, and drafter probabilities are never read.
 
-Exact conventions, documented so Task 10 can mirror the GPU sampler:
+Exact conventions, documented so the GPU sampler can mirror them:
 
 * ``target_logits`` is ``[1 + B, vocab]`` in verify-layout order: row 0 is the
   anchor (the already-generated context), row ``1 + arena`` is tree node

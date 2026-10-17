@@ -309,7 +309,7 @@ def compact_accepted_chain(
             ``accept_arenas.shape[0]`` so padded buffers can be sliced.
 
     Accepted node ``j`` whose KV lives at scattered block-slot
-    ``C + 1 + arena`` (Task 6 tree-verify layout) is copied to block-slot
+    ``C + 1 + arena`` (the tree-verify layout) is copied to block-slot
     ``C + depth`` and its scattered slot is zeroed. A node with
     ``depth == 1 + arena`` already lives at its canonical slot and is left
     untouched. Nothing is launched (or written) when ``num_accepted == 0``.

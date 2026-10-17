@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the df2t FlexAttention tree mask.
 
-Task 8 builds the tree-verify attention mask on the FlexAttention vehicle: a
+Builds the tree-verify attention mask on the FlexAttention vehicle: a
 ``logical_mask_mod`` closure over per-request ancestor words, so the verify
 forward attends only to context + anchor + ancestor-or-self nodes. Within a
 request's verify block the logical KV index equals the block-slot: keys with

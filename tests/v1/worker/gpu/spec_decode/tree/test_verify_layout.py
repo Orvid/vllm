@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the df2t tree verify-block layout (positions/slots/logits).
 
-Task 6 builds the target verify block for a scheduled tree: per request the
+Builds the target verify block for a scheduled tree: per request the
 trailing ``1 + B`` token rows become ``[anchor @ C] + [node i @ C + depth_i]``
 with RoPE positions ``C + depth_i`` and decoupled KV slots ``C + arena_i``.
 ``prepare_tree_inputs`` owns that layout; the block-table kernel then maps the

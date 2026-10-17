@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for the torch TreeVerifier (v5 spec §3.6 TRAVERSAL).
+"""Tests for the torch TreeVerifier (traversal rule).
 
 The verifier must reproduce ``tree_verify_reference`` exactly but vectorized
 across requests: at each depth draw ONE token from the fully processed target
@@ -10,6 +10,8 @@ path). Requests that stop early are masked out of later depths. The output
 contract matches the rejection samplers: ``sampled [num_reqs, 1 + B]`` and
 ``num_sampled [num_reqs]`` (per-request accepted-emitted length).
 """
+
+from typing import TypedDict
 
 import numpy as np
 import pytest
@@ -341,7 +343,7 @@ def test_tree_verifier_t0_argmax_invariant(device):
     parents = parents.to(device)
     num_nodes = num_nodes.to(device)
 
-    cases = [dict(), dict(top_k=5, top_p=0.92)]
+    cases: list[_SamplingParams] = [{}, {"top_k": 5, "top_p": 0.92}]
     tv = TreeVerifier(num_reqs, B, vocab, device)
     for sampling in cases:
         sampled, num_sampled = tv(
@@ -823,6 +825,14 @@ def _tree_compaction_phys(req_bt, c, max_delta, block_size):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class _SamplingParams(TypedDict, total=False):
+    """Sampling parameters a case passes to the verifier / reference."""
+
+    temperature: float
+    top_k: int
+    top_p: float
+
+
 def test_model_runner_df2t_compaction_wiring_moves_per_group():
     """``_compact_tree_accepted_kv`` (the real runner method) relocates each
     accepted node's KV from its scattered ``C + 1 + arena`` block-slot to the

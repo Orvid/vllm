@@ -33,8 +33,7 @@ _HEAD_SCALE_FACTOR = 4.0
 No head-bearing checkpoint exists yet to calibrate against. This is the
 documented v5-consistent default (`B = clamp(round(max_depth * sigmoid(c_t) *
 scale_factor), floor, ceiling)` snapped to the budget set) and MUST be
-recalibrated once a real head ships — see the placeholder-policy note in the
-task report.
+recalibrated once a real head ships.
 """
 
 _HEAD_BUDGETS = (4, 8, 16, 32, 64)

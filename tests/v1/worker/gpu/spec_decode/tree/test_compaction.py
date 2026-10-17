@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for compacting the accepted chain's KV into canonical slots.
 
-Task 7 ships the KV-compaction primitive: after the tree verify accepts a
+The KV-compaction primitive: after the tree verify accepts a
 chain, accepted nodes' K/V still live at their scattered tree-block slots
 ``C + 1 + arena`` while inference reads context by ``position -> slot`` (slot
 ``C + depth``). These tests pin, on GPU with fake per-layer caches mirroring
