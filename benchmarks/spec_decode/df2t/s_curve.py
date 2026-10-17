@@ -18,6 +18,7 @@ reduction noise makes exact-token identity across *rounds* of the same config
 nondeterministic for the plain chain too (documented; use fp32/flex as the
 exact-parity vehicle).
 """
+
 import concurrent.futures
 import hashlib
 import json
@@ -43,11 +44,19 @@ _PROMPTS = E.PROMPTS["chat"] + E.PROMPTS["math"] + E.PROMPTS["code"]
 
 
 def complete(port: int, prompt: str, max_tokens: int = _MAX_TOKENS) -> tuple[str, int]:
-    body = json.dumps({"model": E.TARGET, "prompt": prompt,
-                       "max_tokens": max_tokens, "temperature": 0.0}).encode()
-    req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/completions",
-                                 data=body,
-                                 headers={"Content-Type": "application/json"})
+    body = json.dumps(
+        {
+            "model": E.TARGET,
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/completions",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
     with urllib.request.urlopen(req, timeout=180) as r:
         d = json.loads(r.read())
     return d["choices"][0]["text"], int(d["usage"].get("completion_tokens", 0))
@@ -69,8 +78,9 @@ def bench(port: int, c: int, rounds: int = 4) -> tuple[float, float, str]:
             results = list(ex.map(lambda p: complete(port, p), batch))
         elapsed += time.perf_counter() - t0
         tokens_total += sum(nt for _, nt in results)
-        hashes.append(hashlib.sha256(
-            "".join(t for t, _ in results).encode()).hexdigest()[:12])
+        hashes.append(
+            hashlib.sha256("".join(t for t, _ in results).encode()).hexdigest()[:12]
+        )
     toks = tokens_total / elapsed if elapsed > 0 else float("nan")
     return toks, tokens_total, ",".join(sorted(set(hashes)))
 
@@ -78,8 +88,10 @@ def bench(port: int, c: int, rounds: int = 4) -> tuple[float, float, str]:
 def main() -> None:
     port = int(os.environ.get("PORT", "8006"))
     c = int(os.environ.get("CONCURRENCY", "1"))
-    print(f"=== s-curve (server) L={_L} max_tokens={_MAX_TOKENS} "
-          f"concurrency={c} (quiet-host timing) ===")
+    print(
+        f"=== s-curve (server) L={_L} max_tokens={_MAX_TOKENS} "
+        f"concurrency={c} (quiet-host timing) ==="
+    )
 
     # chain baseline (production path: FULL CUDA graphs, not eager)
     proc = E._boot(port, "dflash", None, None, eager=False)
@@ -103,15 +115,18 @@ def main() -> None:
             time.sleep(2)
             complete(port, _PROMPTS[0])  # warm
             t, n, h = bench(port, c)
-            lines = json.dumps({"tree_s": s, "tok/s": round(t, 1),
-                                "out_tokens": n, "hash": h})
+            lines = json.dumps(
+                {"tree_s": s, "tok/s": round(t, 1), "out_tokens": n, "hash": h}
+            )
             print(f"  s={s:<4} {lines}")
             # acceptance via metrics delta over a short drive
             before = E._counters(port)
             E._drive(port, E.PROMPTS["math"], c)
             m = E._acceptance_metrics(before, E._counters(port))
-            print(f"         math accept: E[A]={m['E[A]']:.3f} "
-                  f"sum_surv={m['sum_survival']:.3f}")
+            print(
+                f"         math accept: E[A]={m['E[A]']:.3f} "
+                f"sum_surv={m['sum_survival']:.3f}"
+            )
             if ref is None:
                 ref = h
             print(f"         T=0 identity vs s=0.25: {'OK' if h == ref else 'DIFF'}")
