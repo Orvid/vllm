@@ -28,19 +28,27 @@ from vllm.v1.worker.gpu.spec_decode.tree.tree_verifier import (
 _DEVICES = ["cpu", "cuda"]
 
 
-def _make_slot_layer(num_slots, num_heads, head_dim, device="cuda"):
+def _make_slot_layer(num_slots, num_heads, head_dim, device="cuda", num_blocks=1):
     """Engine-style LBNHC per-layer view: (logical view, physical storage).
 
-    Physical storage is the contiguous ``[1, num_slots, num_heads, head_dim]``
-    array; the view is the non-contiguous transpose ``[1, num_heads, num_slots,
-    head_dim]`` (strides ``(num_slots * num_heads * head_dim, head_dim,
-    num_heads * head_dim, 1)``), exactly what ``create_kv_cache_views`` yields
-    under LBNHC. ``compact_accepted_chain`` addresses slot ``phys`` via the
-    flat ``phys * elems`` run, so tests seed/read through ``storage[0, phys]``
-    and hand ``view`` to the primitive.
+    Physical storage is the contiguous
+    ``[num_blocks, num_slots, num_heads, head_dim]`` array; the view is the
+    non-contiguous transpose ``[num_blocks, num_heads, num_slots, head_dim]``
+    (strides ``(num_slots * num_heads * head_dim, head_dim, num_heads *
+    head_dim, 1)``), exactly what ``create_kv_cache_views`` yields under
+    LBNHC. ``compact_accepted_chain`` addresses slot ``phys`` via the flat
+    ``phys * elems`` run, so tests seed/read through ``storage[0, phys]`` and
+    hand ``view`` to the primitive; ``num_blocks`` lets a fixture model the
+    kernel-block tables (one view block per table entry) at a realistic
+    slots-per-block size.
     """
     storage = torch.zeros(
-        1, num_slots, num_heads, head_dim, dtype=torch.float32, device=device
+        num_blocks,
+        num_slots,
+        num_heads,
+        head_dim,
+        dtype=torch.float32,
+        device=device,
     )
     return storage.transpose(1, 2), storage
 
@@ -888,7 +896,10 @@ def test_model_runner_df2t_compaction_wiring_moves_per_group():
     storages = {}
     for _, specs in enumerate(layer_specs):
         for name, h, d in specs:
-            views_by_name[name], storages[name] = _make_slot_layer(256, h, d, device)
+            views_by_name[name], storages[name] = _make_slot_layer(
+                4, h, d, device, num_blocks=64
+            )
+            storages[name] = storages[name].reshape(-1, h, d)
 
     block_tables = [
         torch.tensor(
@@ -917,12 +928,12 @@ def test_model_runner_df2t_compaction_wiring_moves_per_group():
     assert canon0 == 201 and canon1 == 49
 
     for name, h, d in [("l.0", 2, 3), ("l.1", 2, 3)]:
-        storages[name][0, int(r0_g0[2])] = _fill(1, h, d)  # node1 scatter
-        storages[name][0, int(r0_g0[3])] = _fill(2, h, d)  # node2 scatter
-        storages[name][0, canon0] = _fill(9, h, d)  # canonical no-op request
-    storages["l.20"][0, int(r0_g1[2])] = _fill(1, 1, 5)
-    storages["l.20"][0, int(r0_g1[3])] = _fill(2, 1, 5)
-    storages["l.20"][0, canon1] = _fill(9, 1, 5)
+        storages[name][int(r0_g0[2])] = _fill(1, h, d)  # node1 scatter
+        storages[name][int(r0_g0[3])] = _fill(2, h, d)  # node2 scatter
+        storages[name][canon0] = _fill(9, h, d)  # canonical no-op request
+    storages["l.20"][int(r0_g1[2])] = _fill(1, 1, 5)
+    storages["l.20"][int(r0_g1[3])] = _fill(2, 1, 5)
+    storages["l.20"][canon1] = _fill(9, 1, 5)
 
     fake_self = SimpleNamespace(
         max_num_reqs=num_reqs,
@@ -946,35 +957,31 @@ def test_model_runner_df2t_compaction_wiring_moves_per_group():
     # Request 0 / group 0: node1 scatter 160 -> canonical 123 and node2 scatter
     # 161 -> canonical 162; both scattered slots come back zeroed.
     for name in ("l.0", "l.1"):
+        assert torch.equal(storages[name][int(r0_g0[1])], _fill(1, 2, 3))  # dst depth1
+        assert torch.equal(storages[name][int(r0_g0[4])], _fill(2, 2, 3))  # dst depth4
         assert torch.equal(
-            storages[name][0, int(r0_g0[1])], _fill(1, 2, 3)
-        )  # dst depth1
-        assert torch.equal(
-            storages[name][0, int(r0_g0[4])], _fill(2, 2, 3)
-        )  # dst depth4
-        assert torch.equal(
-            storages[name][0, int(r0_g0[2])], torch.zeros((2, 3), device=device)
+            storages[name][int(r0_g0[2])], torch.zeros((2, 3), device=device)
         )
         assert torch.equal(
-            storages[name][0, int(r0_g0[3])], torch.zeros((2, 3), device=device)
+            storages[name][int(r0_g0[3])], torch.zeros((2, 3), device=device)
         )
 
     # Request 0 / group 1 uses its OWN block table: node1 12 -> 11, node2
     # 13 -> 14.
-    assert torch.equal(storages["l.20"][0, int(r0_g1[1])], _fill(1, 1, 5))
-    assert torch.equal(storages["l.20"][0, int(r0_g1[4])], _fill(2, 1, 5))
+    assert torch.equal(storages["l.20"][int(r0_g1[1])], _fill(1, 1, 5))
+    assert torch.equal(storages["l.20"][int(r0_g1[4])], _fill(2, 1, 5))
     assert torch.equal(
-        storages["l.20"][0, int(r0_g1[2])], torch.zeros((1, 5), device=device)
+        storages["l.20"][int(r0_g1[2])], torch.zeros((1, 5), device=device)
     )
     assert torch.equal(
-        storages["l.20"][0, int(r0_g1[3])], torch.zeros((1, 5), device=device)
+        storages["l.20"][int(r0_g1[3])], torch.zeros((1, 5), device=device)
     )
 
     # Request 1: already canonical (canonical slot == scattered slot), so the
     # KV there is left byte-for-byte untouched.
     for name in ("l.0", "l.1"):
-        assert torch.equal(storages[name][0, canon0], _fill(9, 2, 3))
-    assert torch.equal(storages["l.20"][0, canon1], _fill(9, 1, 5))
+        assert torch.equal(storages[name][canon0], _fill(9, 2, 3))
+    assert torch.equal(storages["l.20"][canon1], _fill(9, 1, 5))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
