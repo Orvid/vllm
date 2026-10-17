@@ -289,6 +289,16 @@ def kernel_unified_attention(
     # instead of letting them override it. Default False preserves the
     # original (causal AND SW) OR mm_prefix behavior for all other models.
     MM_PREFIX_CLAMP_SW: tl.constexpr = False,
+    # Speculative tree verification: per query row, a mask over the 64 keys
+    # ending at its own slot (bit d = the key d slots back) and its slot minus
+    # its sequence position (``TreeVerifyContext.row_mask`` /
+    # ``row_pos_delta``). Its sliding window is ``TREE_WINDOW`` in positions
+    # (``SLIDING_WINDOW`` is 0), so tiles are pruned with 64 slots of slack.
+    USE_TREE_MASK: tl.constexpr = False,
+    TREE_WINDOW: tl.constexpr = 0,
+    TREE_PRUNE_WINDOW: tl.constexpr = 0,
+    tree_mask_ptr=None,
+    tree_pos_delta_ptr=None,
 ):
     # Per-(token, head) scale caches: used iff KV_QUANT_MODE in {2, 3}.
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = (KV_QUANT_MODE >= 2) and (
@@ -396,6 +406,14 @@ def kernel_unified_attention(
     if USE_QQ_BIAS:
         qq_bias_row_ptrs = qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
 
+    if USE_TREE_MASK:
+        tree_words = tl.load(
+            tree_mask_ptr + query_offset_0, mask=query_mask_0, other=-1
+        )
+        tree_delta = tl.load(
+            tree_pos_delta_ptr + query_offset_0, mask=query_mask_0, other=0
+        )
+
     loop_lo, loop_hi, max_seq_prefix_len = compute_tile_loop_bounds(
         context_len,
         seq_len,
@@ -407,7 +425,7 @@ def kernel_unified_attention(
         BLOCK_M,
         BLOCK_Q,
         num_queries_per_kv,
-        SLIDING_WINDOW,
+        SLIDING_WINDOW + TREE_PRUNE_WINDOW,
         USE_MM_PREFIX,
         IS_3D,
         USE_CAUSAL,
@@ -536,6 +554,12 @@ def kernel_unified_attention(
             CHUNK_SIZE,
             MM_PREFIX_CLAMP_SW,
         )
+        if USE_TREE_MASK:
+            back = (query_abs_pos - seq_offset[None, :]).to(tl.int64)
+            bit = (tree_words[:, None] >> tl.minimum(tl.maximum(back, 0), 63)) & 1
+            seq_mask = seq_mask & ((back >= 64) | (bit != 0))
+            if TREE_WINDOW > 0:
+                seq_mask = seq_mask & ((back - tree_delta[:, None]) < TREE_WINDOW)
 
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
@@ -581,6 +605,9 @@ def kernel_unified_attention(
             else:
                 sw_mask_v = (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
             V = tl.where(sw_mask_v, V, 0.0)
+        if TREE_PRUNE_WINDOW:
+            dist = context_len + q_block_local_idx * BLOCK_Q - seq_offset[:, None]
+            V = tl.where(dist < TREE_PRUNE_WINDOW, V, 0.0)
         if USE_PER_TOKEN_HEAD_SCALES:
             # Per-token-head quant: apply v_scale to P instead of V.
             P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
@@ -852,11 +879,26 @@ def unified_attention(
     # Gemma4: clamp mm_prefix bidirectional ranges by the sliding window.
     # Default False keeps the original behavior for every other model.
     mm_prefix_clamp_sliding_window: bool = False,
+    # Speculative tree verification: ``TreeVerifyContext.row_mask`` and
+    # ``row_pos_delta``, indexed by query row.
+    tree_mask: torch.Tensor | None = None,
+    tree_pos_delta: torch.Tensor | None = None,
 ):
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
     use_causal = bool(causal) if not use_per_seq_causal else True
     per_seq_causal_ptr = causal if use_per_seq_causal else None
+
+    use_tree_mask = tree_mask is not None
+    if use_tree_mask:
+        assert tree_pos_delta is not None
+        assert causal is True and qq_bias is None and chunk_lookback < 0, (
+            "the tree mask composes with causal (optionally windowed) attention only"
+        )
+        assert mm_prefix_range is None and rswa_window is None, (
+            "the tree mask does not compose with mm-prefix or R-SWA masks"
+        )
+        assert kv_quant_mode != KVQuantMode.INT4_PER_TOKEN_HEAD
 
     # Sub-byte packed mode (INT4) needs a bespoke kernel (split-dot +
     # sub-byte unpack); everything else goes through the core kernel below.
@@ -971,6 +1013,10 @@ def unified_attention(
     total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
 
     sliding_window_val = 1 + window_size[0] if window_size[0] >= 0 else 0
+    # A tree row's window is positional and its slot runs up to 64 past its
+    # position, so the kernel applies the window itself.
+    tree_window = sliding_window_val if use_tree_mask else 0
+    tree_prune_window = tree_window + 64 if tree_window > 0 else 0
 
     # Compute chunked block size from sliding window if needed.
     chunk_size = -1
@@ -1130,7 +1176,7 @@ def unified_attention(
         USE_QQ_BIAS=use_qq_bias,
         USE_SOFTCAP=(softcap > 0),
         USE_SINKS=(sinks is not None),
-        SLIDING_WINDOW=(1 + window_size[0]),
+        SLIDING_WINDOW=0 if use_tree_mask else (1 + window_size[0]),
         USE_CAUSAL=use_causal,
         USE_PER_SEQ_CAUSAL=use_per_seq_causal,
         per_seq_causal_ptr=per_seq_causal_ptr,
@@ -1168,6 +1214,11 @@ def unified_attention(
         USE_TD=use_td,
         USE_TD_QO=use_td_qo,
         MM_PREFIX_CLAMP_SW=mm_prefix_clamp_sliding_window,
+        USE_TREE_MASK=use_tree_mask,
+        TREE_WINDOW=tree_window,
+        TREE_PRUNE_WINDOW=tree_prune_window,
+        tree_mask_ptr=tree_mask,
+        tree_pos_delta_ptr=tree_pos_delta,
         **launch_kwargs,
     )
 

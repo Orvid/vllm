@@ -3143,14 +3143,9 @@ class VllmConfig:
         return unsupported
 
     def _validate_tree_attention(self) -> None:
-        """Tree verification requires FA4 or Flex attention on every arch.
-
-        The per-query tree mask is only expressible by FlashAttention-4 (the
-        default ``tree_attention_backend="fa4"``) or FlexAttention
-        (``tree_attention_backend="flex"``). An explicit override to FA2/FA3
-        or to a non-{fa4, flex} attention backend cannot run the tree verify
-        pass correctly, so reject it here rather than silently falling back.
-        """
+        """Reject tree verification on targets whose masks cannot compose
+        with the tree mask. Whether each attention backend can verify trees
+        is checked when the runner builds its attention groups."""
         spec_config = self.speculative_config
         if spec_config is None or not spec_config.use_tree():
             return
@@ -3161,42 +3156,6 @@ class VllmConfig:
             raise ValueError(
                 "tree speculative verification supports mamba_cache_mode "
                 "'none' and 'align', not 'all'."
-            )
-
-        from vllm.v1.attention.backends.fa_utils import TREE_ATTN_REQUIRED
-        from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
-        fa_version = self.attention_config.flash_attn_version
-        if fa_version not in (None, 4):
-            raise ValueError(
-                f"{TREE_ATTN_REQUIRED}, but attention_config."
-                f"flash_attn_version is {fa_version}. the per-query tree "
-                "mask is only supported by FA4 or Flex attention; refusing to "
-                "run it on FA2/FA3."
-            )
-
-        allowed_backends = {
-            AttentionBackendEnum.FLASH_ATTN,
-            AttentionBackendEnum.FLEX_ATTENTION,
-        }
-        backend = self.attention_config.backend
-        if backend is not None and backend not in allowed_backends:
-            raise ValueError(
-                "tree speculative verification requires FlashAttention-4 (fa4) "
-                f"or Flex attention on the target, but attention_config."
-                f"backend is {backend}. Refusing a backend that cannot "
-                "express the per-query tree mask."
-            )
-        bad_kinds = [
-            f"{kind}={value}"
-            for kind, value in self.attention_config.backend_per_kind.items()
-            if value not in allowed_backends
-        ]
-        if bad_kinds:
-            raise ValueError(
-                "tree speculative verification requires FA4 or Flex attention on "
-                "the target, but attention_config.backend_per_kind overrides "
-                f"{bad_kinds} are outside {{fa4, flex}}."
             )
 
         # Fail closed on targets whose mask the FA4 commit kernel would drop

@@ -28,6 +28,7 @@ from vllm.v1.attention.backends.rocm_attn import (
     RocmAttentionMetadata,
     RocmAttentionMetadataBuilder,
 )
+from vllm.v1.attention.ops.tree_attention import check_tree_attention_layer
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
 
 logger = init_logger(__name__)
@@ -42,6 +43,25 @@ def _kv_connector_enabled() -> bool:
 
 
 class RocmAiterUnifiedAttentionMetadataBuilder(RocmAttentionMetadataBuilder):
+    # Tree batches run on the vLLM Triton unified kernel's tree mask.
+    supports_tree_verify = True
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> RocmAttentionMetadata:
+        attn_metadata = super().build(
+            common_prefix_len, common_attn_metadata, fast_build
+        )
+        tree = common_attn_metadata.tree_verify
+        if tree is not None:
+            assert not attn_metadata.use_cascade
+            attn_metadata.tree_mask = tree.row_mask
+            attn_metadata.tree_pos_delta = tree.row_pos_delta
+        return attn_metadata
+
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> RocmAttentionMetadata:
@@ -272,7 +292,7 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         max_seqlen_k = attn_metadata.max_seq_len
         block_table = attn_metadata.block_table
 
-        if attn_metadata.causal:
+        if attn_metadata.causal and attn_metadata.tree_mask is None:
             self.unified_attention(
                 q=query[:num_actual_tokens],
                 k=key_cache,
@@ -295,13 +315,16 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
                 output_scale=output_scale,
             )
         else:
-            # The aiter kernel is causal-only. Non-causal cross-attention
-            # (ENCODER_DECODER, e.g. Whisper) falls back to the vLLM Triton
-            # unified kernel, which shares this layout and honors the flag.
+            # The aiter kernel is causal-only and has no tree mask. Non-causal
+            # cross-attention (ENCODER_DECODER, e.g. Whisper) and speculative
+            # tree verification fall back to the vLLM Triton unified kernel,
+            # which shares this layout.
             from vllm.v1.attention.ops.triton_unified_attention import (
                 unified_attention as triton_unified_attention,
             )
 
+            if attn_metadata.tree_mask is not None:
+                check_tree_attention_layer(self.sliding_window, self.alibi_slopes)
             descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
             triton_unified_attention(
                 q=query[:num_actual_tokens],
@@ -323,6 +346,8 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
                 v_descale=layer._v_scale.expand(descale_shape),
                 sinks=self.sinks,
                 output_scale=output_scale,
+                tree_mask=attn_metadata.tree_mask,
+                tree_pos_delta=attn_metadata.tree_pos_delta,
             )
 
         return output

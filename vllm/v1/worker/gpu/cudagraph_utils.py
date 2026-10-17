@@ -718,6 +718,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 # This graph verifies uniform trees of its query width.
                 query_len = desc.max_query_len or num_tokens // max(num_reqs, 1)
                 tree_verify.step_width = query_len - 1
+                tree_verify.has_treeless = False
             attn_metadata, slot_mappings = prepare_inputs_to_capture(
                 num_reqs,
                 num_tokens,

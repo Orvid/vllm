@@ -20,6 +20,7 @@ on replay. They are published to layers as ``ForwardContext.tree_verify``.
 
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -31,6 +32,8 @@ def _fill_row_parents_kernel(
     row_depth_ptr,  # [max_tokens] int32
     row_anchor_ptr,  # [max_tokens] int32
     path_rows_ptr,  # [max_tokens, D] int32
+    row_mask_ptr,  # [max_tokens] int64
+    row_pos_delta_ptr,  # [max_tokens] int32
     tree_width_ptr,  # [max_num_reqs] int32
     query_start_loc_ptr,  # [R + 1] int32
     parents_ptr,  # [R, W] int64 parent arena per node (-1 = the anchor)
@@ -51,6 +54,8 @@ def _fill_row_parents_kernel(
         tl.store(row_parent_ptr + rows, parent.to(tl.int32), mask=m)
         tl.store(row_depth_ptr + rows, 0, mask=m)
         tl.store(row_anchor_ptr + rows, -1, mask=m)
+        tl.store(row_mask_ptr + rows, tl.full([BLOCK], -1, tl.int64), mask=m)
+        tl.store(row_pos_delta_ptr + rows, 0, mask=m)
     n = tl.load(widths_ptr + r).to(tl.int32)
     tl.store(tree_width_ptr + r, n)
     if n > 0:
@@ -84,6 +89,19 @@ def _fill_row_parents_kernel(
             tl.store(path_rows_ptr + row * D + dst, ancestors, mask=dst < D)
             tl.store(row_depth_ptr + row, steps)
             tl.store(row_anchor_ptr + row, block_start.to(tl.int32))
+            # Bit d: the key d slots back is the row itself or an ancestor
+            # node; the anchor (1 + a slots back) and everything before it is
+            # context. Distinct bits, so the sum is their union.
+            dist = (row - ancestors).to(tl.int64)
+            own = tl.where(
+                (k < steps) & (ancestors >= 0), tl.full([DP], 1, tl.int64) << dist, 0
+            )
+            to_anchor = tl.cast(1 + a, tl.int64)
+            context = tl.where(
+                to_anchor >= 64, 0, ~((tl.full([], 1, tl.int64) << to_anchor) - 1)
+            )
+            tl.store(row_mask_ptr + row, tl.sum(own, axis=0) | context)
+            tl.store(row_pos_delta_ptr + row, tl.cast(1 + a - steps, tl.int32))
 
 
 @triton.jit
@@ -207,8 +225,25 @@ class TreeVerifyContext:
             dtype=torch.int32,
             device=device,
         )
+        # Per row, the keys it attends among the 64 slots ending at its own:
+        # bit d of row_mask[i] is set iff row i sees the key d slots before
+        # its own slot. Keys 64 or more slots back are always visible (a tree
+        # holds at most 64 nodes, so they are context). Chain rows see every
+        # earlier slot (-1). row_pos_delta[i] is the row's slot minus its
+        # sequence position (a tree row sits at its arena slot, but at its
+        # anchor's position plus its depth), for position-keyed windows.
+        self.row_mask = torch.full(
+            (max_num_tokens,), -1, dtype=torch.int64, device=device
+        )
+        self.row_pos_delta = torch.zeros(
+            max_num_tokens, dtype=torch.int32, device=device
+        )
         self.tree_width = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
         self.num_reqs = 0
+        # Whether a request of the step verifies no tree (host value; unknown
+        # counts as True). Backends that verify trees apart from causal
+        # attention skip the causal pass when every request has a tree.
+        self.has_treeless = True
         # Commit buffers, written after each walk.
         per_req = 1 + self.max_depth
         self._commit_rows = torch.zeros(
@@ -226,6 +261,7 @@ class TreeVerifyContext:
         num_reqs: int,
         parents: torch.Tensor,
         widths: torch.Tensor,
+        widths_np: "np.ndarray | None" = None,
     ) -> None:
         """Write this step's row parents and per-request tree widths.
 
@@ -235,9 +271,11 @@ class TreeVerifyContext:
             parents: ``[num_reqs, W]`` parent arena per node (unit column
                 stride; -1 = the anchor).
             widths: ``[num_reqs]`` verify width per request (0 = no tree).
+            widths_np: ``widths`` on the host, when known.
 
         """
         self.num_reqs = num_reqs
+        self.has_treeless = widths_np is None or bool((widths_np[:num_reqs] <= 0).any())
         if num_reqs == 0:
             return
         assert parents.stride(1) == 1
@@ -247,6 +285,8 @@ class TreeVerifyContext:
             self.row_depth,
             self.row_anchor,
             self.path_rows,
+            self.row_mask,
+            self.row_pos_delta,
             self.tree_width,
             query_start_loc,
             parents,

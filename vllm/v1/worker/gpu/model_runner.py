@@ -1074,7 +1074,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _check_tree_attention_support(self, draft_layers: set[str]) -> None:
         """Refuse tree verification when a target attention group could not
         keep tree rows apart: its builder must build tree-correct metadata
-        (``supports_tree_verify``), or the runner must mask it (FlashAttention
+        (``supports_tree_verify``), or the runner must mask it (FlashAttention-4
         / FlexAttention). Stateful mixers commit through
         ``TreeRecurrentLayers`` instead."""
         spec = self.speculative_config
@@ -2367,7 +2367,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self._tree_ctx is not None and tree_batch is not None:
                 self._tree_ctx.step_width = int(tree_batch.widths_np.max())
                 self._tree_ctx.fill(
-                    query_start_loc, num_reqs, tree_batch.parents, tree_batch.widths
+                    query_start_loc,
+                    num_reqs,
+                    tree_batch.parents,
+                    tree_batch.widths,
+                    tree_batch.widths_np,
                 )
 
         fast_prefill = None
@@ -2864,6 +2868,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if id(metadata) in seen_metadata:
                 continue
             seen_metadata.add(id(metadata))
+            if metadata.tree_mask is not None:
+                # FA2/FA3: the builder already split the verify.
+                attached = True
+                continue
             mask_mod, aux = mask_for(window_layer.get(layer_name))
             metadata.tree_mask_mod = mask_mod
             metadata.tree_aux_tensors = aux

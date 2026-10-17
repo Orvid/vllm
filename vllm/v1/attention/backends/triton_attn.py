@@ -34,6 +34,7 @@ from vllm.v1.attention.backends.utils import (
     compute_mm_prefix_range_tensor,
     get_num_attention_heads_from_layers,
 )
+from vllm.v1.attention.ops.tree_attention import check_tree_attention_layer
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
@@ -94,12 +95,17 @@ class TritonAttentionMetadata:
     mm_prefix_range_tensor: torch.Tensor | None = None
     rswa_prefix_lens: torch.Tensor | None = None
     rswa_window: int | None = None
+    # Speculative tree verification (``TreeVerifyContext.row_mask`` and
+    # ``row_pos_delta``).
+    tree_mask: torch.Tensor | None = None
+    tree_pos_delta: torch.Tensor | None = None
 
 
 class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
     # Step-dependent fields reference persistent input buffers directly.
     supports_draft_decode_metadata_update = True
+    supports_tree_verify = True
 
     def __init__(
         self,
@@ -264,6 +270,12 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             persistent_prefix_lens.copy_(rswa_prefix_lens[:num_reqs])
             attn_metadata.rswa_prefix_lens = persistent_prefix_lens
             attn_metadata.rswa_window = self.rswa_window
+
+        tree = common_attn_metadata.tree_verify
+        if tree is not None:
+            assert not use_cascade
+            attn_metadata.tree_mask = tree.row_mask
+            attn_metadata.tree_pos_delta = tree.row_pos_delta
 
         return attn_metadata
 
@@ -659,6 +671,8 @@ class TritonAttentionImpl(AttentionImpl):
         softmax_segm_expsum = attn_metadata.softmax_segm_expsum
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
+        if attn_metadata.tree_mask is not None:
+            check_tree_attention_layer(self.sliding_window, self.alibi_slopes)
 
         unified_attention(
             q=query[:num_actual_tokens],
@@ -697,6 +711,8 @@ class TritonAttentionImpl(AttentionImpl):
             mm_prefix_clamp_sliding_window=getattr(
                 layer, "mm_prefix_clamp_sliding_window", False
             ),
+            tree_mask=attn_metadata.tree_mask,
+            tree_pos_delta=attn_metadata.tree_pos_delta,
         )
 
         return output

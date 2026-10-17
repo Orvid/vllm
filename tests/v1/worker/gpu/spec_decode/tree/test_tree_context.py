@@ -51,6 +51,30 @@ def test_tree_rows_know_their_depth_anchor_and_path():
     assert paths == {4: [4], 5: [4, 5], 6: [6], 7: [4, 5, 7]}
 
 
+def test_row_mask_hides_only_non_ancestor_nodes():
+    """A row's relative mask clears exactly the bits of the earlier tree nodes
+    that are not its ancestors, and its position delta is how far its arena
+    slot lies past its anchor-plus-depth position; chain rows see every
+    earlier slot at their own position."""
+    ctx = TreeVerifyContext(16, 4, max_depth=3, device=DEVICE)
+    _batch(ctx)
+    # n2 (row 6) hides n0 and n1 (1 and 2 slots back); n3 (row 7) hides n2.
+    assert ctx.row_mask[:8].tolist() == [-1, -1, -1, -1, -1, -1, -1 ^ 0b110, -1 ^ 0b10]
+    assert ctx.row_pos_delta[:8].tolist() == [0, 0, 0, 0, 0, 0, 2, 1]
+
+
+def test_row_mask_of_the_64th_node_sees_its_anchor_by_distance():
+    """Node arena 63 sits 64 slots past its anchor, beyond the mask's bits:
+    the anchor stays visible through the always-visible far range, while the
+    non-ancestor nodes inside the 64-slot span stay hidden."""
+    ctx = TreeVerifyContext(80, 1, max_depth=64, device=DEVICE, max_width=64)
+    qsl = torch.tensor([0, 65], dtype=torch.int32, device=DEVICE)
+    parents = torch.full((1, 64), -1, dtype=torch.int64, device=DEVICE)
+    ctx.fill(qsl, 1, parents, torch.tensor([64], dtype=torch.int64, device=DEVICE))
+    assert ctx.row_mask[64].item() == 1
+    assert ctx.row_pos_delta[64].item() == 63
+
+
 def test_commit_lists_anchor_then_accepted_nodes():
     """The committed rows of a tree request are its anchor then the accepted
     nodes shallowest first; a request without a tree commits nothing."""

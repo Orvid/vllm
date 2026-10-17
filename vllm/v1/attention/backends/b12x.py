@@ -39,6 +39,12 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.backends.utils import get_num_attention_heads_from_layers
+from vllm.v1.attention.ops.tree_attention import (
+    TREE_MASK_SPAN,
+    check_tree_attention_layer,
+    fill_tree_relative_bias,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout, KVCacheSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -259,6 +265,9 @@ class B12xPagedMetadata(AttentionMetadata):
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
     causal: bool = True
+    # Speculative tree verification: ``[rows, num_heads, TREE_MASK_SPAN]``
+    # relative attention bias hiding each tree row's non-ancestor nodes.
+    tree_bias: torch.Tensor | None = None
 
 
 class B12xPagedMetadataBuilder(AttentionMetadataBuilder[B12xPagedMetadata]):
@@ -271,6 +280,7 @@ class B12xPagedMetadataBuilder(AttentionMetadataBuilder[B12xPagedMetadata]):
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     supports_update_block_table: bool = True
+    supports_tree_verify = True
 
     @classmethod
     def get_cudagraph_support(
@@ -289,6 +299,22 @@ class B12xPagedMetadataBuilder(AttentionMetadataBuilder[B12xPagedMetadata]):
         device: torch.device,
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self._tree_bias: torch.Tensor | None = None
+        spec = vllm_config.speculative_config
+        if spec is not None and spec.use_tree():
+            num_heads = get_num_attention_heads_from_layers(
+                vllm_config, layer_names
+            ) or vllm_config.model_config.get_num_attention_heads(
+                vllm_config.parallel_config
+            )
+            # b12x checks the bias covers its plan's whole Q capacity.
+            self._tree_bias = torch.zeros(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                num_heads,
+                TREE_MASK_SPAN,
+                dtype=vllm_config.model_config.dtype,
+                device=device,
+            )
 
     def build(
         self,
@@ -298,6 +324,13 @@ class B12xPagedMetadataBuilder(AttentionMetadataBuilder[B12xPagedMetadata]):
     ) -> B12xPagedMetadata:
         del common_prefix_len, fast_build
         cm = common_attn_metadata
+        tree_bias = None
+        if cm.tree_verify is not None:
+            assert self._tree_bias is not None
+            tree_bias = self._tree_bias
+            fill_tree_relative_bias(
+                tree_bias[: cm.num_actual_tokens], cm.tree_verify.row_mask
+            )
         return B12xPagedMetadata(
             num_actual_tokens=cm.num_actual_tokens,
             max_query_len=cm.max_query_len,
@@ -307,6 +340,7 @@ class B12xPagedMetadataBuilder(AttentionMetadataBuilder[B12xPagedMetadata]):
             block_table=cm.block_table_tensor,
             slot_mapping=cm.slot_mapping,
             causal=cm.causal,
+            tree_bias=tree_bias,
         )
 
     def update_block_table(
@@ -539,7 +573,10 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
 
         self._create_decode_plan = _create_decode_plan
         self._verify_q_per_req = 0
-        if spec_config is not None:
+        if spec_config is not None and spec_config.use_tree():
+            # Narrower adaptive widths run on the extend plans.
+            self._verify_q_per_req = 1 + spec_config.num_draft_rows_per_req
+        elif spec_config is not None:
             self._verify_q_per_req = 1 + int(
                 getattr(spec_config, "num_speculative_tokens", None) or 0
             )
@@ -1040,6 +1077,12 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
             page_table = page_table[:num_reqs]
             cache_seqlens = cache_seqlens[:num_reqs]
             cu_seqlens_q = cu_seqlens_q[: num_reqs + 1]
+        if attn_metadata.tree_bias is not None:
+            check_tree_attention_layer(
+                (self.window_left, 0) if self.window_left >= 0 else None,
+                None,
+                windowed=False,
+            )
         k_descale, v_descale = self._prepare_fp8_descales(
             layer,
             num_reqs,
@@ -1067,6 +1110,7 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
             window_left=self.window_left,
             active_total_q=(None if plan.caps.mode == "extend" else num_actual_tokens),
             attention_sink_bias=self.sinks,
+            relative_attention_bias=attn_metadata.tree_bias,
             k_descale=k_descale,
             v_descale=v_descale,
         )

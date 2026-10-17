@@ -72,6 +72,11 @@ class RocmAttentionMetadata:
     # DFlash drafting sets this to False via CommonAttentionMetadata.
     causal: bool = True
 
+    # Speculative tree verification (``TreeVerifyContext.row_mask`` and
+    # ``row_pos_delta``); set only by builders that support it.
+    tree_mask: torch.Tensor | None = None
+    tree_pos_delta: torch.Tensor | None = None
+
 
 class RocmAttentionMetadataBuilder(AttentionMetadataBuilder[RocmAttentionMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS

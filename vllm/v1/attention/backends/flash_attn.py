@@ -44,6 +44,12 @@ from vllm.v1.attention.ops.dcp import (
     dcp_a2a_lse_reduce,
 )
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+from vllm.v1.attention.ops.tree_attention import (
+    TREE_LOCAL_ROWS,
+    check_tree_attention_layer,
+    tree_local_attention,
+    tree_local_context_lens,
+)
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if is_flash_attn_varlen_func_available():
@@ -580,6 +586,17 @@ class FlashAttentionMetadata:
     tree_mask_mod: Callable | None = None
     tree_aux_tensors: list[torch.Tensor] | None = None
 
+    # tree verify (FA2/FA3): no mask hook, so each tree request's verify is
+    # split (see ``vllm.v1.attention.ops.tree_attention``). ``tree_mask`` and
+    # ``tree_width`` come from the ``TreeVerifyContext``; ``tree_context_lens``
+    # is the context each tree request's rows attend unmasked;
+    # ``tree_needs_causal`` whether a request without a tree needs the causal
+    # kernel.
+    tree_mask: torch.Tensor | None = None
+    tree_width: torch.Tensor | None = None
+    tree_context_lens: torch.Tensor | None = None
+    tree_needs_causal: bool = False
+
 
 def _tree_mask_composition_guard(attn_metadata: FlashAttentionMetadata) -> None:
     """Fail closed when the FA4 commit kernel would drop the tree mask.
@@ -668,6 +685,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         else AttentionCGSupport.UNIFORM_BATCH
     )
     supports_update_block_table: bool = True
+    # FA4 verifies trees through the runner's mask_mod, FA2/FA3 split them.
+    supports_tree_verify = True
 
     @classmethod
     def get_cudagraph_support(
@@ -762,6 +781,14 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         self.fa4_hd256 = fa_version == 4 and uses_fa4_hd256_kernel(
             self.headdim, head_size_v
         )
+        spec_config = vllm_config.speculative_config
+        self._tree_context_lens: torch.Tensor | None = None
+        if fa_version != 4 and spec_config is not None and spec_config.use_tree():
+            self._tree_context_lens = torch.zeros(
+                vllm_config.scheduler_config.max_num_seqs,
+                dtype=torch.int32,
+                device=device,
+            )
 
         if (
             vllm_config.kernel_config.enable_jit_warmup
@@ -1108,6 +1135,22 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             attn_metadata.rswa_window = self.rswa_window
             attn_metadata.rswa_window_tensor = self.persistent_rswa_window_tensor
 
+        tree = common_attn_metadata.tree_verify
+        if tree is not None and self._tree_context_lens is not None:
+            if use_cascade or self.dcp_world_size > 1:
+                raise NotImplementedError(
+                    "speculative tree verification on FA2/FA3 does not support "
+                    "cascade attention or decode context parallelism."
+                )
+            attn_metadata.tree_mask = tree.row_mask
+            attn_metadata.tree_width = tree.tree_width
+            attn_metadata.tree_context_lens = tree_local_context_lens(
+                self._tree_context_lens, query_start_loc, seq_lens, tree.tree_width
+            )
+            attn_metadata.tree_needs_causal = (
+                tree.has_treeless or max_query_len > TREE_LOCAL_ROWS
+            )
+
         return attn_metadata
 
     def update_block_table(
@@ -1421,6 +1464,21 @@ class FlashAttentionImpl(AttentionImpl):
                     v_descale=v_descale,
                 )
                 return output
+            elif attn_metadata.tree_mask is not None:
+                self._forward_tree_split(
+                    layer,
+                    query[:num_actual_tokens],
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    output[:num_actual_tokens],
+                    attn_metadata,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                )
+                return output
             else:
                 causal = attn_metadata.causal
                 is_dynamic_causal = isinstance(causal, torch.Tensor)
@@ -1584,6 +1642,85 @@ class FlashAttentionImpl(AttentionImpl):
             s_aux=self.sinks,
         )
         return output
+
+    def _forward_tree_split(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        value: torch.Tensor | None,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        q_descale: torch.Tensor | None,
+        k_descale: torch.Tensor | None,
+        v_descale: torch.Tensor | None,
+    ) -> None:
+        """Verify speculative trees without a mask hook: attend every row of
+        a tree request to the request's context unmasked, then attend it to
+        the request's own rows under the tree mask and merge the two. Other
+        requests run the causal kernel."""
+        check_tree_attention_layer(
+            self.sliding_window, self.alibi_slopes, windowed=False
+        )
+        if self.sinks is not None or key is None or value is None:
+            raise NotImplementedError(
+                "speculative tree verification on FA2/FA3 does not support "
+                "attention sinks or KV-sharing layers."
+            )
+        num_tokens = query.shape[0]
+        common = dict(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            cu_seqlens_q=attn_metadata.query_start_loc,
+            max_seqlen_q=attn_metadata.max_query_len,
+            max_seqlen_k=attn_metadata.max_seq_len,
+            softmax_scale=self.scale,
+            block_table=attn_metadata.block_table,
+            softcap=self.logits_soft_cap,
+            fa_version=self.vllm_flash_attn_version,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            num_splits=attn_metadata.max_num_splits,
+        )
+        if attn_metadata.tree_needs_causal:
+            # Requests without a tree run the causal kernel; the merge below
+            # leaves their rows alone.
+            flash_attn_varlen_func(
+                out=output,
+                seqused_k=attn_metadata.seq_lens,
+                causal=True,
+                scheduler_metadata=attn_metadata.scheduler_metadata,
+                **common,
+            )
+        ctx_out = torch.empty(
+            num_tokens, *output.shape[1:], dtype=output.dtype, device=output.device
+        )
+
+        _, ctx_lse = flash_attn_varlen_func(
+            out=ctx_out,
+            seqused_k=attn_metadata.tree_context_lens,
+            causal=False,
+            return_softmax_lse=True,
+            **common,
+        )
+        tree_local_attention(
+            output,
+            query,
+            key[:num_tokens],
+            value[:num_tokens],
+            ctx_out,
+            ctx_lse,
+            attn_metadata.tree_mask,
+            attn_metadata.query_start_loc,
+            attn_metadata.tree_width,
+            self.scale,
+            self.logits_soft_cap,
+            q_scale=layer._q_scale if query.dtype != key.dtype else None,
+        )
 
     def do_kv_cache_update(
         self,
