@@ -594,6 +594,62 @@ def test_batched_compaction_head_major_blocks_match_slot_major():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_batched_compaction_kernel_blocks_smaller_than_group_blocks():
+    """A backend whose kernel block is smaller than the group's block (b12x's
+    64-slot pages in a hybrid model's larger attention blocks) gets block
+    tables in kernel-block units; compaction must address slots through them,
+    matching the reference on kernel blocks."""
+    from vllm.v1.worker.gpu.spec_decode.tree.compaction import (
+        TreeKVCompaction,
+    )
+
+    R, W = 5, 7
+    kernel_block, num_blocks = 16, 64
+    group_specs = [[("l.0", 2, 3), ("l.1", 2, 3)], [("l.2", 1, 4)]]
+    # The groups' own blocks hold three kernel blocks each.
+    groups = [
+        SimpleNamespace(
+            layer_names=[n for n, _, _ in grp],
+            kv_cache_spec=SimpleNamespace(block_size=3 * kernel_block),
+        )
+        for grp in group_specs
+    ]
+    for seed in range(4):
+        views, buf = _make_batched_cache(group_specs, kernel_block, num_blocks)
+        num_sampled, accepted_arenas, num_computed, block_tables, trees = (
+            _rand_chain_batch(R, W, num_blocks, seed)
+        )
+        num_slots = int(num_computed.max().item()) + W + 2
+        _seed_kv(views, group_specs, kernel_block, num_slots)
+        torch.accelerator.synchronize()
+        initial = buf.clone()
+        _old_compact_reference(
+            views,
+            group_specs,
+            kernel_block,
+            num_sampled,
+            accepted_arenas,
+            num_computed,
+            block_tables,
+            trees,
+            R,
+        )
+        torch.accelerator.synchronize()
+        reference = buf.clone()
+        buf.copy_(initial)
+        TreeKVCompaction(R, W, views, groups, torch.device("cuda")).compact(
+            num_sampled,
+            accepted_arenas,
+            trees,
+            num_computed,
+            [block_tables] * len(groups),
+            R,
+        )
+        torch.accelerator.synchronize()
+        assert torch.equal(buf, reference), f"seed {seed} diverged"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_batched_compaction_treeless_requests_untouched():
     """Requests without a tree (or with no accepted chain) must leave their KV
     byte-for-byte untouched even when the batch otherwise compacts."""

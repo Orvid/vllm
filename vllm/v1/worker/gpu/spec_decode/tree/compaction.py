@@ -610,15 +610,23 @@ class TreeKVCompaction:
                     # (Compressed entries no accepted tree row completes stay
                     # put.)
                     continue
+                # The view's own blocks (kernel blocks) address its slots, and
+                # the runner's block tables count those blocks: a backend
+                # whose kernel block is smaller than the group's block gets
+                # each group block split into several table entries.
+                view_slots = layer.shape[-2]
+                assert (int(bs) // ratio) % view_slots == 0, (name, bs, view_slots)
                 pg = plan_groups.get((g, ratio))
                 if pg is None:
                     pg = plan_groups[(g, ratio)] = len(self.plan_group_of)
                     self.plan_group_of.append(g)
-                    # UniformTypeKVCacheSpecs resolves to an int block_size.
-                    self.block_sizes.append(int(bs) // ratio)
+                    self.block_sizes.append(view_slots)
                     self.slot_ratios.append(ratio)
-                # The view's own blocks (kernel blocks) address its slots.
-                view_slots = layer.shape[-2]
+                elif self.block_sizes[pg] != view_slots:
+                    raise ValueError(
+                        f"tree compaction: layer {name} has {view_slots}-slot "
+                        f"blocks, others of its group {self.block_sizes[pg]}"
+                    )
                 block_bytes = layer.stride(0) * layer.element_size()
                 runs = layer_segments.get(name)
                 if runs is None:

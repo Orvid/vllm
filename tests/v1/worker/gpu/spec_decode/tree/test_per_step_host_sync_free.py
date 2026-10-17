@@ -112,16 +112,16 @@ class _CountingSync:
         return False
 
 
-def _make_slot_layer(num_slots, num_heads, head_dim, device="cuda"):
+def _make_slot_layer(num_blocks, block_size, num_heads, head_dim, device="cuda"):
     """Engine-style LBNHC per-layer view: ``(view, storage)``.
 
-    The view is the non-contiguous transpose ``[1, num_heads, num_slots,
-    head_dim]`` (strides ``(num_slots * num_heads * head_dim, head_dim,
-    num_heads * head_dim, 1)``), exactly what ``create_kv_cache_views`` yields
-    under LBNHC (the compactor requires per-slot-contiguous layers).
+    The view is the non-contiguous transpose ``[num_blocks, num_heads,
+    block_size, head_dim]`` (strides ``(block_size * num_heads * head_dim,
+    head_dim, num_heads * head_dim, 1)``), exactly what
+    ``create_kv_cache_views`` yields under LBNHC.
     """
     storage = torch.zeros(
-        1, num_slots, num_heads, head_dim, dtype=torch.float32, device=device
+        num_blocks, block_size, num_heads, head_dim, dtype=torch.float32, device=device
     )
     return storage.transpose(1, 2), storage
 
@@ -148,8 +148,8 @@ def _fake_runner(device, tree_verifier, batch_size, vocab):
     def apply_sampling_params(logits, *args, **kwargs):
         return logits
 
-    kv_view, _kv_storage = _make_slot_layer(32, 2, 4, device)
     block_sizes = 16
+    kv_view, _kv_storage = _make_slot_layer(2, block_sizes, 2, 4, device)
     num_blocks = 8
     block_table = torch.zeros(batch_size, num_blocks, dtype=torch.long, device=device)
     fake = SimpleNamespace(
