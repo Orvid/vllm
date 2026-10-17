@@ -63,9 +63,9 @@ def _sm120() -> bool:
 def _fa4_available() -> bool:
     if not current_platform.is_cuda():
         return False
-    from vllm.v1.attention.backends.fa_utils import is_fa_version_supported
+    from vllm.v1.attention.backends.fa_utils import FA4_TREE_MASK_AVAILABLE
 
-    return is_fa_version_supported(4)
+    return FA4_TREE_MASK_AVAILABLE
 
 
 requires_sm120_fa4 = pytest.mark.skipif(
@@ -250,6 +250,7 @@ def _df2t_spec_config():
     )
 
 
+@requires_sm120_fa4
 def test_build_fa4_tree_mask_shapes_and_cache():
     """build_fa4_tree_mask returns (mask_mod, [words, c_per_req]) of the right
     shapes, reuses the cached closure for the same B, and re-compiles per B."""
@@ -285,6 +286,7 @@ def test_build_fa4_tree_mask_shapes_and_cache():
     assert aux_packed[0].shape == (num_reqs, B)
 
 
+@requires_sm120_fa4
 def test_build_fa4_tree_mask_window_aux_and_cache():
     """A windowed build_fa4_tree_mask returns the cached closure keyed by the
     window (same W reuses the object; different W or None is a new closure) and
@@ -1265,6 +1267,7 @@ def test_fa4_tree_mask_gates_attention(qwen3_config_path):
     assert err < 2e-2, f"FA4 impl tree mask diverged from manual reference: {err}"
 
 
+@requires_sm120_fa4
 def test_df2t_mask_composition_guard_rswa_mm_prefix_fail_closed():
     """The df2t tree mask must never be silently dropped by the FA4 commit
     kernel's ``rswa_mask_mod_fn or mm_mask_mod or tree_mask_mod`` dispatch:
@@ -1381,6 +1384,7 @@ def _fake_runner(spec, req_states, device, attn_groups, kv_cache_config=None):
     return runner
 
 
+@requires_sm120_fa4
 def test_runner_stage_attach_fa4_tree_mask_windowed():
     """A windowed df2t target stages per-request depths and attaches a 3-aux
     tree mask built with the target KV group's sliding window; the same stage
@@ -1442,6 +1446,7 @@ def test_runner_stage_attach_fa4_tree_mask_windowed():
     assert len(other_meta.tree_aux_tensors) == 2
 
 
+@requires_sm120_fa4
 def test_runner_stage_attach_fa4_tree_mask():
     """The runner's fa4 stage -> attach path wires build_fa4_tree_mask onto the
     target FlashAttention verify group only, keyed by per-request C and words,

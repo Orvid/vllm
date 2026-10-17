@@ -22,10 +22,20 @@ _ROCM_FLASH_ATTN_AVAILABLE = False
 if current_platform.is_cuda():
     from vllm._custom_ops import reshape_and_cache_flash
     from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
-        compile_flash_attn_varlen_func_from_specs,
         flash_attn_varlen_func,
         get_scheduler_metadata,
     )
+
+    try:
+        # The FA4 compile-from-specs (CuTe-DSL mask_mod) API comes from the
+        # vendored FlashAttention fork. The upstream build does not ship it:
+        # tree verification then runs on the Triton / b12x / FA2-3 / Flex
+        # vehicles, and an explicit FA4 request fails closed.
+        from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
+            compile_flash_attn_varlen_func_from_specs,
+        )
+    except ImportError:
+        compile_flash_attn_varlen_func_from_specs = None  # type: ignore[assignment]
 
 elif current_platform.is_xpu():
     from vllm import _custom_ops as ops
@@ -71,6 +81,13 @@ elif current_platform.is_rocm():
     reshape_and_cache_flash = ops.reshape_and_cache_flash
 
 
+# Tree-verification FA4 needs the vendored fork's compile-from-specs (CuTe-DSL
+# mask_mod) API. The upstream FlashAttention build does not ship it, so FA4
+# tree verification is unavailable there: the resolve defaults to the FA2/3
+# split (or Triton/b12x/Flex) and an explicit FA4 request fails closed.
+FA4_TREE_MASK_AVAILABLE = compile_flash_attn_varlen_func_from_specs is not None
+
+
 def get_flash_attn_version(
     requires_alibi: bool = False,
     head_size: int | None = None,
@@ -108,13 +125,19 @@ def get_flash_attn_version(
         )
         tree_active = speculative_config is not None and speculative_config.use_tree()
 
-        # 1. default version depending on platform
-        if tree_active and is_fa_version_supported(4):
+        # 1. default version depending on platform. The tree-verify FA4 mask
+        # path needs the vendored compile-from-specs API; without it, a tree
+        # defaults to the FA2/FA3 split (or Triton/b12x/Flex) vehicles.
+        if tree_active and is_fa_version_supported(4) and FA4_TREE_MASK_AVAILABLE:
             fa_version = 4
         elif device_capability.major == 9 and is_fa_version_supported(3):
             # Hopper (SM90): prefer FA3
             fa_version = 3
-        elif device_capability.major == 10 and is_fa_version_supported(4):
+        elif (
+            device_capability.major == 10
+            and is_fa_version_supported(4)
+            and (not tree_active or FA4_TREE_MASK_AVAILABLE)
+        ):
             # Blackwell (SM100+, restrict to SM100 for now): prefer FA4
             fa_version = 4
         else:
@@ -128,6 +151,18 @@ def get_flash_attn_version(
             and vllm_config.attention_config.flash_attn_version is not None
         ):
             fa_version = vllm_config.attention_config.flash_attn_version
+
+        # Tree-verify FA4 is only available with the vendored fork's
+        # compile-from-specs API; an explicit FA4 request without it must fail
+        # visibly instead of silently serving a non-tree (or split-less) pass.
+        if tree_active and fa_version == 4 and not FA4_TREE_MASK_AVAILABLE:
+            raise RuntimeError(
+                "speculative tree verification on FlashAttention-4 requires "
+                "the vendored FlashAttention compile-from-specs API "
+                "(vllm_flash_attn.compile_flash_attn_varlen_func_from_specs), "
+                "which this build does not ship; use Triton, b12x, FA2/FA3 or "
+                "Flex attention for tree verification."
+            )
 
         # 3. fallback for unsupported combinations
         if device_capability.major >= 10 and fa_version == 3:
