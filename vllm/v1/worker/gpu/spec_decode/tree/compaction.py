@@ -17,6 +17,7 @@ from torch import Tensor
 
 from vllm.triton_utils import tl, triton
 from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 _CopyBlock = 256
 # The batched compactor copies bytes.
@@ -427,8 +428,11 @@ def _slot_ratio(spec: Any, scratch_ratios: Sequence[int]) -> int:
     return int(ratio) if ratio in scratch_ratios else 0
 
 
-def _spec_segments(spec: Any) -> tuple[int, ...]:
-    """Default slot layout: one contiguous run of the slot's bytes."""
+def _spec_segments(spec: Any, head_major: bool = False) -> tuple[int, ...]:
+    """Default slot layout: one contiguous run of the slot's bytes, or one per
+    head in a head-major block."""
+    if head_major:
+        return (spec.state_content_size_bytes,) * spec.num_heads
     return (spec.num_heads * spec.state_content_size_bytes,)
 
 
@@ -618,7 +622,7 @@ class TreeKVCompaction:
                 block_bytes = layer.stride(0) * layer.element_size()
                 runs = layer_segments.get(name)
                 if runs is None:
-                    runs = (self._contiguous_slot_bytes(name, layer),)
+                    runs = self._slot_runs(name, layer)
                 if block_bytes < view_slots * sum(runs):
                     raise ValueError(
                         f"tree compaction: layer {name}'s blocks "
@@ -732,28 +736,33 @@ class TreeKVCompaction:
         self._g_stride = max_a
 
     @staticmethod
-    def _contiguous_slot_bytes(name: str, layer: Tensor) -> int:
-        """Bytes of a slot stored as one run: a ``[B, H, N, C]`` view whose
-        slot is contiguous (LBNHC within a block; blocks may be padded, e.g.
-        hybrid models pad attention pages to the recurrent state's), or a
-        ``[B, N, C]`` view."""
+    def _slot_runs(name: str, layer: Tensor) -> tuple[int, ...]:
+        """Byte widths of the runs a block stores for all its slots in turn.
+
+        A ``[B, H, N, C]`` view whose slot is contiguous (LBNHC within a
+        block; blocks may be padded, e.g. hybrid models pad attention pages to
+        the recurrent state's) or a ``[B, N, C]`` view is one run per slot; a
+        head-major block (LBHNC within a block, e.g. separate K and V planes)
+        is one run per head.
+        """
         stride = layer.stride()
-        if layer.ndim == 4:
-            _, num_heads, _, content = layer.shape
-            ok = stride[3] == 1 and stride[2] == num_heads * content
-            ok = ok and (num_heads == 1 or stride[1] == content)
-        elif layer.ndim == 3:
-            num_heads, content = 1, layer.shape[2]
-            ok = stride[2] == 1 and stride[1] == content
-        else:
-            ok = False
-        if not ok:
-            raise ValueError(
-                "tree compaction requires per-slot-contiguous "
-                f"(LBNHC) layer caches; layer {name} has shape "
-                f"{tuple(layer.shape)}, strides {stride}"
+        size = layer.element_size()
+        if layer.ndim == 4 and stride[3] == 1:
+            _, num_heads, slots, content = layer.shape
+            slot_major = stride[2] == num_heads * content and (
+                num_heads == 1 or stride[1] == content
             )
-        return num_heads * content * layer.element_size()
+            if slot_major:
+                return (num_heads * content * size,)
+            if stride[2] == content and stride[1] == slots * content:
+                return (content * size,) * num_heads
+        elif layer.ndim == 3 and stride[2] == 1 and stride[1] == layer.shape[2]:
+            return (layer.shape[2] * size,)
+        raise ValueError(
+            "tree compaction requires slot- or head-major blocks (LBNHC or "
+            f"LBHNC); layer {name} has shape {tuple(layer.shape)}, strides "
+            f"{stride}"
+        )
 
     @staticmethod
     def _buffer_layout_bytes(
@@ -792,6 +801,7 @@ class TreeKVCompaction:
         scratch_budget_bytes: int | None = None,
         layer_segments: dict[str, tuple[int, ...]] | None = None,
         scratch_ratios: Sequence[int] = (),
+        kv_cache_layout: KVCacheLayout | None = None,
     ) -> int:
         """Precise GPU bytes the compactor will hold, from KV cache group specs.
 
@@ -818,6 +828,9 @@ class TreeKVCompaction:
                 :attr:`_ScratchBudgetBytes`.
             layer_segments: As for :meth:`__init__`.
             scratch_ratios: As for :meth:`__init__`.
+            kv_cache_layout: The resolved KV cache layout, which decides
+                whether a block stores one run per slot or one per head; None
+                for slot-major.
 
         """
         budget = (
@@ -826,6 +839,8 @@ class TreeKVCompaction:
             else cls._ScratchBudgetBytes
         )
         layer_segments = layer_segments or {}
+        # A head-major block stores one run per head (see ``_slot_runs``).
+        head_major = kv_cache_layout is not None and kv_cache_layout.is_block_contiguous
         L = 0
         max_el = 0
         plan_groups: set[tuple[int, int]] = set()
@@ -844,7 +859,7 @@ class TreeKVCompaction:
                     spec = _layer_spec(group.kv_cache_spec, name)
                     if not _is_attention_like(spec):
                         continue
-                    runs = _spec_segments(spec)
+                    runs = _spec_segments(spec, head_major)
                 runs = tuple(run for run in runs if run > 0)
                 L += len(runs)
                 max_el = max(max_el, *runs, 0)

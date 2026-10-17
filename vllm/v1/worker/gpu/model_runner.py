@@ -3074,6 +3074,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_cache_groups=kv_cache_groups,
             layer_segments=layer_segments,
             scratch_ratios=scratch_ratios,
+            kv_cache_layout=self.cache_config.get_resolved_kv_cache_layout(),
         )
         self._tree_compaction_storage = torch.empty(
             nbytes, dtype=torch.uint8, device=self.device

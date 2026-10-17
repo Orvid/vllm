@@ -532,6 +532,68 @@ def test_batched_compaction_matches_reference_bit_identical():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_batched_compaction_head_major_blocks_match_slot_major():
+    """A head-major block (each head's run for every slot in turn, e.g. b12x's
+    separate K and V planes) compacts to the same logical cache as the
+    slot-major LBNHC block, and the reservation for the head-major layout is
+    exactly what it holds."""
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+    from vllm.v1.worker.gpu.spec_decode.tree.compaction import (
+        TreeKVCompaction,
+    )
+
+    R, W = 5, 7
+    block_size, num_blocks = 16, 64
+    group_specs = [[("l.0", 2, 6), ("l.1", 2, 6)], [("l.2", 4, 3)]]
+    groups = [
+        SimpleNamespace(
+            layer_names=[n for n, _, _ in grp],
+            kv_cache_spec=SimpleNamespace(block_size=block_size),
+        )
+        for grp in group_specs
+    ]
+    for seed in range(4):
+        slot_major, _ = _make_batched_cache(group_specs, block_size, num_blocks)
+        head_major = {
+            name: torch.zeros_like(view.contiguous())
+            for name, view in slot_major.items()
+        }
+        assert head_major["l.0"].stride()[1] == block_size * 6
+        num_sampled, accepted_arenas, num_computed, block_tables, trees = (
+            _rand_chain_batch(R, W, num_blocks, seed)
+        )
+        num_slots = int(num_computed.max().item()) + W + 2
+        _seed_kv(slot_major, group_specs, block_size, num_slots)
+        for name, view in head_major.items():
+            view.copy_(slot_major[name])
+        compactors = []
+        for views in (slot_major, head_major):
+            compactors.append(
+                TreeKVCompaction(R, W, views, groups, torch.device("cuda"))
+            )
+            compactors[-1].compact(
+                num_sampled,
+                accepted_arenas,
+                trees,
+                num_computed,
+                [block_tables] * len(groups),
+                R,
+            )
+        torch.accelerator.synchronize()
+        for name in slot_major:
+            assert torch.equal(head_major[name], slot_major[name]), (seed, name)
+    for compactor, layout in zip(
+        compactors, (KVCacheLayout.LBNHC, KVCacheLayout.LBHNC)
+    ):
+        assert compactor._reserved_bytes == TreeKVCompaction.reserved_bytes(
+            max_num_reqs=R,
+            nodes_max=W,
+            kv_cache_groups=_spec_groups(group_specs, block_size),
+            kv_cache_layout=layout,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_batched_compaction_treeless_requests_untouched():
     """Requests without a tree (or with no accepted chain) must leave their KV
     byte-for-byte untouched even when the batch otherwise compacts."""
