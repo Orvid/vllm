@@ -213,7 +213,7 @@ class DFlash2Speculator(DFlashSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> None:
-        candidate_ids, scores = self._draft_tree_candidates(
+        proposal = self._draft_forward(
             num_reqs,
             num_tokens_padded,
             attn_metadata,
@@ -221,9 +221,40 @@ class DFlash2Speculator(DFlashSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
+        self._draft_sample(proposal)
+
+    def _draft_forward(
+        self,
+        num_reqs: int,
+        num_tokens_padded: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    ) -> CandidateHeadProposal:
+        """The candidate head's candidates and their transition scores, for
+        tree selection. The chain walk consumes the very same tensors, so
+        nothing is recomputed and no laziness is needed."""
+        return CandidateHeadProposal(
+            *self._draft_tree_candidates(
+                num_reqs,
+                num_tokens_padded,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+            )
+        )
+
+    def _draft_sample(self, proposal: CandidateHeadProposal) -> None:
+        """The candidate walk tail over the proposal's head (not used by tree
+        verification, which never calls this method)."""
+        ids = proposal._ids
+        scores = proposal._scores
+        num_reqs = ids.shape[0]
         num_sample = num_reqs * self.num_speculative_steps
         self.candidate_sampler.sample(
-            candidate_ids,
+            ids,
             scores,
             num_reqs,
             self.sample_pos,
@@ -240,27 +271,6 @@ class DFlash2Speculator(DFlashSpeculator):
                 self.sample_idx_mapping[:num_sample],
                 self.sample_col[:num_sample],
             )
-
-    def _draft_proposal(
-        self,
-        num_reqs: int,
-        num_tokens_padded: int,
-        attn_metadata: dict[str, Any] | None,
-        slot_mappings: dict[str, torch.Tensor] | None,
-        num_tokens_across_dp: torch.Tensor | None,
-        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
-    ) -> CandidateHeadProposal:
-        """The candidate head's candidates and their transition scores."""
-        return CandidateHeadProposal(
-            *self._draft_tree_candidates(
-                num_reqs,
-                num_tokens_padded,
-                attn_metadata,
-                slot_mappings,
-                num_tokens_across_dp,
-                cudagraph_runtime_mode,
-            )
-        )
 
     def _draft_tree_candidates(
         self,
