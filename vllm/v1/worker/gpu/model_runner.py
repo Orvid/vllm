@@ -477,7 +477,10 @@ def _resolve_decode_query_len(
     never the query width. Every other speculative method verifies
     ``num_speculative_steps + num_new_sampled_per_step``.
     """
-    if speculative_config is not None and speculative_config.use_tree():
+    if (
+        speculative_config is not None
+        and getattr(speculative_config, "use_tree", lambda: False)()
+    ):
         return speculative_config.tree_decode_width
     return num_speculative_steps + num_new_sampled_per_step
 
@@ -571,7 +574,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Pooling models.
         self.is_pooling_model = self.model_config.runner_type == "pooling"
         self.pooling_runner: PoolingRunner | None = None
-
 
         num_prefill_lookahead = max(1, vllm_config.num_prefill_lookahead_tokens)
         use_dense_all_token_ids = (
@@ -831,8 +833,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._tree_width_ctl: TreeWidthController | None = None
         self._tree_pp_widths: np.ndarray | None = None
         self._decode_query_lens = {self.decode_query_len}
-        spec = self.speculative_config
-        if spec is not None and spec.use_tree() and spec.adaptive_tree_width:
+        spec = getattr(self, "speculative_config", None)
+        if (
+            spec is not None
+            and getattr(spec, "use_tree", lambda: False)()
+            and spec.adaptive_tree_width
+        ):
             ladder = spec.tree_verify_width_ladder
             self._decode_query_lens = {1 + w for w in ladder}
             # Under pipeline parallelism the drafting (last) stage chooses
@@ -850,7 +856,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # the target's stateful mixers, which commit accepted paths themselves.
         self._tree_ctx: TreeVerifyContext | None = None
         self._tree_recurrent: TreeRecurrentLayers | None = None
-        if spec is not None and spec.use_tree():
+        if spec is not None and getattr(spec, "use_tree", lambda: False)():
             assert spec.max_tree_depth is not None
             self._tree_ctx = TreeVerifyContext(
                 self.max_num_tokens,
@@ -1089,8 +1095,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         (``supports_tree_verify``), or the runner must mask it (FlashAttention-4
         / FlexAttention). Stateful mixers commit through
         ``TreeRecurrentLayers`` instead."""
-        spec = self.speculative_config
-        if spec is None or not spec.use_tree():
+        spec = getattr(self, "speculative_config", None)
+        if spec is None or not getattr(spec, "use_tree", lambda: False)():
             return
         from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
         from vllm.v1.attention.backends.flex_attention import FlexAttentionBackend
@@ -1870,7 +1876,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         tree_capture_mask_attach: Callable[[dict[str, Any]], None] | None = None
         if (
             capture_decoder
-            and self.speculative_config is not None
+            and getattr(self, "speculative_config", None) is not None
             and (self.speculative_config.use_tree())
         ):
             # Tree verify captures its uniform 1+B target tree-verify decode through
@@ -1918,7 +1924,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             self.lora_config, self
                         ),
                         tree_mask_attach=tree_capture_mask_attach,
-                        tree_verify=self._tree_ctx,
+                        tree_verify=getattr(self, "_tree_ctx", None),
                     )
                     self.model_state.capture_inner_cudagraphs(
                         input_buffers,
@@ -1936,7 +1942,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             ):
                                 self._dummy_run(**batch)
                         self.adaptive_verification.set_initial_cost_curves(timings)
-                    if self._tree_width_ctl is not None and not profile_only:
+                    if (
+                        getattr(self, "_tree_width_ctl", None) is not None
+                        and not profile_only
+                    ):
                         self._profile_tree_width_costs(self._tree_width_ctl)
                     self.kv_connector.reset_capture_state()
 
@@ -3974,14 +3983,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch = self.pcp_manager.global_batch
             assert self.pp_handler is not None
             tree_anchors = None
-            if input_batch.tree_batch is not None:
+            if getattr(input_batch, "tree_batch", None) is not None:
                 # The verify's anchor positions, before the optimistic update
                 # below: this stage compacts its tree KV from them once the
                 # last stage's accepted arenas arrive.
                 tree_anchors = self.req_states.num_computed_tokens.gpu[
                     input_batch.idx_mapping
                 ].clone()
-            all_decode_next = self.pp_handler.receive(input_batch, tree_anchors)
+            if tree_anchors is None:
+                all_decode_next = self.pp_handler.receive(input_batch)
+            else:
+                all_decode_next = self.pp_handler.receive(input_batch, tree_anchors)
             # Optimistically update num_computed_tokens for entire batch here.
             # Will be adjusted for rejections if necessary in update_requests.
             self.postprocess_num_computed_tokens(input_batch)

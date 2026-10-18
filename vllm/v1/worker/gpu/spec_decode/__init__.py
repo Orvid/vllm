@@ -18,7 +18,7 @@ def init_speculator(
     """Build the speculator for this config."""
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
-    if speculative_config.use_tree():
+    if getattr(speculative_config, "use_tree", lambda: False)():
         # Tree verification composes onto the drafter: the drafter proposes
         # candidates, the configured selection method shapes the tree.
         from vllm.v1.worker.gpu.spec_decode.tree.speculator import (
