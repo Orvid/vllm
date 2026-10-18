@@ -23,6 +23,7 @@ CUDA graphs (FULL, mirroring DFlash) cover the whole draft step: the parallel
 backbone forward AND the sequential Markov sampling.
 """
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -69,36 +70,69 @@ class DSparkProposal(DraftProposal):
         self._anchor_ids = anchor_ids
         self._target_to_draft = target_to_draft
         self._draft_topk = draft_topk
+        self._base_logits_fn: Callable[[], torch.Tensor] | None = None
+
+    @classmethod
+    def lazy(
+        cls,
+        model: torch.nn.Module,
+        base_logits_fn: Callable[[], torch.Tensor],
+        anchor_ids: torch.Tensor,
+        target_to_draft: torch.Tensor | None,
+        draft_topk: int | None = None,
+        hidden: torch.Tensor | None = None,
+    ) -> "DSparkProposal":
+        """A proposal whose base logits are computed on first query, so the
+        plain chain tail (which recomputes them itself) never pays for the
+        head."""
+        proposal = cls(
+            model,
+            None,
+            anchor_ids,
+            target_to_draft,
+            draft_topk,
+            hidden,  # type: ignore[arg-type]
+        )
+        proposal._base_logits_fn = base_logits_fn
+        return proposal
+
+    @property
+    def _base_logits(self) -> torch.Tensor:
+        if self._base is None:
+            assert self._base_logits_fn is not None
+            self._base = self._base_logits_fn()
+        assert self._base is not None
+        return self._base
 
     @property
     def num_positions(self) -> int:
-        return self._base.shape[1]
+        return self._base_logits.shape[1]
 
     def marginal_logits(self) -> torch.Tensor | None:
         """Backbone logits before the Markov bias, in target vocab."""
+        base = self._base_logits
         if self._target_to_draft is None:
-            return self._base
-        logits = self._base.new_full(
-            (*self._base.shape[:2], self._target_to_draft.shape[0]), float("-inf")
+            return base
+        logits = base.new_full(
+            (*base.shape[:2], self._target_to_draft.shape[0]), float("-inf")
         )
         cols = self._model.map_draft_to_target(
-            torch.arange(self._base.shape[-1], device=self._base.device)
+            torch.arange(base.shape[-1], device=base.device)
         )
-        return logits.index_copy_(-1, cols, self._base)
+        return logits.index_copy_(-1, cols, base)
 
     def candidates(self, k: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Each position's top ``k`` under the Markov head given the greedy
         chain's previous token (the anchor first), as the chain sampler
         drafts, so the greedy chain is always among them."""
+        base = self._base_logits
         prev = self._anchor_ids
         ids, values = [], []
-        for s in range(self._base.shape[1]):
-            cond = self._base[:, s] + self._model.markov_bias(
-                self._model.markov_embed(prev)
-            )
+        for s in range(base.shape[1]):
+            cond = base[:, s] + self._model.markov_bias(self._model.markov_embed(prev))
             if self._draft_topk is not None:
                 # The chain sampler only re-ranks the backbone's top tokens.
-                keep = self._base[:, s].topk(self._draft_topk, dim=-1).indices
+                keep = base[:, s].topk(self._draft_topk, dim=-1).indices
                 cond = torch.full_like(cond, float("-inf")).scatter_(
                     -1, keep, cond.gather(-1, keep)
                 )
@@ -110,6 +144,7 @@ class DSparkProposal(DraftProposal):
         return torch.stack(ids, dim=1), torch.stack(values, dim=1)
 
     def conditional(self, ids: torch.Tensor) -> torch.Tensor | None:
+        base = self._base_logits
         num_reqs, _, num_cands = ids.shape
         t2d = self._target_to_draft
         draft_ids = ids if t2d is None else t2d[ids]
@@ -122,7 +157,7 @@ class DSparkProposal(DraftProposal):
             ],
             dim=1,
         )
-        unary = self._base.gather(-1, draft_ids).float()
+        unary = base.gather(-1, draft_ids).float()
         unary = torch.where(in_vocab, unary, float("-inf"))
         bias = self._model.markov_transition_bias(prev, draft_ids).float()
         return unary.unsqueeze(-2) + bias
@@ -349,39 +384,6 @@ class DSparkSpeculator(DFlashSpeculator):
                 num_reqs, n_spec
             )
 
-    def _draft_proposal(
-        self,
-        num_reqs: int,
-        num_tokens_padded: int,
-        attn_metadata: dict[str, Any] | None,
-        slot_mappings: dict[str, torch.Tensor] | None,
-        num_tokens_across_dp: torch.Tensor | None,
-        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
-    ) -> DSparkProposal:
-        """The parallel backbone pass, for tree selection; the sequential
-        Markov head is applied to whatever edges the selector scores."""
-        head_hidden = self._run_model(
-            num_tokens_padded,
-            attn_metadata,
-            slot_mappings,
-            num_tokens_across_dp,
-            cudagraph_runtime_mode,
-        )
-        num_sample = num_reqs * self.num_speculative_steps
-        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
-        base_logits = self.model.compute_draft_logits(sample_hidden).view(
-            num_reqs, self.num_speculative_steps, -1
-        )
-        anchor_ids = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
-        return DSparkProposal(
-            self.model,
-            base_logits,
-            anchor_ids,
-            self._target_to_draft,
-            self._draft_topk,
-            hidden=sample_hidden.view(num_reqs, self.num_speculative_steps, -1),
-        )
-
     def _generate_draft(
         self,
         num_reqs: int,
@@ -391,8 +393,29 @@ class DSparkSpeculator(DFlashSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> None:
-        # Full draft step (captured under CUDA graph): parallel backbone forward
-        # then sequential Markov sampling over its hidden state outputs.
+        proposal = self._draft_forward(
+            num_reqs,
+            num_tokens_padded,
+            attn_metadata,
+            slot_mappings,
+            num_tokens_across_dp,
+            cudagraph_runtime_mode,
+        )
+        self._draft_sample(proposal)
+
+    def _draft_forward(
+        self,
+        num_reqs: int,
+        num_tokens_padded: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    ) -> DSparkProposal:
+        """The parallel backbone pass, for tree selection; the sequential
+        Markov head is applied to whatever edges the selector scores. The
+        backbone logits head runs on the proposal's first query, so the plain
+        chain tail never pays for it (the sampler recomputes its own)."""
         head_hidden = self._run_model(
             num_tokens_padded,
             attn_metadata,
@@ -400,4 +423,29 @@ class DSparkSpeculator(DFlashSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
-        self._sample_sequential(num_reqs, head_hidden)
+        num_sample = num_reqs * self.num_speculative_steps
+        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+        anchor_ids = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+        shape = (num_reqs, self.num_speculative_steps, -1)
+
+        def base_logits_fn() -> torch.Tensor:
+            return self.model.compute_draft_logits(sample_hidden).view(shape)
+
+        return DSparkProposal.lazy(
+            self.model,
+            base_logits_fn,
+            anchor_ids,
+            self._target_to_draft,
+            self._draft_topk,
+            hidden=sample_hidden.view(shape),
+        )
+
+    def _draft_sample(self, proposal: DraftProposal) -> None:
+        """The sequential Markov chain tail (not used by tree verification,
+        which never calls this method)."""
+        hidden = proposal.position_hidden()
+        assert hidden is not None
+        # The proposal's hidden rows round-trip through sample_indices in
+        # request-major order, which is exactly what _sample_sequential
+        # gathers from the model's output.
+        self._sample_sequential(hidden.shape[0], hidden.flatten(0, 1))
