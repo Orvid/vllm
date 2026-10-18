@@ -376,7 +376,7 @@ class MambaHybridModelState(DefaultModelState):
             model_specific_attn_metadata=mamba_attn_metadata,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
-            tree_verify=input_batch.tree_verify,
+            tree_verify=getattr(input_batch, "tree_verify", None),
         )
         if self.recoverssm is not None:
             self.recoverssm.record_step(
