@@ -23,6 +23,7 @@ from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     _sparse_attn_norm_rope_store,
 )
 from vllm.triton_utils import tl, triton
+from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
 
 _VARIANT_SPARSE_ATTN = 0
 _VARIANT_INDEXER_FP8 = 1
@@ -63,6 +64,7 @@ def _tree_compress_kernel(
     TOKEN_STRIDE: tl.constexpr,
     SCALE_DIM: tl.constexpr,
     KV_BLOCK_STRIDE: tl.constexpr,
+    MX_SCALE: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     depth = tl.load(row_depth_ptr + row)
@@ -162,6 +164,7 @@ def _tree_compress_kernel(
             TOKEN_STRIDE,
             SCALE_DIM,
             KV_BLOCK_STRIDE,
+            MX_SCALE,
         )
     else:
         _indexer_mxfp4_norm_rope_store(
@@ -279,5 +282,6 @@ def tree_compress_norm_rope_store(
         TOKEN_STRIDE=token_stride,
         SCALE_DIM=scale_dim,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
+        MX_SCALE=not use_fp4_cache and mqa_logits_use_mx_scales(),
         num_warps=4 if head_dim == 512 else 1,
     )

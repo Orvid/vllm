@@ -1091,10 +1091,10 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
         tree = common_attn_metadata.tree_verify
         if tree is not None and self._tree_context_lens is not None:
-            if use_cascade or self.dcp_world_size > 1:
+            if self.dcp_world_size > 1:
                 raise NotImplementedError(
                     "speculative tree verification on FA2/FA3 does not support "
-                    "cascade attention or decode context parallelism."
+                    "decode context parallelism."
                 )
             attn_metadata.tree_mask = tree.row_mask
             attn_metadata.tree_width = tree.tree_width

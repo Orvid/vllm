@@ -303,7 +303,6 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
 
         tree = common_attn_metadata.tree_verify
         if tree is not None:
-            assert not use_cascade
             attn_metadata.tree_mask = tree.row_mask
             attn_metadata.tree_pos_delta = tree.row_pos_delta
 

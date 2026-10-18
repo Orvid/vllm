@@ -51,12 +51,14 @@ def test_df2t_method_is_a_deprecated_alias_for_dflash_tree_selection():
 
 def test_chain_verification_keeps_the_drafter_reservations():
     """Without a tree selection method the same drafter verifies its chain:
-    every tree-only reservation falls back to the drafter's own values."""
+    every tree-only reservation falls back to the drafter's own values (the
+    merged upstream shape: DFlash/DSpark draft in a separate query pass, so
+    the target batch reserves nothing extra)."""
     chain = _build()
     chain.tree_selection = None
     K = chain.num_speculative_tokens
     assert not chain.use_tree()
-    assert chain.max_num_new_slots_for_drafting == K
+    assert chain.max_num_new_slots_for_drafting == 0
     assert chain.num_draft_rows_per_req == K
     assert chain.get_num_draft_tokens() == K
     assert chain.tree_decode_width == 0

@@ -885,6 +885,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
         TOKEN_STRIDE,
         SCALE_DIM,
         KV_BLOCK_STRIDE,
+        MX_SCALE,
     )
 
 
@@ -908,6 +909,7 @@ def _indexer_fp8_norm_rope_store(
     TOKEN_STRIDE: tl.constexpr,
     SCALE_DIM: tl.constexpr,
     KV_BLOCK_STRIDE: tl.constexpr,
+    MX_SCALE: tl.constexpr,
 ):
     """RMSNorm → RoPE → FP8 quant → store of a pooled head=128 indexer
     entry."""

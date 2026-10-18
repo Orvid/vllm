@@ -50,6 +50,8 @@ def _spec_config():
         num_speculative_tokens=5,
         tree_attention_backend="fa4",
         enable_adaptive_verification=False,
+        parallel_drafting=False,
+        draft_sample_method="probabilistic",
     )
 
 

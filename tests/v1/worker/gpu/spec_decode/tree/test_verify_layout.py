@@ -179,7 +179,6 @@ def test_tree_verify_slots_translate_through_block_table():
         max_num_batched_tokens=64,
         max_num_blocks_per_group=[8],
         device=device,
-        kernel_block_sizes=[16],
     )
     block_tables.append_block_ids(0, ([100, 101],), overwrite=False)
     block_tables.apply_staged_writes()

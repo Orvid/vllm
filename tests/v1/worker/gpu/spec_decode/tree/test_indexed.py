@@ -345,6 +345,7 @@ def test_tree_compressor_pools_each_boundary_rows_own_path():
             TOKEN_STRIDE=head,
             SCALE_DIM=4,
             KV_BLOCK_STRIDE=out.stride(0),
+            MX_SCALE=False,
             num_warps=1,
         )
         return entry(out, 0)
