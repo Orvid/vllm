@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for tree drafting composed onto a drafter in ``init_speculator``."""
@@ -8,11 +9,16 @@ from typing import Any
 import pytest
 import torch
 
+from vllm.config.compilation import CUDAGraphMode
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 
 ARCH = "DFlash2DraftModel"
+
+
+def _req_states() -> Any:
+    return SimpleNamespace()
 
 
 def _fake_draft_model_config() -> SimpleNamespace:
@@ -21,6 +27,7 @@ def _fake_draft_model_config() -> SimpleNamespace:
     mask_token_id)."""
     return SimpleNamespace(
         architectures=[ARCH],
+        use_mla=False,
         hf_config=SimpleNamespace(
             num_hidden_layers=2,
             block_size=16,
@@ -41,6 +48,8 @@ def _fake_draft_model_config() -> SimpleNamespace:
 
 def _fake_vllm_config(tree_budget: int | None = None, tree_s: float = 1.0) -> Any:
     """Minimal config that lets the tree speculator ``__init__`` run on CPU."""
+    from vllm.config import ParallelConfig
+
     speculative_config = SpeculativeConfig(
         method="dflash",
         tree_selection="df2t",
@@ -62,13 +71,17 @@ def _fake_vllm_config(tree_budget: int | None = None, tree_s: float = 1.0) -> An
         _get_transformers_backend_cls=lambda: "TransformersForCausalLM",
         hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
     )
+    compilation_config = SimpleNamespace(
+        cudagraph_mode=CUDAGraphMode.NONE,
+    )
+    compilation_config.decode_mode = lambda: compilation_config.cudagraph_mode
     return SimpleNamespace(
         speculative_config=speculative_config,
         scheduler_config=SimpleNamespace(max_num_seqs=8, max_num_batched_tokens=512),
         model_config=model_config,
-        parallel_config=SimpleNamespace(
-            data_parallel_size=1, data_parallel_rank=0, prefill_context_parallel_size=1
-        ),
+        parallel_config=ParallelConfig(),
+        compilation_config=compilation_config,
+        watermark_config=None,
     )
 
 
@@ -78,10 +91,12 @@ def test_init_speculator_composes_tree_onto_drafter() -> None:
     )
     from vllm.v1.worker.gpu.spec_decode.tree.speculator import TreeSpeculatorMixin
 
-    spec = init_speculator(_fake_vllm_config(), torch.device("cpu"))
+    spec = init_speculator(_fake_vllm_config(), torch.device("cpu"), _req_states())
 
     assert isinstance(spec, TreeSpeculatorMixin)
     assert isinstance(spec, DFlash2Speculator)
+    assert hasattr(spec, "_draft_forward")
+    assert not hasattr(spec, "_draft_proposal")
     assert spec.num_query_per_req == 1 + 15
     # The drafter forward shape stays num_spec (the block depth)...
     assert spec.num_speculative_steps == 15
@@ -104,7 +119,7 @@ def test_plain_dflash_drafts_trees_from_its_position_distributions() -> None:
     vllm_config.speculative_config.draft_model_config.architectures = [
         "DFlashDraftModel"
     ]
-    spec = init_speculator(vllm_config, torch.device("cpu"))
+    spec = init_speculator(vllm_config, torch.device("cpu"), _req_states())
 
     assert isinstance(spec, DFlashSpeculator)
     assert not isinstance(spec, DFlash2Speculator)
@@ -212,7 +227,7 @@ def test_generate_draft_builds_tree_and_draft_tokens() -> None:
     from vllm.v1.worker.gpu.spec_decode.tree.tree_metadata import build_tree_naive
 
     torch.manual_seed(0)
-    spec = init_speculator(_fake_vllm_config(), torch.device("cuda"))
+    spec = init_speculator(_fake_vllm_config(), torch.device("cuda"), _req_states())
     assert isinstance(spec, TreeSpeculatorMixin)
     num_reqs, steps = 3, spec.num_speculative_steps
     K = spec.top_k
@@ -241,7 +256,7 @@ def test_generate_draft_builds_tree_and_draft_tokens() -> None:
         num_reqs * steps, device="cuda"
     )
 
-    spec._generate_draft(num_reqs, num_reqs * steps, None, None, None)
+    spec._generate_draft(num_reqs, num_reqs * steps, {}, {}, None)
 
     # latest_tree_drafts exposes one TreeDraft per request with real nodes.
     drafts = spec.latest_tree_drafts
@@ -286,7 +301,7 @@ def test_chain_config_builds_the_plain_drafter() -> None:
 
     cfg = _fake_vllm_config()
     cfg.speculative_config.tree_selection = None
-    spec = init_speculator(cfg, torch.device("cpu"))
+    spec = init_speculator(cfg, torch.device("cpu"), _req_states())
     assert type(spec) is DFlash2Speculator
     assert not isinstance(spec, TreeSpeculatorMixin)
     assert spec.draft_tokens.shape[1] == 15
@@ -304,7 +319,9 @@ def test_generate_draft_budget_below_num_spec_degrades_not_crashes() -> None:
 
     torch.manual_seed(0)
     spec = init_speculator(
-        _fake_vllm_config(tree_budget=16, tree_s=0.5), torch.device("cuda")
+        _fake_vllm_config(tree_budget=16, tree_s=0.5),
+        torch.device("cuda"),
+        _req_states(),
     )
     assert isinstance(spec, TreeSpeculatorMixin)
     assert spec.nodes_max == 8
@@ -327,7 +344,7 @@ def test_generate_draft_budget_below_num_spec_degrades_not_crashes() -> None:
         num_reqs * steps, device="cuda"
     )
 
-    spec._generate_draft(num_reqs, num_reqs * steps, None, None, None)
+    spec._generate_draft(num_reqs, num_reqs * steps, {}, {}, None)
 
     drafts = spec.latest_tree_drafts
     assert drafts is not None and len(drafts) == num_reqs
@@ -356,7 +373,7 @@ def test_get_latest_tree_drafts_fails_closed_on_over_read() -> None:
     from vllm.v1.worker.gpu.spec_decode.tree.speculator import TreeSpeculatorMixin
 
     torch.manual_seed(0)
-    spec = init_speculator(_fake_vllm_config(), torch.device("cuda"))
+    spec = init_speculator(_fake_vllm_config(), torch.device("cuda"), _req_states())
     assert isinstance(spec, TreeSpeculatorMixin)
     num_reqs, steps = 2, spec.num_speculative_steps
     K = spec.top_k
@@ -378,7 +395,7 @@ def test_get_latest_tree_drafts_fails_closed_on_over_read() -> None:
     # No build yet: nothing to read, None (not an over-read).
     assert spec.latest_tree_drafts is None
 
-    spec._generate_draft(num_reqs, num_reqs * steps, None, None, None)
+    spec._generate_draft(num_reqs, num_reqs * steps, {}, {}, None)
     assert spec._last_built_rows == num_reqs
     assert spec.get_latest_tree_drafts(num_reqs) is not None
     with pytest.raises(RuntimeError, match="over-read"):
@@ -389,3 +406,63 @@ def test_get_latest_tree_drafts_fails_closed_on_over_read() -> None:
     assert spec._last_built_rows == 1
     with pytest.raises(RuntimeError, match="over-read"):
         spec.get_latest_tree_drafts(num_reqs)
+
+
+def _tree_speculator_with_seams() -> Any:
+    """A composed tree speculator with the drafter forward fixed to a tiny
+    deterministic proposal and the sample tail spied."""
+    from vllm.v1.worker.gpu.spec_decode.tree.speculator import TreeSpeculatorMixin
+
+    torch.manual_seed(0)
+    spec = init_speculator(_fake_vllm_config(), torch.device("cuda"), _req_states())
+    assert isinstance(spec, TreeSpeculatorMixin)
+    num_reqs, steps = 2, spec.num_speculative_steps
+    K = spec.top_k
+    spec._run_model = lambda *_a, **_k: torch.randn(num_reqs * steps, 64, device="cuda")
+    spec.model = SimpleNamespace(
+        compute_candidates=lambda h: (
+            torch.randint(0, 512, (h.shape[0], K), device="cuda"),
+            torch.randn(h.shape[0], K, device="cuda"),
+        )
+    )
+    spec._score_candidates = lambda cand, unary, hidden: torch.randn(
+        cand.shape[0], cand.shape[1], K, K, device="cuda"
+    )
+    spec.sample_indices[: num_reqs * steps] = torch.arange(
+        num_reqs * steps, device="cuda"
+    )
+    return spec
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_tree_speculator_generate_draft_never_runs_the_chain_sampler() -> None:
+    """The mixin drives selection from the drafter's forward and writes the
+    tree node tokens; the chain-sampling tail must never run."""
+    from unittest import mock
+
+    from vllm.v1.worker.gpu.spec_decode.tree.speculator import TreeSpeculatorMixin
+
+    spec = _tree_speculator_with_seams()
+    assert isinstance(spec, TreeSpeculatorMixin)
+    with (
+        mock.patch.object(spec, "_draft_sample", wraps=spec._draft_sample) as smp,
+        mock.patch.object(
+            spec.tree_selector, "select", wraps=spec.tree_selector.select
+        ) as select,
+    ):
+        spec._generate_draft(2, 30, {}, {}, None)
+    smp.assert_not_called()
+    assert select.call_count == 1
+    assert spec.draft_tokens[:2].shape == (2, spec.draft_tokens.shape[1])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_tree_speculator_dummy_path_runs_the_plain_drafter() -> None:
+    """A dummy/profile run (no attention metadata) must take the plain
+    drafter's chain path, bypassing the tree entirely."""
+    spec = _tree_speculator_with_seams()
+    spec._generate_draft(2, 30, None, None, None, CUDAGraphMode.NONE)
+    # The chain tail ran (its draft-token write is the plain path's), and the
+    # tree read should see no build.
+    assert spec._last_built_rows == 0
+    assert spec.latest_tree_drafts is None

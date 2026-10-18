@@ -3,11 +3,11 @@
 """Tree drafting over any candidate-producing drafter.
 
 ``TreeSpeculatorMixin`` turns a parallel drafter into a tree drafter. The
-drafter runs its step and describes what it knows about the draft positions
-(``_draft_proposal`` -> :class:`DraftProposal`); the configured tree selection
-method (``SpeculativeConfig.tree_selection``) queries that for candidates and
-scores and ranks them into a best-first prefix tree. The drafter itself knows
-nothing about trees.
+drafter runs its forward pass and describes what it knows about the draft
+positions (``_draft_forward`` -> :class:`DraftProposal`); the configured tree
+selection method (``SpeculativeConfig.tree_selection``) queries that for
+candidates and scores and ranks them into a best-first prefix tree. The
+drafter itself knows nothing about trees.
 
 Verification walks the tree with draws from the target alone, so the
 candidates only affect acceptance, never the output distribution.
@@ -24,7 +24,7 @@ from vllm.v1.worker.gpu.spec_decode.tree.tree_metadata import TreeDraft
 
 
 class TreeSpeculatorMixin:
-    """Mixed in ahead of a drafter class that implements ``_draft_proposal``
+    """Mixed in ahead of a drafter class that implements ``_draft_forward``
     (see :func:`tree_speculator_class`)."""
 
     # Provided by the drafter class.
@@ -92,9 +92,21 @@ class TreeSpeculatorMixin:
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> None:
-        """Draft candidates, select the tree, and carry its node tokens (emit
-        order) as this request's draft tokens."""
-        proposal = self._draft_proposal(  # type: ignore[attr-defined]
+        """Run the drafter's forward, select the tree, and carry its node
+        tokens (emit order) as this request's draft tokens. The drafter's
+        chain-sampling tail is never invoked."""
+        if attn_metadata is None:
+            # Dummy/profile runs take the plain drafter path unchanged.
+            super()._generate_draft(
+                num_reqs,
+                num_tokens_padded,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+            )
+            return
+        proposal = self._draft_forward(  # type: ignore[attr-defined]
             num_reqs,
             num_tokens_padded,
             attn_metadata,
@@ -169,7 +181,7 @@ class TreeSpeculatorMixin:
 
 def tree_speculator_class(drafter_cls: type) -> type:
     """The tree-drafting variant of a candidate-producing drafter class."""
-    if not hasattr(drafter_cls, "_draft_proposal"):
+    if not hasattr(drafter_cls, "_draft_forward"):
         raise ValueError(
             f"{drafter_cls.__name__} does not propose its draft positions in "
             "parallel, so it cannot drive tree verification."
