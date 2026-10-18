@@ -1,0 +1,23 @@
+diff a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py	(rejected hunks)
+@@ -3,7 +3,7 @@
+ """Inference-only Qwen3-Next/Qwen3.5 model."""
+ 
+ import os
+-from typing import Literal
++from typing import TYPE_CHECKING, Any, Literal
+ 
+ import torch
+ from einops import rearrange
+@@ -67,6 +78,12 @@ from vllm.utils.torch_utils import (
+ )
+ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+ 
++if TYPE_CHECKING:
++    from vllm.v1.worker.gpu.spec_decode.tree.context import (
++        TreeCommit,
++        TreeVerifyContext,
++    )
++
+ # Optional ROCm AITER Triton kernels for the GDN decode path.
+ # Availability is checked centrally via rocm_aiter_ops; the actual function
+ # references are imported here so that they can be called without per-call
