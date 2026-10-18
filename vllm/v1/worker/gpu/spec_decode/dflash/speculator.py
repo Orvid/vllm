@@ -29,7 +29,10 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
-from vllm.v1.worker.gpu.spec_decode.tree.proposal import DraftProposal
+from vllm.v1.worker.gpu.spec_decode.tree.proposal import (
+    DraftProposal,
+    LazyDraftProposal,
+)
 from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -355,6 +358,29 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> None:
+        proposal = self._draft_forward(
+            num_reqs,
+            num_tokens_padded,
+            attn_metadata,
+            slot_mappings,
+            num_tokens_across_dp,
+            cudagraph_runtime_mode,
+        )
+        self._draft_sample(proposal)
+
+    def _draft_forward(
+        self,
+        num_reqs: int,
+        num_tokens_padded: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    ) -> DraftProposal:
+        """The block's parallel denoising pass, for tree selection: each draft
+        position's target-vocab logits, independent given the context. The
+        logits head is deferred to first query, so the plain chain tail never
+        pays for it (the sampler recomputes its own)."""
         last_hidden_states = self._run_model(
             num_tokens_padded,
             attn_metadata,
@@ -363,7 +389,22 @@ class DFlashSpeculator(DraftModelSpeculator):
             cudagraph_runtime_mode,
         )
         num_sample = num_reqs * self.num_speculative_steps
-        sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
+        sample_hidden = last_hidden_states[self.sample_indices[:num_sample]]
+        shape = (num_reqs, self.num_speculative_steps, -1)
+
+        def logits_fn() -> torch.Tensor:
+            return self.model.compute_logits(sample_hidden).view(shape)
+
+        return LazyDraftProposal(sample_hidden.view(shape), logits_fn)
+
+    def _draft_sample(self, proposal: DraftProposal) -> None:
+        """The chain-sampling tail over the proposal's hidden rows (not used
+        by tree verification, which never calls this method)."""
+        hidden = proposal.position_hidden()
+        assert hidden is not None
+        num_reqs = hidden.shape[0]
+        num_sample = num_reqs * self.num_speculative_steps
+        sample_hidden_states = hidden.reshape(-1, hidden.shape[-1])
         # sample_pos is the predicted token's position P. Sampling keys a draw
         # by the position before the sampled token, P-1.
         draft_tokens = self.sample_draft(
@@ -379,30 +420,6 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.draft_tokens[:num_reqs] = draft_tokens.view(
             num_reqs, self.num_speculative_steps
         )
-
-    def _draft_proposal(
-        self,
-        num_reqs: int,
-        num_tokens_padded: int,
-        attn_metadata: dict[str, Any] | None,
-        slot_mappings: dict[str, torch.Tensor] | None,
-        num_tokens_across_dp: torch.Tensor | None,
-        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
-    ) -> DraftProposal:
-        """The block's parallel denoising pass, for tree selection: each draft
-        position's target-vocab logits, independent given the context."""
-        last_hidden_states = self._run_model(
-            num_tokens_padded,
-            attn_metadata,
-            slot_mappings,
-            num_tokens_across_dp,
-            cudagraph_runtime_mode,
-        )
-        num_sample = num_reqs * self.num_speculative_steps
-        sample_hidden = last_hidden_states[self.sample_indices[:num_sample]]
-        logits = self.model.compute_logits(sample_hidden)
-        shape = (num_reqs, self.num_speculative_steps, -1)
-        return DraftProposal(logits.view(shape), sample_hidden.view(shape))
 
     def _num_graph_context_tokens(self, num_reqs: int) -> int:
         # Context rows a captured draft step stores: one full verify per request.

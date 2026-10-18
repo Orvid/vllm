@@ -12,6 +12,8 @@ anchor token at ``s = 0``). Every query runs on the device without host syncs,
 inside the drafter's step.
 """
 
+from collections.abc import Callable
+
 import torch
 
 
@@ -47,7 +49,9 @@ class DraftProposal:
     def candidates(self, k: int) -> tuple[torch.Tensor, torch.Tensor]:
         """The drafter's ``k`` most likely tokens per position: target-vocab
         ``ids [R, S, k]`` and their logits ``[R, S, k]``."""
-        values, ids = self._logits.topk(k, dim=-1)
+        logits = self.marginal_logits()
+        assert logits is not None
+        values, ids = logits.topk(k, dim=-1)
         return ids, values
 
     def conditional(self, ids: torch.Tensor) -> torch.Tensor | None:
@@ -56,6 +60,37 @@ class DraftProposal:
         a position does not depend on its predecessor's token, so each
         candidate's own logit scores every edge into it."""
         return None
+
+
+class LazyDraftProposal(DraftProposal):
+    """A :class:`DraftProposal` whose logits are computed on first query.
+
+    The chain-sampling tail never queries the proposal's logits (the sampler
+    recomputes its own), so a drafter split into ``_draft_forward`` +
+    ``_draft_sample`` can defer the logits head to the tree selector without
+    paying for it on the plain path.
+    """
+
+    def __init__(
+        self,
+        hidden: torch.Tensor,
+        logits_fn: Callable[[], torch.Tensor],
+    ):
+        self._hidden = hidden
+        self._logits_fn = logits_fn
+        self._logits = None
+
+    @property
+    def num_positions(self) -> int:
+        hidden = self._hidden
+        assert hidden is not None
+        return hidden.shape[1]
+
+    def marginal_logits(self) -> torch.Tensor:
+        """``[R, S, V]``, computed from ``logits_fn`` on first access."""
+        if self._logits is None:
+            self._logits = self._logits_fn()
+        return self._logits
 
 
 class CandidateHeadProposal(DraftProposal):
