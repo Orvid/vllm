@@ -27,6 +27,12 @@ def init_speculator(
 
         drafter_cls = _speculator_class(vllm_config)
         return tree_speculator_class(drafter_cls)(vllm_config, device)
+    if getattr(speculative_config, "use_ngram", lambda: False)():
+        from vllm.v1.worker.gpu.spec_decode.ngram.speculator import (
+            NgramGPUSpeculator,
+        )
+
+        return NgramGPUSpeculator(vllm_config, device, req_states)
     return _speculator_class(vllm_config)(vllm_config, device)
 
 
@@ -84,18 +90,12 @@ def _speculator_class(vllm_config: VllmConfig) -> type:
             EagleSpeculator,
         )
 
-        return EagleSpeculator(vllm_config, device)
+        return EagleSpeculator
     elif speculative_config.uses_draft_model():
         from vllm.v1.worker.gpu.spec_decode.standalone_ar.speculator import (
             StandaloneARSpeculator,
         )
 
-        return StandaloneARSpeculator(vllm_config, device)
-    elif speculative_config.use_ngram():
-        from vllm.v1.worker.gpu.spec_decode.ngram.speculator import (
-            NgramGPUSpeculator,
-        )
-
-        return NgramGPUSpeculator(vllm_config, device, req_states)
+        return StandaloneARSpeculator
     else:
         raise NotImplementedError(f"{speculative_config.method} is not supported yet.")

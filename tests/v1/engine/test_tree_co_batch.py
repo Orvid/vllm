@@ -23,7 +23,7 @@ import gc
 
 import pytest
 
-from tests.v1.engine.df2t_test_utils import assert_t0_parity
+from tests.v1.engine.tree_test_utils import assert_t0_parity
 from vllm.platforms import current_platform
 
 if not current_platform.is_cuda():

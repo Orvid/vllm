@@ -517,6 +517,8 @@ def attach_tree_flex_mask(
     B: int,
     window: int | None = None,
     depths: torch.Tensor | None = None,
+    mask_mod: Callable | None = None,
+    hint: BlockSparsityHint | None = None,
 ) -> None:
     """Attach the tree mask to a built ``FlexAttentionMetadata``.
 
@@ -542,17 +544,23 @@ def attach_tree_flex_mask(
             ``None`` keeps the window-less tree mask.
         depths: [num_reqs, B] per-request node depths, required iff ``window``
             is set.
+        mask_mod: Prebuilt tree mask mod (see ``build_flex_tree_mask``); when
+            provided it must close over stable pool tensors (the runner's
+            persistent pools and doc_ids buffer), so torch compile guards
+            hold across steps. Rebuilt from the per-step tensors otherwise.
+        hint: The prebuilt ``BlockSparsityHint`` paired with ``mask_mod``.
 
     """
-    mask_mod, hint = build_flex_tree_mask(
-        num_reqs,
-        C_per_req,
-        words,
-        B,
-        metadata.doc_ids,
-        window=window,
-        depths=depths,
-    )
+    if mask_mod is None or hint is None:
+        mask_mod, hint = build_flex_tree_mask(
+            num_reqs,
+            C_per_req,
+            words,
+            B,
+            metadata.doc_ids,
+            window=window,
+            depths=depths,
+        )
     metadata.logical_mask_mod = mask_mod
     metadata.block_sparsity_hint = hint
     if window is not None:

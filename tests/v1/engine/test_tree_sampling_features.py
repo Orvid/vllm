@@ -94,7 +94,7 @@ def _run_engine(
 
 
 def _assert_parity(tree_ids, tree_probs, ref_ids, ref_probs, what) -> None:
-    from tests.v1.engine.df2t_test_utils import assert_t0_parity
+    from tests.v1.engine.tree_test_utils import assert_t0_parity
 
     assert_t0_parity(tree_ids, ref_ids, tree_probs, ref_probs, what)
 

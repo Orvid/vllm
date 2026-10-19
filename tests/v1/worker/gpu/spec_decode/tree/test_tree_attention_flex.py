@@ -493,6 +493,7 @@ def _fake_flex_metadata(doc_ids: torch.Tensor) -> FlexAttentionMetadata:
     assertions touch."""
     meta = object.__new__(FlexAttentionMetadata)
     meta.doc_ids = doc_ids
+    meta.persistent_doc_ids = doc_ids
     meta.logical_mask_mod = None
     meta.block_sparsity_hint = None
     meta.mask_mod = None
@@ -552,7 +553,9 @@ def _fake_runner(spec, req_states, device, attn_groups, kv_cache_config=None):
         speculative_config=spec,
         req_states=req_states,
         device=device,
+        max_num_reqs=4,
         _pending_tree_flex_mask=None,
+        _tree_flex_masks={},
         attn_groups=attn_groups,
         kv_cache_config=kv_cache_config,
     )
@@ -561,8 +564,13 @@ def _fake_runner(spec, req_states, device, attn_groups, kv_cache_config=None):
         "_tree_verify_layer_names",
         "_tree_window",
         "_attach_tree_flex_mask",
+        "_ensure_tree_mask_buffers",
+        "_tree_flex_mask_mod",
     ):
         setattr(runner, name, types.MethodType(getattr(GPUModelRunner, name), runner))
+    runner._tree_mask_words = torch.zeros(4, spec.max_tree_budget, dtype=torch.long)
+    runner._tree_mask_c = torch.zeros(4, dtype=torch.int32)
+    runner._tree_mask_depths = torch.zeros(4, spec.max_tree_budget, dtype=torch.int32)
     return runner
 
 
@@ -731,8 +739,9 @@ def test_runner_stage_scopes_zero_context():
     pending = runner._pending_tree_flex_mask
     assert pending is not None
     _, c_per_req, words, _, _, _ = pending
-    # The contextless request is staged with a zero anchor length, not dropped.
-    assert c_per_req.tolist() == [4, 0]
+    # The contextless request is staged with a zero anchor length, not dropped
+    # (the persistent pool keeps its full row count; leading rows are live).
+    assert c_per_req[:2].tolist() == [4, 0]
     assert bool((words[1] == 0).all().item())
 
 

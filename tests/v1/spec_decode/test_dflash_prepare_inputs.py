@@ -116,6 +116,8 @@ def _run_prepare(
         max_num_tokens=max_num_tokens,
         max_model_len=128,
         sample_from_anchor=True,
+        _tree_accepted_arenas=lambda: None,
+        nodes_max=1,
     )
     with (
         patch(

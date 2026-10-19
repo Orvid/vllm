@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""df2t real-logprobs layout and value drills (WS-B-2).
+"""Real-logprobs layout and value drills for tree verification.
 
 The tree verify block emits, per request, one token per chain depth (the
-accepted path + the terminal/resampled token). Before this task a ``logprobs``
-request raised NotImplementedError inside the worker on the first verify step
-(killing the engine); these tests pin the replacement: per-emitted-token
-logprobs gathered from the fully processed distribution at the row each token
-was actually drawn from.
+accepted path + the terminal/resampled token). A ``logprobs`` request used to
+raise NotImplementedError inside the worker on the first verify step (killing
+the engine); these tests pin the fix: per-emitted-token logprobs gathered
+from the fully processed distribution at the row each token was actually
+drawn from.
 
 A chain-depth-d token is drawn from verify row ``0`` at depth 0 and from row
 ``accepted_arenas[r, d] + 1`` for ``d >= 1`` (the last accepted node's target

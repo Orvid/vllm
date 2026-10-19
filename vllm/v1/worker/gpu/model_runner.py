@@ -24,7 +24,7 @@ from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager
 from copy import deepcopy
 from dataclasses import replace
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
@@ -203,6 +203,12 @@ from vllm.v1.worker.gpu.structured_outputs import (
     StructuredOutputsWorker,
     grammar_invalid_drafts,
 )
+
+if TYPE_CHECKING:
+    from vllm.v1.attention.backends.flex_attention import (
+        BlockSparsityHint,
+        FlexAttentionMetadata,
+    )
 from vllm.v1.worker.gpu.ubatch_utils import (
     UBatchRunner,
     UBatchState,
@@ -620,10 +626,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cls=self.pcp_manager_cls,
         )
 
-        # Pooling models.
-        self.is_pooling_model = self.model_config.runner_type == "pooling"
-        self.pooling_runner: PoolingRunner | None = None
-
         self.step_timing = StepTimingCollector()
         self.adaptive_verification: AdaptiveVerificationManager | None = None
         # flex tree verify: per-request mask inputs staged by
@@ -640,6 +642,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ]
             | None
         ) = None
+        # Cached flex tree mask mods keyed by (budget, window, doc_ids buffer):
+        # the same closure and captured pool tensors across steps keep torch
+        # compile guards stable (see _tree_flex_mask_mod).
+        self._tree_flex_masks: dict[
+            tuple[int, int | None, int], tuple[Callable, BlockSparsityHint]
+        ] = {}
         # fa4 tree verify: same staging for the FlashAttention-4 mask_mod
         # vehicle (``tree_attention_backend == "fa4"``, the default). Stays
         # None except on fa4-tree batches.
@@ -1377,12 +1385,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Adjust the dummy token count only when the expanded draft batch
         # would exceed the token budget.
         num_reqs = min(num_tokens, self.max_num_reqs)
-        if self._tree_ctx is not None:
+        tree_ctx = getattr(self, "_tree_ctx", None)
+        if tree_ctx is not None:
             # A dummy step fills no trees; size tree kernels for its widest.
-            self._tree_ctx.step_width = (
+            tree_ctx.step_width = (
                 uniform_query_len - 1
                 if uniform_query_len is not None
-                else self._tree_ctx.max_width
+                else tree_ctx.max_width
             )
         if uniform_query_len is not None:
             # A uniform decode at a query length other than decode_query_len
@@ -1874,11 +1883,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         capture_decoder = self.cudagraph_manager.needs_capture()
         tree_capture_mask_attach: Callable[[dict[str, Any]], None] | None = None
-        if (
-            capture_decoder
-            and getattr(self, "speculative_config", None) is not None
-            and (self.speculative_config.use_tree())
-        ):
+        spec = getattr(self, "speculative_config", None)
+        if capture_decoder and spec is not None and spec.use_tree():
             # Tree verify captures its uniform 1+B target tree-verify decode through
             # the V2 uniform FULL-graph machinery, with the FA4 tree mask
             # baked into the captured metadata (see
@@ -2324,7 +2330,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # flex/fa4 verify: stage the per-request tree mask inputs (context
         # length C per request, ancestor-or-self words) so execute_model can
         # attach them to the Flex/FA4 metadata after prepare_attn.
-        self._stage_tree_flex_mask(use_trees, trees, num_reqs, idx_mapping)
+        self._stage_tree_flex_mask(use_trees, trees, num_reqs, idx_mapping, tree_batch)
         self._stage_tree_fa4_mask(use_trees, trees, num_reqs, idx_mapping, tree_batch)
 
         # The general branch also serves a no-draft batch with k != 1, and
@@ -2521,13 +2527,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         trees: "list[TreeDraft | None] | None",
         num_reqs: int,
         idx_mapping: torch.Tensor,
+        tree_batch: "TreeBatch | None" = None,
     ) -> None:
         """Stage the flex-tree per-request mask inputs, or clear them.
 
         Only active on tree batches with ``tree_attention_backend ==
         "flex"``; and attaches the tree mask in ``execute_model``. For every
         other batch the pending field is cleared so no stale mask leaks into a
-        later step.
+        later step. Writes into the same persistent pools the FA4 path uses,
+        so the flex mask mod captures stable addresses across steps (torch
+        compile guards on the captured tensors' identity and shape, so a fresh
+        allocation per step forces a recompile per step).
         """
         spec = self.speculative_config
         self._pending_tree_flex_mask = None
@@ -2536,34 +2546,44 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ):
             return
         from vllm.v1.worker.gpu.spec_decode.tree.attention import (
-            pack_tree_mask_inputs,
+            fill_tree_mask_inputs,
+            fill_tree_mask_inputs_batched,
         )
 
-        c_per_req = self.req_states.num_computed_tokens.gpu[idx_mapping].to(torch.int64)
-        # A request without a tree (a prefill chunk co-scheduled with a tree
-        # decode step) keeps all-zero words; the flex mask falls back to
-        # per-request causal attention for it (see build_flex_tree_mask).
-        words = pack_tree_mask_inputs(
-            trees, num_reqs, spec.max_tree_budget, self.device
-        )
+        width = spec.max_tree_budget
+        self._ensure_tree_mask_buffers(width)
+        assert self._tree_mask_words is not None
+        assert self._tree_mask_c is not None
+        assert self._tree_mask_depths is not None
+        if tree_batch is not None:
+            fill_tree_mask_inputs_batched(
+                self._tree_mask_words,
+                self._tree_mask_c,
+                self._tree_mask_depths,
+                tree_batch,
+                self.req_states.num_computed_tokens.gpu,
+                idx_mapping,
+            )
+        else:
+            fill_tree_mask_inputs(
+                self._tree_mask_words,
+                self._tree_mask_c,
+                trees,
+                num_reqs,
+                width,
+                self.req_states.num_computed_tokens.gpu[idx_mapping],
+                depths_out=self._tree_mask_depths,
+            )
         # Per-layer sliding windows (positional-window term of the attached
         # flex mask) and the per-request node depths backing it.
         window_map = self._tree_window(self._tree_verify_layer_names())
-        depths = None
-        if trees is not None:
-            depths = torch.zeros(
-                num_reqs, spec.max_tree_budget, dtype=torch.int64, device=self.device
-            )
-            for r, tree in enumerate(trees[:num_reqs]):
-                if tree is not None and tree.depths.shape[0] > 0:
-                    depths[r, : tree.depths.shape[0]] = tree.depths
         self._pending_tree_flex_mask = (
             num_reqs,
-            c_per_req,
-            words,
-            spec.max_tree_budget,
+            self._tree_mask_c,
+            self._tree_mask_words,
+            width,
             window_map,
-            depths,
+            self._tree_mask_depths,
         )
 
     def _tree_verify_layer_names(self) -> set[str]:
@@ -2615,8 +2635,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 continue
             seen_metadata.add(id(metadata))
             window = window_map.get(layer_name)
+            mask_mod, hint = self._tree_flex_mask_mod(
+                b, window, c_per_req, words, depths, metadata
+            )
             attach_tree_flex_mask(
-                metadata, num_reqs, c_per_req, words, b, window=window, depths=depths
+                metadata,
+                num_reqs,
+                c_per_req,
+                words,
+                b,
+                window=window,
+                depths=depths,
+                mask_mod=mask_mod,
+                hint=hint,
             )
             attached = True
         if not attached:
@@ -2626,6 +2657,44 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "FlexAttentionMetadata was produced. Select FlexAttention "
                 "for the target (or set tree_attention_backend='fa4')."
             )
+
+    def _tree_flex_mask_mod(
+        self,
+        b: int,
+        window: int | None,
+        c_per_req: torch.Tensor,
+        words: torch.Tensor,
+        depths: torch.Tensor,
+        metadata: "FlexAttentionMetadata",
+    ) -> "tuple[Callable, BlockSparsityHint]":
+        """Cached tree flex ``mask_mod`` for one (budget, window) pair.
+
+        The mask mod closes over the persistent mask pools and the metadata's
+        persistent doc_ids, whose addresses stay fixed across steps (only the
+        contents change, via ``fill_tree_mask_inputs``). torch compile guards
+        on the captured tensors' identity and shape, so a per-step closure
+        over fresh tensors forces a recompile every step; caching the closure
+        per (budget, window) keeps both stable.
+        """
+        key = (b, window, id(metadata.persistent_doc_ids))
+        cached = self._tree_flex_masks.get(key)
+        if cached is not None:
+            return cached
+        from vllm.v1.worker.gpu.spec_decode.tree.attention import (
+            build_flex_tree_mask,
+        )
+
+        mask_mod, hint = build_flex_tree_mask(
+            self.max_num_reqs,
+            c_per_req,
+            words,
+            b,
+            metadata.persistent_doc_ids,
+            window=window,
+            depths=depths,
+        )
+        self._tree_flex_masks[key] = (mask_mod, hint)
+        return mask_mod, hint
 
     def _ensure_tree_mask_buffers(self, width: int) -> None:
         """Allocate the persistent FA4 tree-mask aux pools (once).
@@ -3144,7 +3213,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         spec = self.speculative_config
         if spec is None or not spec.use_tree():
             return
-        from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+        from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
 
         kv_cache_groups = get_kv_cache_groups(
             self.vllm_config, self.get_kv_cache_spec()

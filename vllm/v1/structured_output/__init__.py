@@ -68,6 +68,7 @@ def _tree_node_chains(tree: "StashedTree | None") -> list[list[int]]:
         chains.append([token_ids[x] for x in path + [a]])
     return chains
 
+
 class ConstraintBounds(NamedTuple):
     """Where tokens start being fed to the grammar and being masked."""
 
@@ -509,10 +510,13 @@ class StructuredOutputManager:
                     # ancestors plus itself (not the arena-order siblings).
                     chains = _tree_node_chains(tree)
                     constrained = constraint_start == 0
+                    masked_ids = (
+                        self._masked_reasoning_ends(request) if constrained else ()
+                    )
                     for i in range(len(req_tokens) + 1):
                         if i == 0:
                             self._fill_bitmasks(
-                                ((grammar, cumulative_index, constrained),)
+                                ((grammar, cumulative_index, constrained, masked_ids),)
                             )
                         else:
                             a = i - 1
@@ -529,7 +533,9 @@ class StructuredOutputManager:
                                 if valid:
                                     grammar.accept_tokens(req_id, valid)
                                     apply = True
-                            self._fill_bitmasks(((grammar, cumulative_index, apply),))
+                            self._fill_bitmasks(
+                                ((grammar, cumulative_index, apply, masked_ids),)
+                            )
                             if apply:
                                 grammar.rollback(len(valid))
                         cumulative_index += 1

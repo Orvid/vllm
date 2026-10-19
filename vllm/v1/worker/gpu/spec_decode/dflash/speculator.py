@@ -417,8 +417,11 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.draft_logits,
             num_steps=self.num_speculative_steps,
         )
-        self.draft_tokens[:num_reqs] = draft_tokens.view(
-            num_reqs, self.num_speculative_steps
+        # The carry's leading columns: for a plain drafter this is the whole
+        # row; under a tree flavor (dummy/profile runs only) the carry is
+        # wider than the drafter depth and the sampler writes its own width.
+        self.draft_tokens[:num_reqs, : self.num_speculative_steps] = (
+            draft_tokens.view(num_reqs, self.num_speculative_steps)
         )
 
     def _num_graph_context_tokens(self, num_reqs: int) -> int:
