@@ -8019,9 +8019,9 @@ def test_diffusion_read_deferral_keeps_a_longer_pp_wait():
     assert read.next_decode_eligible_step == 7
 
 
-def _df2t_draft_model_config() -> SimpleNamespace:
-    """A lightweight df2t draft ``ModelConfig`` stand-in exposing the surface
-    ``SpeculativeConfig._validate_df2t`` reads (architecture, hf_config with
+def _tree_draft_model_config() -> SimpleNamespace:
+    """A lightweight tree-verification draft ``ModelConfig`` stand-in exposing
+    the surface tree config reads (architecture, hf_config with
     ``dflash_config.block_size``)."""
     return SimpleNamespace(
         architectures=["DFlash2DraftModel"],
@@ -8037,7 +8037,7 @@ def _df2t_draft_model_config() -> SimpleNamespace:
     )
 
 
-def _df2t_scheduler(tmp_path, tree: bool = True) -> Scheduler:
+def _tree_scheduler(tmp_path, tree: bool = True) -> Scheduler:
     """A real :class:`Scheduler` over a tree ``SpeculativeConfig`` with the
     tree budget ceiling raised above the drafter block depth (num_spec = 15,
     max_tree_budget = 64). ``tree=False`` keeps the same drafter verifying its
@@ -8086,7 +8086,7 @@ def _df2t_scheduler(tmp_path, tree: bool = True) -> Scheduler:
         method="dflash",
         tree_selection="df2t",
         num_speculative_tokens=15,
-        draft_model_config=_df2t_draft_model_config(),
+        draft_model_config=_tree_draft_model_config(),
     )
     if not tree:
         speculative_config.tree_selection = None
@@ -8130,7 +8130,7 @@ def test_df2t_scheduler_reserves_tree_budget_ceiling(tmp_path):
     max_tree_budget``), both decoupled from ``num_speculative_tokens`` — so a
     tree wider than the drafter block depth (B > L) has slots to verify into,
     while the arena reservation buffers to the ceiling."""
-    scheduler = _df2t_scheduler(tmp_path)
+    scheduler = _tree_scheduler(tmp_path)
     spec = scheduler.vllm_config.speculative_config
     assert scheduler.num_spec_tokens == spec.tree_decode_width - 1
     assert scheduler.num_spec_tokens > spec.num_speculative_tokens
@@ -8141,7 +8141,7 @@ def test_chain_verification_scheduler_reserves_dflash_chain(tmp_path):
     """Without tree selection the same drafter's chain is verified: per-request
     draft rows == ``num_speculative_tokens`` (not the tree width) and the KV
     lookahead == ``num_speculative_tokens + 1`` (not the tree ceiling)."""
-    scheduler = _df2t_scheduler(tmp_path, tree=False)
+    scheduler = _tree_scheduler(tmp_path, tree=False)
     spec = scheduler.vllm_config.speculative_config
     assert not spec.use_tree()
     K = spec.num_speculative_tokens

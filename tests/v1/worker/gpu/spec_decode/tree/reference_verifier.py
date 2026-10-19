@@ -24,7 +24,7 @@ Exact conventions, documented so the GPU sampler can mirror them:
   mass reaches ``top_p``, at least one token).
 * ``greedy`` draws ``argmax``, so every emitted token (accepted, mismatch, and
   the leaf bonus on a fully accepted path) equals ``argmax(p)`` exactly at
-  T=0 (§3.7 invariant 4). Otherwise one categorical sample is drawn per depth
+  T=0 (the argmax-everywhere invariant). Otherwise one categorical sample is drawn per depth
   from a single ``torch.Generator`` seeded from ``seed``, drawn sequentially so
   depths are effectively independent and a fixed seed is reproducible
   (``seed=None`` is non-reproducible).

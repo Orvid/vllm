@@ -1347,13 +1347,14 @@ def test_models_default_to_v2_model_runner(model_config, expected, monkeypatch):
     assert VllmConfig.use_v2_model_runner.fget(config) is expected
 
 
-def test_df2t_forces_v2_model_runner(monkeypatch):
-    """df2t (like dflash/dspark) runs only on the V2 GPU model runner.
+def test_tree_forces_v2_model_runner(monkeypatch):
+    """Tree verification (like dflash/dspark) runs only on the V2 GPU model
+    runner.
 
-    ``_validate_df2t`` force-enables parallel drafting, so without the V2
+    Tree verification force-enables parallel drafting, so without the V2
     parallel-drafting exemption the config would be flagged V2-unsupported and
-    fall back to the V1 runner, which crashes with "Unknown speculative
-    decoding method: df2t". The V1 runner must instead reject df2t outright.
+    fall back to the V1 runner, which cannot run tree verification. The V1
+    runner must instead reject it outright.
     """
     from vllm.platforms import current_platform
 
@@ -2035,8 +2036,9 @@ def test_dflash_allows_async_scheduling(tmp_path: Path):
     assert cfg.scheduler_config.async_scheduling is True
 
 
-def _df2t_speculative_config(tmp_path: Path, parallel_config) -> SpeculativeConfig:
-    """A df2t SpeculativeConfig over locally-written Qwen3 configs (offline)."""
+def _tree_speculative_config(tmp_path: Path, parallel_config) -> SpeculativeConfig:
+    """A tree-verification SpeculativeConfig over locally-written Qwen3 configs
+    (offline)."""
     from transformers import LlamaConfig
 
     common = dict(
@@ -2087,11 +2089,11 @@ def _df2t_speculative_config(tmp_path: Path, parallel_config) -> SpeculativeConf
     )
 
 
-def test_df2t_allows_async_scheduling(tmp_path: Path):
-    """df2t is a supported async-scheduling method: forcing it on must not
-    raise, and the config must keep async enabled."""
+def test_tree_allows_async_scheduling(tmp_path: Path):
+    """Tree verification is a supported async-scheduling mode: forcing it on
+    must not raise, and the config must keep async enabled."""
     parallel_config = ParallelConfig(distributed_executor_backend="uni")
-    speculative_config = _df2t_speculative_config(tmp_path, parallel_config)
+    speculative_config = _tree_speculative_config(tmp_path, parallel_config)
     model_config = speculative_config.target_model_config
 
     cfg = VllmConfig(
@@ -2110,11 +2112,11 @@ def test_df2t_allows_async_scheduling(tmp_path: Path):
     assert cfg.scheduler_config.async_scheduling is True
 
 
-def test_df2t_defaults_to_async_scheduling(tmp_path: Path):
+def test_tree_defaults_to_async_scheduling(tmp_path: Path):
     """df2t defaults to async scheduling (the tree is carried through the
     async/deferred path by update_draft_token_ids_in_output)."""
     parallel_config = ParallelConfig(distributed_executor_backend="uni")
-    speculative_config = _df2t_speculative_config(tmp_path, parallel_config)
+    speculative_config = _tree_speculative_config(tmp_path, parallel_config)
     model_config = speculative_config.target_model_config
     cfg = VllmConfig(
         model_config=model_config,
@@ -2131,14 +2133,14 @@ def test_df2t_defaults_to_async_scheduling(tmp_path: Path):
     assert cfg.scheduler_config.async_scheduling is True
 
 
-def test_df2t_reserves_tree_budget_drafter_slots(tmp_path: Path):
+def test_tree_reserves_tree_budget_drafter_slots(tmp_path: Path):
     """df2t drafts with the DFlash drafter, so the KL/lookahead reservation and
     the draft-slot ceiling come from the TREE BUDGET (``1 + max_tree_budget``
     / ``max_tree_budget``), never from ``num_speculative_tokens``. Buffering to
     the ceiling is what lets a tree wider than the drafter block depth
     (B > L) verify."""
     parallel_config = ParallelConfig(distributed_executor_backend="uni")
-    speculative_config = _df2t_speculative_config(tmp_path, parallel_config)
+    speculative_config = _tree_speculative_config(tmp_path, parallel_config)
     cfg = VllmConfig(
         model_config=speculative_config.target_model_config,
         scheduler_config=SchedulerConfig(
@@ -2160,13 +2162,13 @@ def test_df2t_reserves_tree_budget_drafter_slots(tmp_path: Path):
     assert mtb > k
 
 
-def test_df2t_cudagraphs_are_not_config_rejected(tmp_path: Path):
+def test_tree_cudagraphs_are_not_config_rejected(tmp_path: Path):
     """CUDA-graph capture itself is not yet supported for the df2t tree-verify
     decode, but the config must not blanket-forbid df2t + cudagraphs: capture is
     refused eagerly at capture time (see GPUModelRunner.capture_model), not at
     config time."""
     parallel_config = ParallelConfig(distributed_executor_backend="uni")
-    speculative_config = _df2t_speculative_config(tmp_path, parallel_config)
+    speculative_config = _tree_speculative_config(tmp_path, parallel_config)
     model_config = speculative_config.target_model_config
     cfg = VllmConfig(
         model_config=model_config,

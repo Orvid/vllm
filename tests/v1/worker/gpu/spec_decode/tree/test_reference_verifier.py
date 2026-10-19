@@ -5,8 +5,8 @@
 Traversal draws one token per depth from the fully processed target
 distribution at the current row, descends iff it is a child of the current
 node, and otherwise emits it and stops (leaf/bonus included). These tests pin
-greedy behaviour, the T=0 argmax-everywhere invariant (§3.7 invariant 4), the
-over-proposed-unexpanded sampling regime the v4 residual rule got wrong, the
+greedy behaviour, the T=0 argmax-everywhere invariant, the
+over-proposed-unexpanded sampling regime, the
 leaf bonus path, and determinism.
 """
 
@@ -22,7 +22,7 @@ from vllm.v1.worker.gpu.spec_decode.tree.tree_metadata import build_tree_naive
 
 
 def test_reference_verifier_not_in_runtime_package():
-    """The brute-force oracle stays TEST material (v5 SS9): no runtime module
+    """The brute-force oracle stays TEST material: no runtime module
     named ``vllm...df2t.reference_verifier`` ships, and the test-tree import
     above is what resolves it."""
     assert (

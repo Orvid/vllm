@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from vllm.config.speculative import SpeculativeConfig
 
@@ -40,13 +41,11 @@ def _build(arch: str = ARCH, **over: Any) -> SpeculativeConfig:
     return SpeculativeConfig(**kwargs)
 
 
-def test_df2t_method_is_a_deprecated_alias_for_dflash_tree_selection():
+def test_df2t_is_not_a_drafter_method():
     """df2t is a tree selection method, not a drafter: ``method="df2t"``
-    resolves to the dflash drafter with ``tree_selection="df2t"``."""
-    cfg = _build(method="df2t", tree_selection=None)
-    assert cfg.method == "dflash"
-    assert cfg.tree_selection == "df2t"
-    assert cfg.use_tree()
+    is rejected (use ``method="dflash"`` with ``tree_selection="df2t"``)."""
+    with pytest.raises(ValidationError):
+        _build(method="df2t", tree_selection=None)
 
 
 def test_chain_verification_keeps_the_drafter_reservations():

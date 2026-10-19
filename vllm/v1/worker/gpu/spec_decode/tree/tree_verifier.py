@@ -127,9 +127,9 @@ def _row_param(
 
 
 class TreeVerifier:
-    """Vectorized tree-traversal verifier (v5 §3.6), a sibling of
-    :class:`RejectionSampler` with the same output contract, used only for
-    ``method="df2t"``."""
+    """Vectorized tree-traversal verifier, a sibling of
+    :class:`RejectionSampler` with the same output contract, used only when
+    tree verification is enabled."""
 
     def __init__(
         self,

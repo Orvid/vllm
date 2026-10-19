@@ -71,9 +71,6 @@ MTPModelTypes = Literal[
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
 DSparkModelTypes = Literal["dspark"]
-# Deprecated alias: ``method="df2t"`` is ``method="dflash"`` with
-# ``tree_selection="df2t"``.
-DF2TModelTypes = Literal["df2t"]
 TreeSelectionMethod = Literal["df2t"]
 # Methods whose drafters propose every draft position in parallel, so their
 # per-position candidates can be selected into a tree.
@@ -89,7 +86,6 @@ SpeculativeMethod = Literal[
     EagleModelTypes,
     NgramGPUTypes,
     DSparkModelTypes,
-    DF2TModelTypes,
 ]
 RejectionSampleMethod = Literal["standard", "synthetic", "block"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
@@ -1203,15 +1199,6 @@ class SpeculativeConfig:
         # will be detected automatically if possible. If the speculative method
         # can not be detected, it will be considered as the "draft_model" by
         # default.
-
-        if self.method == "df2t":
-            logger.warning(
-                "method `df2t` is deprecated: df2t is a tree selection method. "
-                "Use method `dflash` with tree_selection `df2t`."
-            )
-            self.method = "dflash"
-            if self.tree_selection is None:
-                self.tree_selection = "df2t"
 
         # infer method from user args
         if self.method is None and SpeculativeConfig._is_custom_proposer_path(
